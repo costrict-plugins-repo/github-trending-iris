@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "iris-eval": {
+      "command": "npx",
+      "args": ["-y", "@iris-eval/mcp-server"],
+      "env": {
+        "IRIS_LOG_LEVEL": "info"
+      }
+    }
+  }
+}

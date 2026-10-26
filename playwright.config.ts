@@ -1,0 +1,140 @@
+/*
+ * Playwright E2E suite — audit item #5.
+ *
+ * Spins up iris-mcp with the dashboard against a temp SQLite DB, seeds
+ * a small deterministic dataset, then runs Chromium against the live
+ * dashboard. Covers the critical flows a first-time evaluator would walk:
+ *
+ *   - Fresh load + view navigation (smoke.spec.ts)
+ *   - Drill-through from dashboard to moments (drill-through.spec.ts)
+ *   - Make-This-A-Rule end-to-end (make-rule.spec.ts)
+ *
+ * The test DB lives in os.tmpdir() so local runs don't pollute the
+ * user's real ~/.iris/iris.db. CI starts from a clean checkout so
+ * pollution isn't a concern there; the same temp path still works.
+ *
+ * Port: chosen at run time (tests/e2e/_constants.ts, #665). CI uses 6921,
+ * as it always has; a local run takes E2E_PORT when set and otherwise a
+ * port the OS says is free, so a dashboard already running on 6921 (or
+ * anywhere) is never the one tested. globalSetup then checks that the
+ * server answering is the dashboard this checkout built.
+ */
+import { defineConfig, devices } from '@playwright/test';
+import { E2E_PORT, E2E_DB_DIR, E2E_DB_PATH, E2E_BASE_URL } from './tests/e2e/_constants.js';
+
+export default defineConfig({
+  testDir: './tests/e2e',
+  timeout: 30_000,
+  expect: { timeout: 5_000 },
+  fullyParallel: false, // tests may share mutable state (audit log, rules file); keep sequential
+  retries: process.env.CI ? 1 : 0,
+  workers: 1,
+  reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
+  use: {
+    baseURL: E2E_BASE_URL,
+    trace: 'on-first-retry',
+    video: 'retain-on-failure',
+  },
+  globalSetup: './tests/e2e/global-setup.ts',
+  webServer: {
+    /*
+     * Starts iris-mcp with the dashboard on E2E_PORT. Uses the built
+     * dist/ so we're exercising the same artifact that ships to npm.
+     * IRIS_NO_AUTO_LAUNCH=1 keeps the server from opening a browser
+     * window (Playwright drives its own).
+     */
+    command: `node dist/index.js --dashboard --dashboard-port ${E2E_PORT} --config tests/e2e/server-config.json`,
+    url: `${E2E_BASE_URL}/api/v1/health`,
+    /*
+     * tests/e2e/server-config.json raises security.rateLimit.api for this
+     * server only. Every test here opens a fresh browser context, so each
+     * page load re-fetches every asset plus the shell's own reads, and the
+     * whole run (both browsers, one process, one IP) lands inside one
+     * 60-second limiter window: at the shipped 600/min the Firefox half of
+     * a CI run was served `{"error":"Too many requests"}` for `/` itself
+     * (2026-09-07). The limiter's own proposition is held by
+     * tests/unit/middleware/rate-limit.test.ts, not here.
+     */
+    /*
+     * A server already on the port is reused only when asked for with
+     * E2E_REUSE_SERVER=1 (never in CI). Reuse was the default outside CI,
+     * and a reused server serves the bundle IT was started with: a
+     * dashboard left running from an earlier session made two local runs
+     * test an old build (2026-09-07), and a stray `npx` server on 6921 did
+     * it again during #662. Even when reuse is asked for, globalSetup
+     * refuses a server that is not this checkout's build.
+     */
+    reuseExistingServer: !process.env.CI && process.env.E2E_REUSE_SERVER === '1',
+    timeout: 30_000,
+    env: {
+      /*
+       * IRIS_HOME confines EVERY per-user file (config.json, iris.db,
+       * custom-rules.json, audit.log, preferences.json) to the temp dir.
+       * Before this, only the DB was isolated: each run WIPED the real
+       * ~/.iris/audit.log, deployed make-rule test rules into the real
+       * custom-rules.json (where they then loaded at every subsequent
+       * server start), and overwrote the real preferences.json via the
+       * globalSetup PATCH.
+       */
+      IRIS_HOME: E2E_DB_DIR,
+      IRIS_DB_PATH: E2E_DB_PATH,
+      IRIS_NO_AUTO_LAUNCH: '1',
+    },
+  },
+  /*
+   * Browser matrix: Chromium + Firefox.
+   *
+   * WebKit-on-Linux (Playwright's `webkit` device) is intentionally
+   * excluded, not deferred. It is a Linux build of WebKit — NOT Apple
+   * Safari. Safari uses Apple's WebKit which ships only on macOS
+   * hardware. Testing Playwright's Linux WebKit build gives weak
+   * assurance about actual Safari users and introduces environment-
+   * specific flakiness (React 19 + Vite 8 hydration + WebKit-Linux
+   * interact poorly on GitHub Actions Ubuntu runners).
+   *
+   * Real Safari coverage would require a macOS CI runner. That's an
+   * honest cost/benefit call for a later decision: Iris is an MCP-
+   * native dev tool consumed via Claude Desktop / Cursor / Windsurf /
+   * IDE plugins — direct Safari dashboard access is a small slice of
+   * usage. When Safari-real becomes material we add macOS to the CI
+   * matrix explicitly rather than simulate it on Linux.
+   *
+   * Chromium covers ~65% real-world share; Firefox surfaces Gecko-
+   * specific regressions (focus-management, layout-shift interaction).
+   * Both pass reliably on ubuntu-latest + Windows + macOS.
+   */
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'firefox',
+      use: {
+        ...devices['Desktop Firefox'],
+        launchOptions: {
+          firefoxUserPrefs: {
+            /*
+             * Root cause of the intermittent page.reload() >30s hang on
+             * firefox/Windows (#334): helmet sends
+             * Cross-Origin-Opener-Policy: same-origin, and Firefox
+             * responds to COOP by swapping the browsing-context group on
+             * every navigation. Playwright's Firefox driver (Juggler)
+             * loses the frame across that swap — reload() never sees the
+             * 'load' event and even evaluate() on the page goes dead.
+             *
+             * Measured against the built bundle on Windows: with COOP
+             * served, 8-10 of 16 reloads hung; with COOP stripped OR with
+             * this pref, 0 of 16. (Origin-Agent-Cluster was innocent:
+             * removing it alone still hung 8/16.) The pref disables
+             * COOP-driven process swaps in the TEST browser only — the
+             * production security header stays exactly as shipped.
+             */
+            'browser.tabs.remote.useCrossOriginOpenerPolicy': false,
+          },
+        },
+      },
+    },
+  ],
+});
+

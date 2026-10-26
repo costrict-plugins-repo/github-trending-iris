@@ -1,0 +1,342 @@
+import { z } from 'zod';
+import { supportedModelsSummary } from '../eval/llm-judge/pricing.js';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { IStorageAdapter } from '../types/query.js';
+import { LOCAL_TENANT } from '../types/tenant.js';
+import { verifyCitations } from '../eval/citation-verify/verifier.js';
+import type { LLMProvider } from '../eval/llm-judge/client.js';
+import { generateEvalId } from '../utils/ids.js';
+import { JUDGE_KEY_VARS } from '../judge-enablement.js';
+import { DAILY_BUDGET_VAR } from '../eval/llm-judge/budget.js';
+import { strictInput } from './strict-input.js';
+import { assertTraceExists, insertLinkedEvalResult } from './trace-link.js';
+import { besideNote } from '../eval/of-record.js';
+import { evidenceOf } from '../eval/evidence.js';
+import type { EvalEngine } from '../eval/engine.js';
+import { verdictSchema } from '../eval/response-schema.js';
+import { inferProvider, resolveApiKey } from './evaluate-with-llm-judge.js';
+import { describeTool, ERROR_ENVELOPE_SENTENCE } from './describe.js';
+import { advertisedOutput } from './advertise.js';
+import { irisError } from './errors.js';
+import { evaluationLinks, guarded, respond } from './respond.js';
+import { asRecord, asWarning, citationCostCeiling, domainCeiling, fetchCeiling, judgeBudgetFor } from './operator-ceilings.js';
+
+const inputSchema = {
+  output: z.string().min(1).describe('The agent output containing citations to verify'),
+  model: z
+    .string()
+    .describe(
+      `Judge model for per-citation verification. Supported: ${supportedModelsSummary()}; an unknown id is refused with the full priced list.`,
+    ),
+  provider: z.enum(['anthropic', 'openai']).optional().describe('Auto-detected from model when omitted'),
+  allow_fetch: z
+    .boolean()
+    .optional()
+    .describe('false skips fetching for this call. Fetching happens only when the operator sets IRIS_CITATION_ALLOW_FETCH=1; true cannot turn it on. SSRF-guarded regardless.'),
+  domain_allowlist: z
+    .array(z.string())
+    .optional()
+    .describe('Fetch only from these hostnames (suffix match). Narrows IRIS_CITATION_DOMAINS when the operator set it, never adds to it.'),
+  max_cost_usd_total: z
+    .number()
+    .positive()
+    .optional()
+    .describe('Cap TOTAL judge cost across all citations in this call, at most the operator\'s IRIS_CITATION_MAX_COST_USD_TOTAL (default 1.00 USD); the pipeline stops when the next call would exceed it'),
+  max_citations: z.number().int().positive().max(50).optional().describe('Max citations to verify (extras skipped, not errored); default 20, at most 50'),
+  per_source_timeout_ms: z.number().int().positive().optional().describe('Per-URL fetch timeout; default 10_000'),
+  per_source_max_bytes: z.number().int().positive().optional().describe('Per-URL body cap; default 5MB'),
+  trace_id: z.string().optional().describe('Keep the verification result beside a stored trace (id from log_trace / get_traces). It is listed with the trace and never replaces its verdict; an unknown id is rejected before any fetch or judge call'),
+};
+
+type CitationFailures = ReadonlyArray<{
+  resolveStatus: string;
+  resolveError?: { kind: string; message: string } | string;
+  judgeError?: { kind: string; message: string };
+}>;
+
+/**
+ * `passed: true` with `overall_score: null` is the honest answer when there
+ * was nothing to judge (no citations, none resolved). It is NOT the honest
+ * answer when citations resolved and the judge then failed on every one —
+ * a wrong API key, a model the provider refused, a parse failure — because
+ * the caller reads "passed" and ships. That case is IRIS_JUDGE_FAILED
+ * naming the cause; nothing is stored. (v0.6.0 acceptance pass, observation 3.)
+ */
+export function assertJudgeRan(result: {
+  totalResolved: number;
+  totalJudged: number;
+  citations: CitationFailures;
+}): void {
+  if (result.totalResolved === 0 || result.totalJudged > 0) return;
+  const judgeFailures = result.citations.flatMap((c) => (c.judgeError ? [c.judgeError] : []));
+  if (judgeFailures.length === 0) return;
+  const kinds = [...new Set(judgeFailures.map((e) => e.kind))].join(', ');
+  const first = judgeFailures[0].message;
+  throw irisError(
+    'IRIS_JUDGE_FAILED',
+    `verify_citations could not judge any of the ${result.totalResolved} resolved citation(s): the judge failed on every one (${kinds}). ` +
+      `Nothing was verified and nothing was stored, so there is no verdict. First error: ${first}`,
+    {
+      retryable: /timeout|rate_limit|server_error|daily_budget_reached/.test(kinds),
+      recovery: [
+        'Check the key and the model: a refused key or an unknown model fails every citation the same way.',
+        'Retry when the kind is a timeout, a rate limit or a provider server error.',
+        'Raise max_cost_usd_total when the kind is cost_cap_reached.',
+        `When the kind is daily_budget_reached, every judge call on this key has used the operator's ${DAILY_BUDGET_VAR} for today: retry after it resets, or the operator raises it.`,
+      ],
+    },
+  );
+}
+
+/** `kind` for one failure, `kind: n` for several; sorted so the text is stable. */
+function kindTally(kinds: readonly string[]): string {
+  const counts = new Map<string, number>();
+  for (const k of kinds) counts.set(k, (counts.get(k) ?? 0) + 1);
+  return [...counts.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, n]) => (n > 1 ? `${k}: ${n}` : k))
+    .join(', ');
+}
+
+/**
+ * What the stored row says about the citations that got no verdict, split
+ * by the stage that failed: the source (not resolved) or the judge (resolved,
+ * then no verdict). Empty when every citation was judged. The stored row
+ * carries no per-citation list, so this sentence is how a reader of the
+ * evaluation — on the dashboard or at iris://evaluations/{id} — tells a
+ * judge outage from a dead link (#407).
+ */
+export function unjudgedSummary(citations: CitationFailures): string {
+  const judge: string[] = [];
+  const source: string[] = [];
+  for (const c of citations) {
+    if (c.judgeError) judge.push(c.judgeError.kind);
+    else if (c.resolveStatus !== 'ok' && c.resolveError) {
+      source.push(typeof c.resolveError === 'string' ? 'unknown' : c.resolveError.kind);
+    }
+  }
+  const parts: string[] = [];
+  if (judge.length > 0) parts.push(`the judge failed on ${judge.length} resolved source${judge.length === 1 ? '' : 's'} (${kindTally(judge)})`);
+  if (source.length > 0) parts.push(`${source.length} source${source.length === 1 ? ' was' : 's were'} not resolved (${kindTally(source)})`);
+  return parts.length === 0 ? '' : `Not judged: ${parts.join('; ')}.`;
+}
+
+export const verifyCitationsOutputSchema = z.looseObject({
+  id: z.string().describe('the evaluation id; read it back at iris://evaluations/{id}'),
+  reference_trace_id: z.string().optional().describe('the trace this result is kept beside, when one was named; it is not that trace\'s verdict'),
+  overall_score: z.number().nullable().describe('supported / judged; null when nothing was judged'),
+  passed: z
+    .boolean()
+    .nullable()
+    .describe(
+      'true when every judged citation was supported; false when any judged citation was not; NULL when nothing was judged — no verdict, because nothing was verified. Until 0.10.0 that last case returned true.',
+    ),
+  verdict: verdictSchema.optional().describe('the composer verdict as evaluate_output prints it; state unknown when nothing was judged'),
+  total_unsupported: z.number().int().describe('judged citations the judge ruled unsupported — the number the verdict turns on'),
+  total_citations_found: z.number().int().describe('citations extracted from the output'),
+  total_resolved: z.number().int().describe('citations whose source was fetched'),
+  total_judged: z.number().int().describe('citations the judge ruled on'),
+  total_supported: z.number().int().describe('citations the judge found supported'),
+  total_cost_usd: z.number().describe('the spend across every judge call'),
+  warnings: z
+    .array(z.looseObject({ code: z.string(), field: z.string(), message: z.string() }))
+    .optional()
+    .describe('IRIS_ARGUMENT_NARROWED: an argument asked for more than the operator allows (fetching, domains or cost), and the operator\'s setting applied instead'),
+  citations: z.array(z.looseObject({ resolve_status: z.string() })).describe('per citation: the citation (raw, kind, identifier, offsets), resolve_status ok | skipped | error, resolve_error { kind, message } when the source was not resolved, source (url, status, content_type, bytes_fetched, truncated), judge (supported, confidence, rationale, cost_usd, latency_ms, tokens), judge_error { kind, message } when the source resolved but the judge gave no verdict'),
+});
+
+export function registerVerifyCitationsTool(server: McpServer, storage: IStorageAdapter, engine: EvalEngine): void {
+  const judgeBudget = judgeBudgetFor(engine, storage);
+  server.registerTool(
+    'verify_citations',
+    {
+      title: 'Verify Citations',
+      description: describeTool({
+        summary:
+          'Is each citation in an output supported by its source? Extracts, fetches (opt-in, SSRF-guarded) and judges on your key.',
+        does:
+          'Fetches only if the operator set IRIS_CITATION_ALLOW_FETCH=1, blocking private addresses. One judge call per resolved citation, within max_cost_usd_total. overall_score: supported / judged; null if none judged.',
+        whenNot:
+          `With no citations (evaluate_output). Without ${JUDGE_KEY_VARS.anthropic} or ${JUDGE_KEY_VARS.openai}.`,
+        returns: verifyCitationsOutputSchema,
+        errors:
+          'IRIS_JUDGE_NOT_ENABLED, IRIS_JUDGE_UNKNOWN_MODEL, IRIS_UNKNOWN_TRACE (before any spend); IRIS_JUDGE_FAILED when every judge call failed. ' + ERROR_ENVELOPE_SENTENCE,
+        siblings: {
+          evaluate_with_llm_judge: 'semantic scoring',
+          evaluate_output: 'the free deterministic path',
+        },
+      }),
+      inputSchema: strictInput(inputSchema),
+      outputSchema: advertisedOutput(verifyCitationsOutputSchema),
+      annotations: {
+        readOnlyHint: false,      // Writes eval_result + spends money
+        destructiveHint: false,   // Creates data; doesn't overwrite/delete
+        idempotentHint: false,    // External fetches + provider non-determinism
+        openWorldHint: true,      // Outbound HTTP to citation URLs + LLM provider API
+      },
+    },
+    guarded(async (args) => {
+      const provider = (args.provider as LLMProvider | undefined) ?? inferProvider(args.model);
+      const apiKey = resolveApiKey(provider, 'verify_citations');
+      // Operator settings are ceilings: an argument may narrow them, never widen them (operator-ceilings.ts).
+      const fetching = fetchCeiling(args.allow_fetch);
+      const domains = domainCeiling(args.domain_allowlist);
+      const cost = citationCostCeiling(args.max_cost_usd_total);
+      const warnings = [fetching.warning, domains.warning, cost.warning].filter((w) => w !== undefined);
+
+      // Refused before any fetch or judge call spends anything (#376).
+      if (args.trace_id) {
+        await assertTraceExists(storage, LOCAL_TENANT, args.trace_id);
+      }
+
+      const result = await verifyCitations({
+        output: args.output,
+        provider,
+        model: args.model,
+        apiKey,
+        allowFetch: fetching.allowFetch && !domains.none,
+        domainAllowlist: domains.allowlist,
+        maxCostUsdTotal: cost.value,
+        maxCitations: args.max_citations,
+        perSourceTimeoutMs: args.per_source_timeout_ms,
+        perSourceMaxBytes: args.per_source_max_bytes,
+        spend: judgeBudget().gate(LOCAL_TENANT),
+      });
+
+      assertJudgeRan(result);
+
+      const evalId = generateEvalId();
+      const score = result.overallScore ?? 0;
+      const unjudged = unjudgedSummary(result.citations);
+
+      // Persist so dashboard can surface. eval_type='custom' — same
+      // rationale as evaluate_with_llm_judge (spans all 4 heuristic
+      // categories). rule_results[0] carries per-citation summary. The
+      // composer's verdict is stored with it.
+      const row = engine.verdictOf({
+        id: evalId,
+        eval_type: 'custom',
+        output_text: args.output,
+        score,
+        passed: result.passed === true,
+        rule_results: [
+          {
+            ruleName: `semantic_citation_verify:${provider}/${args.model}`,
+            /*
+             * Null means nothing was judged, which is not a pass and not a
+             * failure — it is a check that did not run. Stored as a SKIP so
+             * the composer treats it as coverage rather than silently
+             * reading a paid-for "nothing verified" as clean.
+             */
+            passed: result.passed === null ? false : result.passed,
+            ...(result.passed === null
+              ? { skipped: true, skipReason: `no citation was judged (found ${result.totalCitationsFound}, resolved ${result.totalResolved})` }
+              : {}),
+            kind: 'judgment',
+            score,
+            message: [
+              result.overallScore === null
+                ? `No citations judged (found ${result.totalCitationsFound}, resolved ${result.totalResolved}, judged 0).`
+                : `${result.totalSupported}/${result.totalJudged} judged sources supported the output.`,
+              unjudged,
+            ]
+              .filter(Boolean)
+              .join(' '),
+          },
+        ],
+        rules_evaluated: 1,
+        rules_skipped: 0,
+        insufficient_data: result.overallScore === null,
+        eval_cost_usd: result.totalCostUsd,
+      }, evidenceOf({ output: args.output, recordedBy: 'agent' }), warnings.map(asRecord));
+      /*
+       * The one sentence the fields do not already carry: a citation check
+       * that judged nothing is not a pass, and a caller who reads only
+       * `passed` would take it for one. Appended after the composer has
+       * written its own notes, never in place of them.
+       */
+      if (result.passed === null) {
+        row.interpretations = [
+          ...(row.interpretations ?? []),
+          {
+            severity: 'block',
+            addressee: 'operator',
+            rule: `semantic_citation_verify:${provider}/${args.model}`,
+            text: 'No citation was judged, so nothing about the sources was verified. This is not a pass.',
+          },
+        ];
+      }
+      // Kept beside the trace, never as its verdict (eval/of-record.ts): the verifier answers its own question.
+      if (args.trace_id) {
+        row.reference_trace_id = args.trace_id;
+        if (row.provenance) row.provenance = { ...row.provenance, beside: ['citations'] };
+        row.interpretations = [besideNote(args.trace_id, ['citations']), ...(row.interpretations ?? [])];
+      }
+      await insertLinkedEvalResult(storage, LOCAL_TENANT, row);
+
+      return respond(
+        verifyCitationsOutputSchema,
+        {
+          id: evalId,
+          ...(args.trace_id ? { reference_trace_id: args.trace_id } : {}),
+          overall_score: result.overallScore,
+          passed: result.passed,
+          ...(row.verdict ? { verdict: row.verdict } : {}),
+          // Derived rather than read: the verifier reports it, but the tool
+          // must not break if a caller hands it an older shape.
+          total_unsupported: result.totalUnsupported ?? Math.max(0, result.totalJudged - result.totalSupported),
+          total_citations_found: result.totalCitationsFound,
+          total_resolved: result.totalResolved,
+          total_judged: result.totalJudged,
+          total_supported: result.totalSupported,
+          total_cost_usd: result.totalCostUsd,
+          citations: result.citations.map((c) => ({
+            citation: {
+              raw: c.citation.raw,
+              kind: c.citation.kind,
+              identifier: c.citation.identifier,
+              offset_start: c.citation.offsetStart,
+              offset_end: c.citation.offsetEnd,
+            },
+            resolve_status: c.resolveStatus,
+            /*
+             * Two fields, one per stage (#407). resolve_error says the
+             * source was not resolved; judge_error says it was, and the
+             * judge gave no verdict (cost cap, provider error, unreadable
+             * reply). Until 0.20.0 both went under resolve_error, so a
+             * `timeout` there could be the fetch or the judge.
+             */
+            resolve_error: c.resolveError,
+            judge_error: c.judgeError,
+            // Mapped to the documented snake_case keys. The verifier's
+            // internal shape is camelCase (contentType, bytesFetched) and
+            // used to be passed through verbatim, so a client parsing
+            // `source.content_type` per the description read undefined.
+            source: c.source
+              ? {
+                  url: c.source.url,
+                  status: c.source.status,
+                  content_type: c.source.contentType,
+                  bytes_fetched: c.source.bytesFetched,
+                  truncated: c.source.truncated,
+                }
+              : undefined,
+            judge: c.judge
+              ? {
+                  supported: c.judge.supported,
+                  confidence: c.judge.confidence,
+                  rationale: c.judge.rationale,
+                  cost_usd: c.judge.costUsd,
+                  latency_ms: c.judge.latencyMs,
+                  input_tokens: c.judge.inputTokens,
+                  output_tokens: c.judge.outputTokens,
+                }
+              : undefined,
+          })),
+          ...(warnings.length > 0 ? { warnings: warnings.map(asWarning) } : {}),
+        },
+        evaluationLinks(evalId, args.trace_id),
+      );
+    }),
+  );
+}

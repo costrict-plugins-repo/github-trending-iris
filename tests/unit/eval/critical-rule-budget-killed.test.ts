@@ -1,0 +1,168 @@
+import { describe, it, expect, afterAll } from 'vitest';
+import { EvalEngine } from '../../../src/eval/engine.js';
+import { createCustomRule } from '../../../src/eval/rules/index.js';
+import { shutdownRegexSandbox } from '../../../src/eval/rules/regex-sandbox.js';
+import type { CustomRuleDefinition } from '../../../src/types/eval.js';
+
+/*
+ * Where v0.5.0's two headline features MEET — and the suite had nothing
+ * here.
+ *
+ * Feature 1: a failing critical rule vetoes the evaluation, forcing
+ * passed=false regardless of the weighted score.
+ * Feature 2: a user regex whose match blows the 100ms sandbox budget is
+ * killed mid-backtrack and reports SKIPPED (fail-open, per rule).
+ *
+ * Intersect them and you get the seam: a deployed severity=critical regex
+ * rule, defeated by output CRAFTED to stall it, does not judge — and a
+ * rule that did not judge cannot veto. So the evaluation comes back
+ * passed=true, with no `critical_failures`, on output nobody cleared. An
+ * adversary who knows the pattern can reach that state on purpose.
+ *
+ * That behaviour is deliberate — failing closed would let the same
+ * adversary force false violations on benign output, which is worse for an
+ * eval product. What was NOT acceptable was leaving it undocumented and
+ * untested, with the only signal a prose line beside the result. These tests
+ * pin the fail-open contract so a future change to it has to be a decision,
+ * and assert the machine-readable `critical_skipped` marker a fail-closed
+ * gate consumes instead of walking rule_results[].budgetExceeded.
+ */
+
+/*
+ * The hostile pair: a pattern equivalent to ^(a|a)*$ matched against a long
+ * run of 'a' ending in 'b'. It passes safe-regex2's star-height heuristic
+ * and is exponential — exactly the class the sandbox worker exists for, and
+ * the same fuel tests/unit/eval/regex-circuit-breaker.test.ts uses.
+ *
+ * Assembled from parts rather than written as one literal so CodeQL's
+ * js/redos query does not raise a genuine (and here, entirely deliberate)
+ * high-severity alert on a test fixture. The engine receives the identical
+ * string either way; only the static analyser sees a difference.
+ */
+const HOSTILE_FUEL = 'a'.repeat(40) + 'b';
+const HOSTILE_PATTERN = ['^(', 'a', '|', 'a', ')', '*', '$'].join('');
+
+function hostileCriticalRule(name: string) {
+  const def: CustomRuleDefinition = {
+    name,
+    type: 'regex_match',
+    config: { pattern: HOSTILE_PATTERN },
+  };
+  // severity 'critical' is what deploy_rule sets for a hard-failing rule.
+  return createCustomRule(def, 'critical');
+}
+
+afterAll(() => {
+  shutdownRegexSandbox();
+});
+
+describe('a critical rule killed by the sandbox budget', () => {
+  it('skips instead of failing — it never judged the output', async () => {
+    const engine = new EvalEngine(0.7);
+    engine.registerRule('custom', hostileCriticalRule('crafted_stall'), 'rule-stall-1');
+
+    const result = await engine.evaluate('custom', { output: HOSTILE_FUEL });
+
+    const rule = result.rule_results.find((r) => r.ruleName === 'crafted_stall');
+    expect(rule).toBeDefined();
+    expect(rule!.skipped).toBe(true);
+    expect(rule!.budgetExceeded).toBe(true);
+  });
+
+  it('makes the verdict UNKNOWN — the fail-open seam, closed in 0.10.0', async () => {
+    const engine = new EvalEngine(0.7);
+    engine.registerRule('custom', hostileCriticalRule('crafted_stall'), 'rule-stall-2');
+    // A second, cheap rule that passes, so the evaluation is not
+    // "insufficient_data" and produces a real score to reason about.
+    engine.registerRule(
+      'custom',
+      createCustomRule({ name: 'cheap_check', type: 'min_length', config: { min_length: 5 } }),
+      'rule-cheap',
+    );
+
+    const result = await engine.evaluate('custom', { output: HOSTILE_FUEL });
+
+    expect(result.insufficient_data).toBe(false);
+    expect(result.rules_skipped).toBeGreaterThanOrEqual(1);
+    /*
+     * Until 0.10.0 this returned passed=true with no critical_failures, on
+     * output the critical rule was DEFEATED by rather than cleared — the
+     * seam the 2026-09-05 audit found and no configuration could close. The composer
+     * now returns a third state: the rule was asked and could not answer,
+     * so the verdict is unknown, and unknown does not read as passed.
+     *
+     * It is still not a veto: critical_failures stays empty, because
+     * nothing was detected. What changed is that "could not tell" stopped
+     * being reported as "clean".
+     */
+    expect(result.critical_failures).toBeUndefined();
+    expect(result.verdict?.state).toBe('unknown');
+    expect(result.verdict?.basis).toBe('critical_unknown');
+    expect(result.verdict?.by).toContain('crafted_stall');
+    expect(result.passed).toBe(false);
+    // And a deployment that would rather accept the risk can say so.
+    const permissive = new EvalEngine(0.7, undefined, { onCriticalSkipped: 'pass' });
+    permissive.registerRule('custom', hostileCriticalRule('crafted_stall'), 'rule-stall-2p');
+    permissive.registerRule('custom', createCustomRule({ name: 'cheap_check', type: 'min_length', config: { min_length: 5 } }), 'rule-cheap-p');
+    const allowed = await permissive.evaluate('custom', { output: HOSTILE_FUEL });
+    expect(allowed.passed).toBe(true);
+  });
+
+  it('reports the defeated rule in critical_skipped so a gate can fail closed', async () => {
+    const engine = new EvalEngine(0.7);
+    engine.registerRule('custom', hostileCriticalRule('crafted_stall'), 'rule-stall-3');
+    engine.registerRule(
+      'custom',
+      createCustomRule({ name: 'cheap_check', type: 'min_length', config: { min_length: 5 } }),
+      'rule-cheap',
+    );
+
+    const result = await engine.evaluate('custom', { output: HOSTILE_FUEL });
+
+    expect(result.critical_skipped).toEqual(['crafted_stall']);
+    // And it is stated in prose too, for the human reading the interpretations.
+    const notes = (result.interpretations ?? []).map((i) => i.text).join(' ');
+    expect(notes).toContain('could not answer');
+    expect(notes).toContain('crafted_stall');
+  });
+
+  it('leaves critical_skipped absent when every critical rule actually ran', async () => {
+    const engine = new EvalEngine(0.7);
+    engine.registerRule(
+      'custom',
+      createCustomRule(
+        { name: 'linear_forbidden', type: 'regex_no_match', config: { pattern: 'zzz' } },
+        'critical',
+      ),
+      'rule-linear',
+    );
+
+    const result = await engine.evaluate('custom', { output: 'a perfectly ordinary agent response' });
+
+    expect(result.critical_skipped).toBeUndefined();
+    expect(result.passed).toBe(true);
+  });
+
+  it('still vetoes when the critical rule DOES judge and fails', async () => {
+    const engine = new EvalEngine(0.7);
+    engine.registerRule(
+      'custom',
+      createCustomRule(
+        { name: 'linear_forbidden', type: 'regex_no_match', config: { pattern: 'forbidden' } },
+        'critical',
+      ),
+      'rule-linear-2',
+    );
+    engine.registerRule(
+      'custom',
+      createCustomRule({ name: 'cheap_check', type: 'min_length', config: { min_length: 5 } }, 'low'),
+      'rule-cheap-2',
+    );
+
+    const result = await engine.evaluate('custom', { output: 'this response contains a forbidden token' });
+
+    expect(result.critical_failures).toEqual(['linear_forbidden']);
+    expect(result.critical_skipped).toBeUndefined();
+    expect(result.passed).toBe(false);
+  });
+});

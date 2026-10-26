@@ -1,0 +1,361 @@
+{
+  "schemaVersion": 1,
+  "rule": "verbosity_ratio",
+  "category": "cost",
+  "family": "tokens",
+  "positiveClass": "fail",
+  "definition": "verbosity_ratio — the completion-to-prompt token ratio must not exceed the maximum: pass when completion_tokens / prompt_tokens ≤ max_token_ratio, default 5 (config key max_token_ratio); skipped when token usage is not provided. docs/api-reference.md §Cost Rules. Positive = ratio strictly over the maximum (the rule should FAIL).",
+  "source": "LLM-authored on 2026-09-04. Held out on 2026-09-23: the 7 case(s) copied from, varied from or modelled on the 24 real transcripts in tests/fixtures/real-transcripts (tokens-001, tokens-002, tokens-003, tokens-004, tokens-005, tokens-006, tokens-007) were removed, so no number this family publishes is estimated on a transcript, and the transcript line in proof/TRANSCRIPTS.md and proof/COMPOSITE.md is measured on cases none of these rates were estimated from. 6 replacement case(s), authored the same day and marked in their notes, bring the family back to the 24-case floor the runner enforces.",
+  "labelling": "LLM-authored and LLM-labelled against the documented definition on 2026-09-04; each note states the ratio and the maximum that decided the label.",
+  "labelBasis": "definition",
+  "authored": "2026-09-04",
+  "counts": {
+    "n": 24,
+    "positive": 12,
+    "negative": 12
+  },
+  "cases": [
+    {
+      "id": "tokens-008",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=100 completion_tokens=600.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 600,
+          "total_tokens": 700
+        }
+      },
+      "notes": "Six completion tokens per prompt token (ratio 6.0000 vs max 5)"
+    },
+    {
+      "id": "tokens-009",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=10 completion_tokens=51.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 10,
+          "completion_tokens": 51,
+          "total_tokens": 61
+        }
+      },
+      "notes": "Just over five (ratio 5.1000 vs max 5)"
+    },
+    {
+      "id": "tokens-010",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=1 completion_tokens=6.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 1,
+          "completion_tokens": 6,
+          "total_tokens": 7
+        }
+      },
+      "notes": "A one-token prompt with a six-token completion (ratio 6.0000 vs max 5)"
+    },
+    {
+      "id": "tokens-011",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=200 completion_tokens=2000.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 200,
+          "completion_tokens": 2000,
+          "total_tokens": 2200
+        }
+      },
+      "notes": "Ten to one (ratio 10.0000 vs max 5)"
+    },
+    {
+      "id": "tokens-012",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=50 completion_tokens=1000.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 50,
+          "completion_tokens": 1000,
+          "total_tokens": 1050
+        }
+      },
+      "notes": "Twenty to one (ratio 20.0000 vs max 5)"
+    },
+    {
+      "id": "tokens-013",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=100 completion_tokens=300 max_token_ratio=2.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 300,
+          "total_tokens": 400
+        },
+        "customConfig": {
+          "max_token_ratio": 2
+        }
+      },
+      "notes": "Over a lowered maximum of 2 (ratio 3.0000 vs max 2)"
+    },
+    {
+      "id": "tokens-014",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=100 completion_tokens=101 max_token_ratio=1.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 101,
+          "total_tokens": 201
+        },
+        "customConfig": {
+          "max_token_ratio": 1
+        }
+      },
+      "notes": "Just over a maximum of 1 (ratio 1.0100 vs max 1)"
+    },
+    {
+      "id": "tokens-015",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=1000 completion_tokens=5001.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 1000,
+          "completion_tokens": 5001,
+          "total_tokens": 6001
+        }
+      },
+      "notes": "One token over five to one (ratio 5.0010 vs max 5)"
+    },
+    {
+      "id": "tokens-016",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=3 completion_tokens=100.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 3,
+          "completion_tokens": 100,
+          "total_tokens": 103
+        }
+      },
+      "notes": "Runaway completion on a tiny prompt (ratio 33.3333 vs max 5)"
+    },
+    {
+      "id": "tokens-017",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=100 completion_tokens=500.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 500,
+          "total_tokens": 600
+        }
+      },
+      "notes": "Exactly five to one: the documented condition is ≤, so at the limit passes (ratio 5.0000 vs max 5)"
+    },
+    {
+      "id": "tokens-018",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=100 completion_tokens=499.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 499,
+          "total_tokens": 599
+        }
+      },
+      "notes": "Just under five to one (ratio 4.9900 vs max 5)"
+    },
+    {
+      "id": "tokens-019",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=1000 completion_tokens=1000.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 1000,
+          "completion_tokens": 1000,
+          "total_tokens": 2000
+        }
+      },
+      "notes": "One to one (ratio 1.0000 vs max 5)"
+    },
+    {
+      "id": "tokens-020",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=5000 completion_tokens=10.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 5000,
+          "completion_tokens": 10,
+          "total_tokens": 5010
+        }
+      },
+      "notes": "Much more prompt than completion (ratio 0.0020 vs max 5)"
+    },
+    {
+      "id": "tokens-021",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=100 completion_tokens=800 max_token_ratio=10.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 800,
+          "total_tokens": 900
+        },
+        "customConfig": {
+          "max_token_ratio": 10
+        }
+      },
+      "notes": "Under a raised maximum of 10 (ratio 8.0000 vs max 10)"
+    },
+    {
+      "id": "tokens-022",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=100 completion_tokens=100 max_token_ratio=1.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 100,
+          "total_tokens": 200
+        },
+        "customConfig": {
+          "max_token_ratio": 1
+        }
+      },
+      "notes": "Exactly a configured maximum of 1 (ratio 1.0000 vs max 1)"
+    },
+    {
+      "id": "tokens-023",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=absent completion_tokens=absent.",
+      "context": {},
+      "notes": "No token usage: the documented rule skips rather than judges (ratio undefined vs max 5)"
+    },
+    {
+      "id": "tokens-024",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=100 completion_tokens=0.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 0,
+          "total_tokens": 100
+        }
+      },
+      "notes": "An empty completion has ratio zero (ratio 0.0000 vs max 5)"
+    },
+    {
+      "id": "tokens-025",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=2000 completion_tokens=6000.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 2000,
+          "completion_tokens": 6000,
+          "total_tokens": 8000
+        }
+      },
+      "notes": "Three to one (ratio 3.0000 vs max 5)"
+    },
+    {
+      "id": "tokens-026",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=300 completion_tokens=1600.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 300,
+          "completion_tokens": 1600,
+          "total_tokens": 1900
+        }
+      },
+      "notes": "A short prompt answered at length (ratio 5.3333 vs max 5). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "tokens-027",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=120 completion_tokens=2400.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 120,
+          "completion_tokens": 2400,
+          "total_tokens": 2520
+        }
+      },
+      "notes": "A one-line prompt that produced a long essay (ratio 20.0000 vs max 5). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "tokens-028",
+      "rule": "verbosity_ratio",
+      "label": "positive",
+      "output": "Run completed. prompt_tokens=800 completion_tokens=4100.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 800,
+          "completion_tokens": 4100,
+          "total_tokens": 4900
+        }
+      },
+      "notes": "Just over the maximum (ratio 5.1250 vs max 5). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "tokens-029",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=5200 completion_tokens=310.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 5200,
+          "completion_tokens": 310,
+          "total_tokens": 5510
+        }
+      },
+      "notes": "A long context answered briefly (ratio 0.0596 vs max 5). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "tokens-030",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=950 completion_tokens=1400.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 950,
+          "completion_tokens": 1400,
+          "total_tokens": 2350
+        }
+      },
+      "notes": "A moderate expansion (ratio 1.4737 vs max 5). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "tokens-031",
+      "rule": "verbosity_ratio",
+      "label": "negative",
+      "output": "Run completed. prompt_tokens=1800 completion_tokens=620.",
+      "context": {
+        "tokenUsage": {
+          "prompt_tokens": 1800,
+          "completion_tokens": 620,
+          "total_tokens": 2420
+        }
+      },
+      "notes": "A typical question-and-answer turn (ratio 0.3444 vs max 5). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    }
+  ]
+}

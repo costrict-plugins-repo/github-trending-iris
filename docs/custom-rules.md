@@ -1,0 +1,995 @@
+# Custom Eval Rules
+
+Define your own evaluation criteria. Iris ships with 26 built-in rules across completeness, relevance, safety, and cost. Custom rules let you enforce domain-specific requirements — regulatory compliance, output format constraints, brand guidelines, budget limits — evaluated with the same weighted scoring engine.
+
+**How it works:** Pass a `custom_rules` array to `evaluate_output` with `eval_type: "custom"`. Each rule runs against the output and produces a score between 0 and 1; the engine reports their weighted average as `score`. The verdict (`passed`) is composed by kind, never by that score: rules deployed with severity `high`/`critical` gate the evaluation when they fail (inline `custom_rules` carry no severity and advise), and the rest of the verdict is decided as the API reference describes under "Scoring and the verdict". A critical rule that SKIPPED — missing context, a broken definition, or a regex killed at the sandbox budget — has not judged the output and does not veto; every such rule is named in `critical_skipped`. A gate that must fail closed treats a non-empty `critical_skipped` as unknown, not clean, and may treat any `budgetExceeded` skip in `rule_results` the same way.
+
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Rule Types](#rule-types)
+  - [regex_match](#regex_match)
+  - [regex_no_match](#regex_no_match)
+  - [min_length](#min_length)
+  - [max_length](#max_length)
+  - [contains_keywords](#contains_keywords)
+  - [excludes_keywords](#excludes_keywords)
+  - [json_schema](#json_schema)
+  - [cost_threshold](#cost_threshold)
+- [Scoring and Weights](#scoring-and-weights)
+- [ReDoS Protection](#redos-protection)
+- [Combining Built-in and Custom Rules](#combining-built-in-and-custom-rules)
+- [Registering Rules Programmatically](#registering-rules-programmatically)
+- [Reusable Rule Packages](#reusable-rule-packages)
+- [Real-World Examples](#real-world-examples)
+  - [HIPAA Compliance Check](#hipaa-compliance-check)
+  - [Financial Accuracy Validation](#financial-accuracy-validation)
+  - [Brand Voice Enforcement](#brand-voice-enforcement)
+
+---
+
+## Quick Start
+
+The simplest custom rule: check that the output is valid JSON.
+
+```json
+{
+  "output": "{\"status\": \"ok\", \"count\": 42}",
+  "eval_type": "custom",
+  "custom_rules": [
+    {
+      "name": "valid_json",
+      "type": "json_schema",
+      "config": {}
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "id": "eval_...",
+  "score": 1,
+  "passed": true,
+  "rule_results": [
+    {
+      "ruleName": "valid_json",
+      "passed": true,
+      "score": 1,
+      "message": "Output is valid JSON"
+    }
+  ]
+}
+```
+
+Add a second rule to require a minimum length. Now both rules contribute to the final score:
+
+```json
+{
+  "output": "{\"status\": \"ok\", \"count\": 42}",
+  "eval_type": "custom",
+  "custom_rules": [
+    {
+      "name": "valid_json",
+      "type": "json_schema",
+      "config": {},
+      "weight": 2
+    },
+    {
+      "name": "not_trivial",
+      "type": "min_length",
+      "config": { "min_length": 10 }
+    }
+  ]
+}
+```
+
+The `json_schema` rule has weight 2, `min_length` has weight 1 (default). Final score: `(1*2 + 1*1) / (2+1) = 1.0`.
+
+---
+
+## Rule Types
+
+Every custom rule has the same structure:
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | `string` | Yes | -- | Your identifier for this rule |
+| `type` | `string` | Yes | -- | One of the 9 types below |
+| `config` | `object` | Yes | -- | Type-specific configuration |
+| `weight` | `number` | No | `1` | Weight in the final score calculation |
+
+### regex_match
+
+Output must match a regex pattern. Use for format validation, required structures, or content patterns.
+
+**Config:**
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `pattern` | `string` | Yes | Regular expression pattern |
+| `flags` | `string` | No | Regex flags (e.g., `"i"` for case-insensitive, `"g"` for global) |
+
+**Scoring:** Binary. 1 if the pattern matches, 0 if it does not.
+
+```json
+{
+  "name": "has_version_number",
+  "type": "regex_match",
+  "config": { "pattern": "v\\d+\\.\\d+\\.\\d+", "flags": "i" }
+}
+```
+
+```json
+{
+  "name": "starts_with_json_object",
+  "type": "regex_match",
+  "config": { "pattern": "^\\s*\\{" }
+}
+```
+
+```json
+{
+  "name": "contains_iso_date",
+  "type": "regex_match",
+  "config": { "pattern": "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}" }
+}
+```
+
+**Safety:** All regex patterns go through [ReDoS protection](#redos-protection) before execution.
+
+---
+
+### regex_no_match
+
+Output must NOT match a regex pattern. Use for blocking forbidden content, internal URLs, or data leakage.
+
+**Config:** Same as `regex_match`.
+
+**Scoring:** Binary. 1 if the pattern does NOT match, 0 if it does.
+
+```json
+{
+  "name": "no_internal_urls",
+  "type": "regex_no_match",
+  "config": { "pattern": "https?://internal\\.", "flags": "i" }
+}
+```
+
+```json
+{
+  "name": "no_raw_api_keys",
+  "type": "regex_no_match",
+  "config": { "pattern": "sk-[a-zA-Z0-9]{20,}" }
+}
+```
+
+---
+
+### min_length
+
+Output must be at least N characters long. Use to enforce substantive responses.
+
+**Config:**
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `min_length` | `number` | Yes | Minimum character count (`length` and `min` are accepted as aliases) |
+
+**Scoring:** Partial credit. If the output is shorter than the minimum, score is `output.length / min`. A 150-character output against a 200-character minimum scores `0.75`.
+
+```json
+{
+  "name": "substantial_answer",
+  "type": "min_length",
+  "config": { "min_length": 200 }
+}
+```
+
+---
+
+### max_length
+
+Output must be at most N characters long. Use to enforce concise responses or API payload limits.
+
+**Config:**
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `max_length` | `number` | Yes | Maximum character count (`length` and `max` are accepted as aliases) |
+
+**Scoring:** Partial credit. If the output exceeds the maximum, score is `max / output.length`. A 600-character output against a 500-character maximum scores `0.833`.
+
+```json
+{
+  "name": "concise_summary",
+  "type": "max_length",
+  "config": { "max_length": 500 }
+}
+```
+
+---
+
+### contains_keywords
+
+Output must contain specified keywords. Case-insensitive matching.
+
+**Config:**
+
+| Key | Type | Required | Default | Description |
+|-----|------|----------|---------|-------------|
+| `keywords` | `string[]` | Yes | -- | Keywords to look for |
+| `threshold` | `number` | No | `1` | Fraction of keywords that must be present (0 to 1) |
+
+**Scoring:** Proportional. Score is `found_count / total_keywords`. If you require 4 keywords and 3 are found, score is `0.75`. The rule passes when the score meets or exceeds the `threshold`.
+
+```json
+{
+  "name": "covers_required_sections",
+  "type": "contains_keywords",
+  "config": {
+    "keywords": ["summary", "methodology", "results", "conclusion"],
+    "threshold": 0.75
+  }
+}
+```
+
+With `threshold: 0.75`, the rule passes if 3 out of 4 keywords are found. The score still reflects the actual ratio (e.g., `0.75` for 3/4).
+
+```json
+{
+  "name": "mentions_key_terms",
+  "type": "contains_keywords",
+  "config": {
+    "keywords": ["latency", "throughput", "error rate"]
+  }
+}
+```
+
+Without a `threshold`, all keywords must be present (default threshold is `1`).
+
+---
+
+### excludes_keywords
+
+Output must NOT contain any of the specified keywords. Case-insensitive matching.
+
+**Config:**
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `keywords` | `string[]` | Yes | Forbidden keywords |
+
+**Scoring:** Binary. 1 if none found, 0 if any found. The message reports which keywords were detected.
+
+```json
+{
+  "name": "no_competitor_mentions",
+  "type": "excludes_keywords",
+  "config": { "keywords": ["acme corp", "rival inc", "othertool"] }
+}
+```
+
+---
+
+### json_schema
+
+Output must be valid JSON, and — when you supply one — must match the schema you supply.
+
+**Config:** `schema` (optional). Omit it and the rule passes any parseable JSON and says so in its message; this is exactly what the rule did before v0.11.0, so a rule you already deployed goes on meaning what it meant. Supply one and the parsed output is validated against it.
+
+**Scoring:** Binary. 1 when the output parses and (if a schema is configured) matches it; 0 otherwise. The message names the JSON Pointer and the keyword that rejected the output, never the value.
+
+**A schema Iris will not compile is refused when you deploy the rule**, not silently ignored while it runs. Schemas go through the same guard ladder a tools catalogue does: size, depth and node caps, local `$ref` only, star height and a backtracking probe on every `pattern`. `format` is treated as an annotation and is not enforced, so `format: "email"` documents the field without deciding the verdict.
+
+```json
+{
+  "name": "valid_json_response",
+  "type": "json_schema",
+  "config": {
+    "schema": {
+      "type": "object",
+      "properties": { "id": { "type": "string" }, "count": { "type": "integer" } },
+      "required": ["id", "count"],
+      "additionalProperties": false
+    }
+  }
+}
+```
+
+Use `json_schema` in combination with `regex_match` or `contains_keywords` to validate both structure and content:
+
+```json
+[
+  {
+    "name": "valid_json",
+    "type": "json_schema",
+    "config": {},
+    "weight": 2
+  },
+  {
+    "name": "has_required_fields",
+    "type": "contains_keywords",
+    "config": { "keywords": ["\"status\"", "\"data\"", "\"timestamp\""] }
+  }
+]
+```
+
+---
+
+### cost_threshold
+
+Execution cost must be under a USD limit. Reads the `cost_usd` value from the evaluation context.
+
+**Config:**
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `max_cost` | `number` | Yes | Maximum cost in USD (`max_usd` is accepted as an alias) |
+
+**Scoring:** Binary. 1 if cost is at or under the threshold, 0 if over.
+
+The rule reads `cost_usd` from the `evaluate_output` call. When `cost_usd` is not passed, the rule **skips** — `skipped: true`, `skipReason: "context.costUsd not provided"` — rather than passing or failing: it is excluded from the weighted score, and a deployed rule with severity `high`/`critical` is named in `critical_skipped` so a gate that must fail closed can see the rule did not run. (Before v0.5.1 a missing cost was read as `$0` and the rule passed.) Pass `cost_usd`:
+
+```json
+{
+  "output": "The analysis is complete.",
+  "eval_type": "custom",
+  "cost_usd": 0.03,
+  "custom_rules": [
+    {
+      "name": "budget_limit",
+      "type": "cost_threshold",
+      "config": { "max_cost": 0.05 },
+      "weight": 2
+    }
+  ]
+}
+```
+
+---
+
+### action_policy
+
+What the agent may DO, not what it wrote: the tools it is allowed to call, and with what arguments. Needs `tool_calls` on the trace — a trace without them is `not_applicable`, never a silent pass.
+
+```json
+{
+  "name": "no-delete-tools",
+  "type": "action_policy",
+  "config": {
+    "deny": [{ "tool": "delete_*" }]
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `allow` | `object[]` | No | Only these calls are permitted; anything else fails the rule |
+| `deny` | `object[]` | No | These calls fail the rule |
+
+**Each entry is an OBJECT, not a bare glob.** `{ "tool": "<glob>" }` matches by tool name; add `"args"` to match on arguments too:
+
+```json
+{ "deny": [{ "tool": "shell", "args": { "command": "rm -rf *" } }] }
+```
+
+A bare string (`"deny": ["delete_*"]`) is refused with a 400 that names the shape. At least one of `allow` or `deny` is required.
+
+Deployed at `severity: high` or `critical` the rule GATES: a denied call makes the verdict `fail` with `basis: policy_gate`. At `medium` or `low` it advises — the deployment's own statement of how much it matters (see [Rule severity](#combining-built-in-and-custom-rules)).
+
+## Scoring and Weights
+
+### Weighted Average
+
+The final score is a weighted average of all rule scores:
+
+```
+score = sum(rule_score * rule_weight) / sum(rule_weight)
+```
+
+Example with three rules:
+
+| Rule | Score | Weight | Contribution |
+|------|-------|--------|-------------|
+| `valid_json` | 1.0 | 2 | 2.0 |
+| `min_length` | 0.6 | 1 | 0.6 |
+| `has_keywords` | 0.75 | 1.5 | 1.125 |
+
+Final score: `(2.0 + 0.6 + 1.125) / (2 + 1 + 1.5)` = `3.725 / 4.5` = **0.828**
+
+### Pass/Fail Threshold
+
+`eval.defaultThreshold` (default `0.7`) governs only the legacy `score` gradient; since 0.10.0 it does not decide `passed` (see the API reference, "Scoring and the verdict"). Configure it at server initialization:
+
+```typescript
+const evalEngine = new EvalEngine(0.85); // stricter threshold
+```
+
+### Scoring by Rule Type
+
+| Rule Type | Scoring Model | Partial Credit? |
+|-----------|--------------|-----------------|
+| `regex_match` | Binary (0 or 1) | No |
+| `regex_no_match` | Binary (0 or 1) | No |
+| `min_length` | `output.length / min` | Yes |
+| `max_length` | `max / output.length` | Yes |
+| `contains_keywords` | `found / total` | Yes |
+| `excludes_keywords` | Binary (0 or 1) | No |
+| `json_schema` | Binary (0 or 1) | No |
+| `cost_threshold` | Binary (0 or 1) | No |
+
+### Weight Strategy
+
+Use higher weights for rules that matter more to your use case:
+
+- **Correctness rules** (JSON validity, required fields): weight 2-3
+- **Quality rules** (length, keyword coverage): weight 1
+- **Nice-to-have rules** (formatting preferences): weight 0.5
+
+The default weight is `1` when omitted.
+
+---
+
+## ReDoS Protection
+
+Protection has two layers. The static checks below reject obviously dangerous patterns up front with a clear message — but static analysis of backtracking is undecidable in general, and some superlinear patterns pass every static check. So the layer that actually holds is at runtime: **every match of a user-supplied pattern executes in a sandbox worker thread with a hard 100ms deadline, counted from the moment the match starts**. Time the match spends waiting for a busy host to schedule the worker is not charged to the pattern, so an ordinary pattern is not killed because the machine is loaded; a worker that has not started the match within 5 s is reported as a sandbox error, not as backtracking. A match still backtracking at the deadline is terminated mid-execution — a hostile pattern (or a hostile output crafted to stall a legitimate pattern) cannot hang the server, no matter what the static checks missed.
+
+### Layer 1 — static checks (fast rejection with a clear message)
+
+1. **Patterns longer than 1000 characters.** Rejected immediately with the message `Regex pattern too long (N > 1000)`.
+
+2. **Invalid regex syntax.** Patterns that fail `new RegExp()` are caught with the native error message.
+
+3. **Exponential star-height patterns.** Iris uses [`safe-regex2`](https://www.npmjs.com/package/safe-regex2) to detect nested-quantifier blowup. Rejected patterns produce: `Regex pattern rejected: potentially unsafe (catastrophic backtracking)`.
+
+4. **Deploy-time probe** (`deploy_rule` and the dashboard composer only): candidate patterns are also test-run against short adversarial payloads inside the sandbox; a pattern that blows a 50ms budget on a ≤128-character input is rejected before it is persisted.
+
+Examples rejected statically (nested quantifiers — caught by safe-regex2):
+
+```
+(a+)+$           — nested quantifiers
+(a+){2,}         — nested quantifiers
+(.*a){20}        — greedy quantifier under bounded repetition
+([a-zA-Z]+)*     — character class with nested quantifier
+```
+
+### Layer 2 — the runtime sandbox deadline (the actual safety boundary)
+
+Some patterns pass every static check and still backtrack catastrophically:
+
+```
+(a|a)*$          — exponential, but star height 1: safe-regex2 judges it safe
+a*a*a*a*a*b      — polynomial: no nesting at all
+.*.*.*.*=.*      — polynomial: slow only on long inputs with no '='
+```
+
+These deploy (or arrive inline via `custom_rules`) — and at evaluation time their match runs in the sandbox worker. If the match exceeds the 100ms budget on a given output, the worker is killed and the rule reports **skipped** for that evaluation with `budgetExceeded: true` and the message `Regex evaluation terminated: pattern exceeded the 100ms matching budget…`. The server keeps serving; other rules in the same evaluation still run.
+
+**This is fail-open per rule, and you should know it.** A budget-killed rule did not judge the output — and an adversary who knows your pattern can CRAFT output that stalls it into skipping, letting the rest of the rules decide. That trade-off is deliberate: failing closed would let the same adversary force false violations on benign output, which is worse for an eval product. The `budgetExceeded` flag on the rule result exists precisely so a consumer that must fail closed can do so on its own terms — the recipe is the same everywhere: treat a non-empty `critical_skipped` as unknown, not clean, and optionally treat any `skipped && budgetExceeded` result in `rule_results` as a failure too.
+
+Two additional bounds keep a hostile output from stalling a request repeatedly:
+
+- **Per-evaluation circuit breaker**: after 3 budget breaches in one evaluation, remaining regex rules skip without running (also reported with `budgetExceeded: true`) — including provably safe linear patterns later in the same evaluation, which is the non-obvious part: an open breaker is a per-request stop, not a per-pattern judgment. The dashboard's rule-preview endpoint shares one breaker across all traces in a preview for the same reason.
+- **Inline rule cap**: `evaluate_output` accepts at most 10 `custom_rules` per call — persistent rule sets belong in `deploy_rule`, where deploy-time validation probes each pattern.
+
+### Examples of Safe Patterns
+
+These patterns are accepted and run normally:
+
+```
+v\d+\.\d+\.\d+                   — version number
+https?://[^\s]+                   — URL detection
+\b\d{3}-\d{2}-\d{4}\b            — SSN format
+"[a-zA-Z_]+"\s*:\s*              — JSON key pattern
+^\s*\{[\s\S]*\}\s*$              — wrapped in braces (non-backtracking)
+```
+
+### What Happens on Rejection
+
+A **statically rejected** pattern (length, syntax, safe-regex2) makes the rule report `skipped: true` with `configInvalid` — the rule could not run at all, so it neither passes nor deflates the score, and the message names the exact problem. Deploy-time validation rejects these outright with a 400 before they are ever persisted.
+
+A **budget-exceeded** match reports `skipped: true` + `budgetExceeded: true` for that evaluation only (no `configInvalid` — the same pattern may be fine on the next output; the breach is a property of pattern × input). The rule's skip reason appears verbatim on its own row in `rule_results` as `skipReason`, telling the rule author to bound quantifiers (e.g. `\s{0,8}` rather than `\s*`) and remove overlapping alternatives.
+
+---
+
+## Combining Built-in and Custom Rules
+
+**Since v0.5.0, inline `custom_rules` are additive.** They fire regardless of `eval_type`, running together with whatever bundle `eval_type` selects — one `evaluate_output` call, one weighted score. Before v0.5.0, passing `custom_rules` alongside `eval_type: "safety"` silently discarded them; that is fixed.
+
+The two knobs compose like this:
+
+| Call | Rules that run |
+|---|---|
+| `eval_type: "safety"` | the safety built-ins + your deployed rules on `safety` |
+| `eval_type: "safety"` + `custom_rules: [...]` | the above **plus** your inline rules — one score |
+| `eval_type: "custom"` + `custom_rules: [...]` | **only** your inline rules + your deployed rules whose eval type is `custom` (there is no built-in `custom` bundle) |
+| `eval_type: "custom"` with no `custom_rules` | only your deployed `custom` rules |
+
+### Run Built-in and Custom Together (one call)
+
+```json
+{
+  "output": "Patient records indicate...",
+  "eval_type": "safety",
+  "trace_id": "trc_abc123",
+  "custom_rules": [
+    {
+      "name": "no_patient_names",
+      "type": "regex_no_match",
+      "config": { "pattern": "\\b[A-Z][a-z]+ [A-Z][a-z]+\\b" }
+    },
+    {
+      "name": "has_disclaimer",
+      "type": "contains_keywords",
+      "config": { "keywords": ["not medical advice", "consult a physician"] }
+    }
+  ]
+}
+```
+
+The safety built-ins and both inline rules are weighted into a single `score`, and every rule appears in `rule_results`. A failing **critical** rule (`no_pii`, `no_injection_patterns`, `no_blocklist_words`) still forces `passed: false` regardless of that score, and names itself in `critical_failures`.
+
+### Run Them Sequentially (optional style)
+
+Separate calls remain perfectly valid, and are the right shape when you want the built-in verdict and the domain verdict scored independently rather than averaged together:
+
+```json
+{
+  "output": "Patient records indicate...",
+  "eval_type": "safety",
+  "trace_id": "trc_abc123"
+}
+```
+
+```json
+{
+  "output": "Patient records indicate...",
+  "eval_type": "custom",
+  "trace_id": "trc_abc123",
+  "custom_rules": [
+    {
+      "name": "no_patient_names",
+      "type": "regex_no_match",
+      "config": { "pattern": "\\b[A-Z][a-z]+ [A-Z][a-z]+\\b" }
+    }
+  ]
+}
+```
+
+Both evaluations are linked to the same trace via `trace_id` and appear together in the dashboard. Choose per call: one evaluation when you want one verdict, two when you want two.
+
+### Extend Built-in Rules Programmatically
+
+Use `registerRule()` to add rules to built-in eval types without replacing them. See [Registering Rules Programmatically](#registering-rules-programmatically).
+
+---
+
+## Registering Rules Programmatically
+
+The `EvalEngine.registerRule()` method adds rules to any built-in eval type. Registered rules run alongside the defaults — they don't replace them.
+
+### API
+
+```typescript
+registerRule(evalType: EvalType, rule: EvalRule): void
+```
+
+**`EvalType`:** `'completeness' | 'relevance' | 'safety' | 'cost' | 'custom'`
+
+**`EvalRule` interface:**
+
+```typescript
+interface EvalRule {
+  name: string;
+  description: string;
+  evalType: EvalType;
+  weight: number;
+  evaluate(context: EvalContext): EvalRuleResult;
+}
+```
+
+**`EvalContext`:**
+
+```typescript
+interface EvalContext {
+  output: string;
+  expected?: string;
+  input?: string;
+  toolCalls?: Array<{ tool_name: string; input?: unknown; output?: unknown }>;
+  tokenUsage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  costUsd?: number;
+  metadata?: Record<string, unknown>;
+  customConfig?: Record<string, unknown>;
+}
+```
+
+**`EvalRuleResult`:**
+
+```typescript
+interface EvalRuleResult {
+  ruleName: string;
+  passed: boolean;
+  score: number;   // 0 to 1
+  message: string;
+}
+```
+
+### Example: Add a Custom Completeness Rule
+
+```typescript
+import { EvalEngine } from 'iris-eval/eval';
+
+const engine = new EvalEngine(0.7);
+
+engine.registerRule('completeness', {
+  name: 'has_code_example',
+  description: 'Response must include a code block',
+  evalType: 'completeness',
+  weight: 1.5,
+  evaluate(context) {
+    const hasCode = /```[\s\S]*?```/.test(context.output);
+    return {
+      ruleName: 'has_code_example',
+      passed: hasCode,
+      score: hasCode ? 1 : 0,
+      message: hasCode ? 'Code example found' : 'No code example in response',
+    };
+  },
+});
+
+// Now every "completeness" eval includes this rule alongside the 4 built-in ones
+const result = engine.evaluate('completeness', { output: '...' });
+```
+
+### Example: Add a Custom Safety Rule
+
+```typescript
+engine.registerRule('safety', {
+  name: 'no_internal_project_names',
+  description: 'Output must not leak internal project codenames',
+  evalType: 'safety',
+  weight: 2,
+  evaluate(context) {
+    const codenames = ['project-atlas', 'operation-phoenix', 'codename-nebula'];
+    const lower = context.output.toLowerCase();
+    const found = codenames.filter(name => lower.includes(name));
+    return {
+      ruleName: 'no_internal_project_names',
+      passed: found.length === 0,
+      score: found.length === 0 ? 1 : 0,
+      message: found.length === 0
+        ? 'No internal project names detected'
+        : `Leaked project names: ${found.join(', ')}`,
+    };
+  },
+});
+```
+
+---
+
+## Reusable Rule Packages
+
+Group related rules into a function that registers them all at once. This pattern lets you share domain-specific rule sets across projects.
+
+### Pattern: Rule Package Function
+
+```typescript
+import type { EvalEngine } from 'iris-eval/eval';
+
+export function registerHipaaRules(engine: EvalEngine): void {
+  engine.registerRule('safety', {
+    name: 'hipaa_no_phi',
+    description: 'Detects Protected Health Information patterns',
+    evalType: 'safety',
+    weight: 3,
+    evaluate(context) {
+      const patterns = [
+        { name: 'MRN', regex: /\bMRN[:\s]*\d{6,}\b/i },
+        { name: 'DOB', regex: /\b(?:DOB|date of birth)[:\s]*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b/i },
+        { name: 'Diagnosis Code', regex: /\b[A-Z]\d{2}\.\d{1,4}\b/ },
+      ];
+      const found = patterns.filter(p => p.regex.test(context.output)).map(p => p.name);
+      return {
+        ruleName: 'hipaa_no_phi',
+        passed: found.length === 0,
+        score: found.length === 0 ? 1 : 0,
+        message: found.length === 0
+          ? 'No PHI patterns detected'
+          : `PHI detected: ${found.join(', ')}`,
+      };
+    },
+  });
+
+  engine.registerRule('safety', {
+    name: 'hipaa_disclaimer_present',
+    description: 'Response must include HIPAA-appropriate disclaimer',
+    evalType: 'safety',
+    weight: 2,
+    evaluate(context) {
+      const lower = context.output.toLowerCase();
+      const hasDisclaimer = lower.includes('not medical advice') ||
+        lower.includes('consult your healthcare provider') ||
+        lower.includes('hipaa');
+      return {
+        ruleName: 'hipaa_disclaimer_present',
+        passed: hasDisclaimer,
+        score: hasDisclaimer ? 1 : 0,
+        message: hasDisclaimer
+          ? 'HIPAA-appropriate disclaimer found'
+          : 'Missing HIPAA disclaimer',
+      };
+    },
+  });
+}
+```
+
+### Usage
+
+```typescript
+import { EvalEngine } from 'iris-eval/eval';
+import { registerHipaaRules } from './rules/hipaa.js';
+
+const engine = new EvalEngine(0.8);
+registerHipaaRules(engine);
+
+// Safety evals now include the 4 built-in safety rules + 2 HIPAA rules
+```
+
+### Pattern: Rule Package as a Config Array
+
+For teams that prefer JSON configuration over code, export rule definitions as `CustomRuleDefinition[]` arrays:
+
+```typescript
+import type { CustomRuleDefinition } from 'iris-eval/types/eval';
+
+export const financialAccuracyRules: CustomRuleDefinition[] = [
+  {
+    name: 'valid_json_output',
+    type: 'json_schema',
+    config: {},
+    weight: 2,
+  },
+  {
+    name: 'has_currency_format',
+    type: 'regex_match',
+    config: { pattern: '\\$[\\d,]+\\.\\d{2}', flags: '' },
+    weight: 1.5,
+  },
+  {
+    name: 'no_approximations',
+    type: 'excludes_keywords',
+    config: { keywords: ['approximately', 'roughly', 'about', 'around', 'estimated'] },
+    weight: 1,
+  },
+  {
+    name: 'budget_per_call',
+    type: 'cost_threshold',
+    config: { max_cost: 0.02 },
+    weight: 2,
+  },
+];
+```
+
+Then pass the array directly:
+
+```json
+{
+  "output": "{\"total\": \"$1,234.56\", \"tax\": \"$98.77\"}",
+  "eval_type": "custom",
+  "cost_usd": 0.015,
+  "custom_rules": [
+    { "name": "valid_json_output", "type": "json_schema", "config": {}, "weight": 2 },
+    { "name": "has_currency_format", "type": "regex_match", "config": { "pattern": "\\$[\\d,]+\\.\\d{2}" }, "weight": 1.5 },
+    { "name": "no_approximations", "type": "excludes_keywords", "config": { "keywords": ["approximately", "roughly", "about", "around", "estimated"] } },
+    { "name": "budget_per_call", "type": "cost_threshold", "config": { "max_cost": 0.02 }, "weight": 2 }
+  ]
+}
+```
+
+---
+
+## Real-World Examples
+
+### HIPAA Compliance Check
+
+A healthcare agent must not leak Protected Health Information and should include appropriate disclaimers.
+
+```json
+{
+  "output": "Based on the symptoms described, this could indicate a respiratory infection. Treatment options include rest, fluids, and over-the-counter medications. This information is not medical advice — consult your healthcare provider for diagnosis and treatment.",
+  "eval_type": "custom",
+  "custom_rules": [
+    {
+      "name": "no_ssn",
+      "type": "regex_no_match",
+      "config": { "pattern": "\\b\\d{3}-\\d{2}-\\d{4}\\b" },
+      "weight": 3
+    },
+    {
+      "name": "no_mrn",
+      "type": "regex_no_match",
+      "config": { "pattern": "\\bMRN[:\\s]*\\d{6,}\\b", "flags": "i" },
+      "weight": 3
+    },
+    {
+      "name": "no_dob_pattern",
+      "type": "regex_no_match",
+      "config": { "pattern": "\\b(?:DOB|date of birth)[:\\s]*\\d{1,2}[\\/\\-]\\d{1,2}[\\/\\-]\\d{2,4}\\b", "flags": "i" },
+      "weight": 3
+    },
+    {
+      "name": "no_patient_identifiers",
+      "type": "excludes_keywords",
+      "config": { "keywords": ["patient name", "medical record", "insurance id", "policy number"] },
+      "weight": 2
+    },
+    {
+      "name": "has_disclaimer",
+      "type": "contains_keywords",
+      "config": {
+        "keywords": ["not medical advice", "consult"],
+        "threshold": 0.5
+      },
+      "weight": 2
+    },
+    {
+      "name": "sufficient_detail",
+      "type": "min_length",
+      "config": { "min_length": 100 },
+      "weight": 1
+    }
+  ]
+}
+```
+
+**What this catches:**
+- SSN patterns (weight 3)
+- Medical Record Numbers (weight 3)
+- Date of birth in identifiable format (weight 3)
+- Common patient identifier phrases (weight 2)
+- Missing medical disclaimer (weight 2)
+- Trivially short responses (weight 1)
+
+---
+
+### Financial Accuracy Validation
+
+A financial reporting agent must produce exact numbers, proper currency formatting, and stay within a per-call budget.
+
+```json
+{
+  "output": "{\"revenue\": \"$1,234,567.89\", \"expenses\": \"$987,654.32\", \"net_income\": \"$246,913.57\", \"period\": \"Q1 2026\"}",
+  "eval_type": "custom",
+  "cost_usd": 0.018,
+  "custom_rules": [
+    {
+      "name": "valid_json",
+      "type": "json_schema",
+      "config": {},
+      "weight": 3
+    },
+    {
+      "name": "proper_currency_format",
+      "type": "regex_match",
+      "config": { "pattern": "\\$[\\d,]+\\.\\d{2}" },
+      "weight": 2
+    },
+    {
+      "name": "no_vague_language",
+      "type": "excludes_keywords",
+      "config": {
+        "keywords": ["approximately", "roughly", "about", "around", "estimated", "ballpark", "in the range of"]
+      },
+      "weight": 2
+    },
+    {
+      "name": "has_required_fields",
+      "type": "contains_keywords",
+      "config": {
+        "keywords": ["revenue", "expenses", "net_income"],
+        "threshold": 1
+      },
+      "weight": 2
+    },
+    {
+      "name": "no_stale_data_warning",
+      "type": "regex_no_match",
+      "config": { "pattern": "(?:data may be|information might be) (?:outdated|stale)", "flags": "i" },
+      "weight": 1.5
+    },
+    {
+      "name": "cost_budget",
+      "type": "cost_threshold",
+      "config": { "max_cost": 0.05 },
+      "weight": 2
+    }
+  ]
+}
+```
+
+**What this catches:**
+- Malformed JSON output (weight 3)
+- Missing dollar sign or decimal places in currency (weight 2)
+- Hedging language that undermines a precise financial answer (weight 2)
+- Missing required financial fields (weight 2)
+- "Data may be outdated" disclaimers that shouldn't appear in production reports (weight 1.5)
+- Runaway costs per call (weight 2)
+
+---
+
+### Brand Voice Enforcement
+
+A customer-facing agent must follow brand guidelines: no competitor mentions, required tone markers, proper formatting, and concise responses.
+
+```json
+{
+  "output": "Here's how to set up your integration:\n\n1. Install the package: `npm install acme-sdk`\n2. Add your API key to the configuration file\n3. Run the setup wizard: `acme init`\n\nIf you run into issues, our support team is available at support@acme.com. We typically respond within 2 hours during business hours.",
+  "eval_type": "custom",
+  "custom_rules": [
+    {
+      "name": "no_competitor_mentions",
+      "type": "excludes_keywords",
+      "config": {
+        "keywords": ["competitor-a", "competitor-b", "rival-tool", "alternative-product"]
+      },
+      "weight": 3
+    },
+    {
+      "name": "no_ai_hedging",
+      "type": "excludes_keywords",
+      "config": {
+        "keywords": ["as an ai", "i cannot", "i apologize", "i'm not able to", "i don't have access"]
+      },
+      "weight": 2
+    },
+    {
+      "name": "professional_tone",
+      "type": "excludes_keywords",
+      "config": {
+        "keywords": ["lol", "haha", "omg", "btw", "tbh", "gonna", "wanna"]
+      },
+      "weight": 1.5
+    },
+    {
+      "name": "actionable_content",
+      "type": "contains_keywords",
+      "config": {
+        "keywords": ["install", "configure", "run", "setup", "add"],
+        "threshold": 0.4
+      },
+      "weight": 1
+    },
+    {
+      "name": "not_too_short",
+      "type": "min_length",
+      "config": { "min_length": 100 },
+      "weight": 1
+    },
+    {
+      "name": "not_too_long",
+      "type": "max_length",
+      "config": { "max_length": 2000 },
+      "weight": 1
+    },
+    {
+      "name": "no_internal_urls",
+      "type": "regex_no_match",
+      "config": { "pattern": "https?://(?:internal|staging|dev)\\.", "flags": "i" },
+      "weight": 2
+    }
+  ]
+}
+```
+
+**What this catches:**
+- Competitor name-drops (weight 3)
+- AI assistant hedging that breaks character (weight 2)
+- Informal language that doesn't match brand voice (weight 1.5)
+- Internal/staging URLs leaking to customers (weight 2)
+- Responses that are too short to be useful or too long to read (weight 1 each)
+- Missing actionable language in how-to responses (weight 1)

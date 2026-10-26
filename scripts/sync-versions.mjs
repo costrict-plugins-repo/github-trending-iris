@@ -1,0 +1,230 @@
+#!/usr/bin/env node
+
+/**
+ * Version Sync Script
+ *
+ * Reads the version from package.json (single source of truth)
+ * and writes it to all other version-carrying files.
+ *
+ * Usage: node scripts/sync-versions.mjs
+ *
+ * To add a new file: add an entry to the FILES array below.
+ * Each entry needs: path, a read function, and a write function.
+ *
+ * This script is idempotent — safe to run multiple times.
+ */
+
+import { readFileSync, writeFileSync, existsSync } from "fs";
+import { createRequire } from "module";
+
+const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+const VERSION = pkg.version;
+
+// ============================================================
+// Files that carry version numbers.
+// Add new entries here as the project grows — AND add the matching
+// check_version line to scripts/check-version.sh. The checker and the
+// syncer must cover the same set of files, or the release gate reports
+// PASSED over a file the syncer never touched (this is how the served
+// plugin manifest sat at 0.1.0 through four minor releases).
+//
+// NOTE: dashboard/package.json and packages/*/package.json are
+// intentionally excluded. The dashboard pins 0.1.0 independently
+// (separate Vite SPA release cadence, not part of MCP server releases).
+// Companion packages (packages/langchain, etc.) version on their own
+// cadence as ecosystem adapters. Before adding any of these, coordinate
+// with the respective release process. Their DEPENDENCY RANGE on this
+// package is a different matter — see the advisory after the loop.
+// ============================================================
+const FILES = [
+  {
+    path: "server.json",
+    description: "MCP Registry manifest",
+  },
+  {
+    path: "website/public/.well-known/mcp.json",
+    description: "Agent auto-discovery endpoint",
+  },
+  {
+    path: ".claude-plugin/plugin.json",
+    description: "Claude Code plugin manifest (repo root)",
+  },
+  {
+    path: ".cursor-plugin/plugin.json",
+    description: "Cursor plugin manifest",
+  },
+  {
+    // .claude-plugin/marketplace.json points plugin installs at
+    // `./claude-plugin` — so THIS is the manifest a marketplace user sees,
+    // not the root one above. It was never in this list: it shipped 0.1.0
+    // while the product was at 0.5.1.
+    path: "claude-plugin/.claude-plugin/plugin.json",
+    description: "Claude Code plugin manifest the marketplace serves",
+  },
+  {
+    path: "claude-plugin-capture/.claude-plugin/plugin.json",
+    description: "Claude Code capture plugin manifest (its version pins the package the Stop hook installs)",
+  },
+  {
+    path: "package-lock.json",
+    description: "npm lockfile (root + packages[\"\"] version metadata only — never runs npm install; surgical write avoids the rolldown lockfile trap)",
+  },
+  {
+    // The MCPB bundle's manifest: the version Claude Desktop shows and
+    // scripts/mcpb/pack.mjs refuses to pack under any other.
+    path: "mcpb/manifest.json",
+    description: "MCPB bundle manifest",
+  },
+];
+
+let updated = 0;
+let skipped = 0;
+
+// ============================================================
+// Pinned launchers. A plugin or action that runs `npx -y @iris-eval/mcp-server`
+// with no version installs whatever npm says is latest, on every user's machine
+// and in every consumer's CI, the moment it is published. Pinned to the
+// release version, a new release reaches them when they update the plugin or
+// move the action tag (2026-09-23 security review). Text edits, so each file's
+// formatting survives.
+// ============================================================
+const GATE_USES_PATTERN = /iris-eval\/mcp-server\/\.github\/actions\/gate@v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]*[0-9A-Za-z])?/g;
+const LAUNCHERS = [
+  { path: "claude-plugin/.mcp.json", pattern: /@iris-eval\/mcp-server(?:@[0-9A-Za-z.+-]+)?"/g, replace: `@iris-eval/mcp-server@${VERSION}"` },
+  { path: ".cursor-plugin/plugin.json", pattern: /@iris-eval\/mcp-server(?:@[0-9A-Za-z.+-]+)?"/g, replace: `@iris-eval/mcp-server@${VERSION}"` },
+  { path: ".github/actions/gate/action.yml", pattern: /(\r?\n  version:\r?\n[\s\S]*?\r?\n    default: )'[^']*'/, replace: `$1'${VERSION}'` },
+  // The gate action's own tag in every `uses:` line a reader copies. Each
+  // release tags vX.Y.Z, so a snippet names the release it documents instead
+  // of the one that was current when it was written. check-version.sh walks
+  // the same three files with the same pattern.
+  ...["README.md", "docs/ci-gate.md", ".github/actions/gate/action.yml"].map((path) => ({
+    path,
+    pattern: GATE_USES_PATTERN,
+    replace: `iris-eval/mcp-server/.github/actions/gate@v${VERSION}`,
+  })),
+];
+
+console.log(`Syncing all versions to ${VERSION} (from package.json)\n`);
+
+for (const file of FILES) {
+  if (!existsSync(file.path)) {
+    console.log(`  SKIP: ${file.path} (not found)`);
+    skipped++;
+    continue;
+  }
+
+  const content = JSON.parse(readFileSync(file.path, "utf8"));
+  const current = content.version;
+
+  if (current === VERSION) {
+    console.log(`  OK:   ${file.path} (already ${VERSION})`);
+    continue;
+  }
+
+  content.version = VERSION;
+
+  // Also sync nested package versions (e.g., server.json packages[].version)
+  if (Array.isArray(content.packages)) {
+    for (const pkg of content.packages) {
+      if (pkg.version && pkg.version !== VERSION) {
+        console.log(`  SYNC: ${file.path} packages[].version (${pkg.version} → ${VERSION})`);
+        pkg.version = VERSION;
+      }
+    }
+  } else if (content.packages && typeof content.packages === "object" && content.packages[""]) {
+    // package-lock.json shape: packages is an object with "" key for the root package
+    const root = content.packages[""];
+    if (root.version && root.version !== VERSION) {
+      console.log(`  SYNC: ${file.path} packages[""].version (${root.version} → ${VERSION})`);
+      root.version = VERSION;
+    }
+  }
+
+  writeFileSync(file.path, JSON.stringify(content, null, 2) + "\n");
+  console.log(`  SYNC: ${file.path} (${current} → ${VERSION})`);
+  updated++;
+}
+
+// ------------------------------------------------------------
+// server.json's MCPB package names its bundle by URL, and the URL carries
+// the release tag: https://github.com/<repo>/releases/download/v<version>/iris-eval.mcpb.
+// The registry reads that URL at publish time and refuses one that is not
+// there, so it must name the release being cut. check-version.sh checks it.
+// ------------------------------------------------------------
+{
+  const content = JSON.parse(readFileSync("server.json", "utf8"));
+  let changed = false;
+  for (const entry of content.packages ?? []) {
+    if (entry.registryType !== "mcpb") continue;
+    const next = entry.identifier.replace(/\/releases\/download\/v[^/]+\//, `/releases/download/v${VERSION}/`);
+    if (next !== entry.identifier) {
+      console.log(`  SYNC: server.json MCPB identifier (${entry.identifier} → ${next})`);
+      entry.identifier = next;
+      changed = true;
+    }
+  }
+  if (changed) {
+    writeFileSync("server.json", JSON.stringify(content, null, 2) + "\n");
+    updated++;
+  } else {
+    console.log(`  OK:   server.json MCPB identifier (already names v${VERSION})`);
+  }
+}
+
+for (const launcher of LAUNCHERS) {
+  const before = readFileSync(launcher.path, "utf8");
+  const after = before.replace(launcher.pattern, launcher.replace);
+  if (after !== before) {
+    writeFileSync(launcher.path, after);
+    console.log(`  SYNC: ${launcher.path} (pinned launcher → ${VERSION})`);
+    updated++;
+  } else {
+    console.log(`  OK:   ${launcher.path} (launcher already pinned to ${VERSION})`);
+  }
+}
+
+// ------------------------------------------------------------
+// Advisory, not a write: @iris-eval/langchain's dependency range on this
+// package. A range is a policy choice (which server lines the adapter
+// supports), so the syncer does not rewrite it — but it must still ADMIT
+// the version being released. `^0.4.0` excluded every 0.5.x, so a fresh
+// install of the adapter resolved to the pre-veto 0.4.6 line for a whole
+// release. scripts/check-version.sh fails on this; here we say what to edit.
+// ------------------------------------------------------------
+const LANGCHAIN_PKG = "packages/langchain/package.json";
+if (existsSync(LANGCHAIN_PKG)) {
+  const lc = JSON.parse(readFileSync(LANGCHAIN_PKG, "utf8"));
+  const range =
+    lc.dependencies?.["@iris-eval/mcp-server"] ??
+    lc.peerDependencies?.["@iris-eval/mcp-server"];
+  // A private adapter is not installable, so its range protects no install
+  // (scripts/check-langchain-range.mjs skips it the same way).
+  if (lc.private === true) {
+    console.log(`
+  SKIP: ${LANGCHAIN_PKG} is "private": true (not published); its range is not reviewed`);
+  } else if (range) {
+    let semver;
+    try {
+      semver = createRequire(import.meta.url)("semver");
+    } catch {
+      console.log(`\n  NOTE: ${LANGCHAIN_PKG} range "${range}" not checked (semver not installed — run npm ci)`);
+    }
+    if (semver) {
+      // Compare against the production version an RC precedes, so
+      // 0.6.0-rc.1 asks "will the range accept 0.6.0?".
+      const p = semver.parse(VERSION);
+      const release = p ? `${p.major}.${p.minor}.${p.patch}` : VERSION;
+      if (semver.satisfies(release, range)) {
+        console.log(`\n  OK:   ${LANGCHAIN_PKG} depends on "@iris-eval/mcp-server": "${range}" (admits ${release})`);
+      } else {
+        console.log(`\n  REVIEW: ${LANGCHAIN_PKG} depends on "@iris-eval/mcp-server": "${range}" — that range does NOT admit ${release}.`);
+        console.log(`          Edit it by hand (e.g. "^${p ? `${p.major}.${p.minor}.0` : release}"); npm run version:check will fail until it does.`);
+      }
+    }
+  }
+}
+
+console.log(`\nDone. ${updated} file(s) updated, ${skipped} skipped.`);
+if (updated > 0) {
+  console.log("Don't forget to commit the changes.");
+}

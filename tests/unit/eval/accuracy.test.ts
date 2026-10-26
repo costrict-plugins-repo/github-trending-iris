@@ -1,0 +1,172 @@
+/*
+ * The published accuracy, read at runtime — the arithmetic and its provenance.
+ *
+ * An audit on 2026-09-05 found the per-rule precision/recall intervals in
+ * proof/results.json never reached a result, a roster entry or a resource;
+ * and that the published precision is the value at corpus prevalence (about
+ * one half) while no surface said what a fire is worth at field prevalence
+ * (for no_pii, from 87% to about 6% at one percent). This module carries the
+ * numbers into the shipped server and does that arithmetic, with intervals.
+ */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { fnv1a as proofFnv1a, mulberry32 as proofMulberry32 } from '../../../proof/lib/materialise.js';
+import { rulesByType } from '../../../src/eval/rules/index.js';
+import {
+  missRateInterval,
+  ppvAt,
+  ppvInterval,
+  publishedAccuracyFor,
+  publishedProvenance,
+  publishedRuleNames,
+  resetAccuracyMemo,
+} from '../../../src/eval/accuracy.js';
+import { beta, fnv1a, gamma, missRate, mulberry32, percentile95, ppv } from '../../../src/eval/stats.js';
+
+const root = resolve(__dirname, '..', '..', '..');
+
+describe('stats — the seeded generator twins the proof harness', () => {
+  it('fnv1a and mulberry32 agree with proof/lib/materialise.ts on a fixed seed', () => {
+    for (const seed of ['proof-f1-bootstrap-v1', 'ppv:no_pii:abc', '']) {
+      expect(fnv1a(seed)).toBe(proofFnv1a(seed));
+      const a = mulberry32(fnv1a(seed));
+      const b = proofMulberry32(proofFnv1a(seed));
+      for (let i = 0; i < 5; i++) expect(a()).toBe(b());
+    }
+  });
+
+  it('gamma and beta draws are in range and reproducible', () => {
+    const rng = mulberry32(fnv1a('stats-test'));
+    const g = Array.from({ length: 200 }, () => gamma(0.5, rng));
+    expect(g.every((x) => x > 0)).toBe(true);
+    const b = Array.from({ length: 200 }, () => beta(34.5, 11.5, rng));
+    expect(b.every((x) => x > 0 && x < 1)).toBe(true);
+    const again = mulberry32(fnv1a('stats-test'));
+    expect(gamma(0.5, again)).toBe(g[0]);
+    const [lo, hi] = percentile95(b);
+    expect(lo).toBeLessThanOrEqual(hi);
+  });
+
+  it('PPV and the miss rate behave like the diagnostic-test arithmetic they are', () => {
+    expect(ppv(1, 1, 0.01)).toBe(1);
+    expect(ppv(0.756, 0.889, 0.5)).toBeCloseTo(0.872, 2);
+    expect(ppv(0.756, 0.889, 0.01)).toBeLessThan(0.1);
+    // PPV rises with prevalence; the miss rate never exceeds the prevalence.
+    expect(ppv(0.756, 0.889, 0.2)).toBeGreaterThan(ppv(0.756, 0.889, 0.05));
+    expect(missRate(0.756, 0.889, 0.2)).toBeLessThanOrEqual(0.2);
+  });
+});
+
+describe('accuracy — the published numbers and their intervals', () => {
+  it('every built-in with a proof family is published, with its provenance', () => {
+    const results = JSON.parse(readFileSync(resolve(root, 'proof', 'results.json'), 'utf-8')) as { corpusVersion: string; rules: Array<{ name: string }> };
+    const pkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf-8')) as { version: string };
+    const names = publishedRuleNames();
+    expect(names.sort()).toEqual(results.rules.map((r) => r.name).sort());
+    const builtIns = (['completeness', 'relevance', 'safety', 'cost'] as const).flatMap((t) => rulesByType[t].map((r) => r.name));
+    for (const n of builtIns) expect(names, `${n} has no published family`).toContain(n);
+    const prov = publishedProvenance();
+    expect(prov.corpusVersion).toBe(results.corpusVersion);
+    expect(prov.release).toBe(pkg.version);
+    expect(['same-model', 'human-verified']).toContain(prov.labelling);
+    expect(publishedAccuracyFor('no_such_rule')).toBeNull();
+  });
+
+  it('a fired detection gets a PPV interval that contains its point and moves with the prevalence', () => {
+    resetAccuracyMemo();
+    const at50 = ppvInterval('no_pii', 0.5);
+    const at1 = ppvInterval('no_pii', 0.01);
+    expect(at50).not.toBeNull();
+    expect(at1).not.toBeNull();
+    expect(at50!.lo).toBeLessThanOrEqual(at50!.point);
+    expect(at50!.point).toBeLessThanOrEqual(at50!.hi);
+    expect(at1!.point).toBeLessThan(at50!.point);
+    // The point is the published precision's arithmetic at corpus prevalence.
+    const counts = publishedAccuracyFor('no_pii')!;
+    /*
+     * Half a pseudo-count per cell, the same Jeffreys prior the draws use.
+     * The point estimate used the RAW rates until 0.11.0, which is how three
+     * rules came to report a positive predictive value of exactly 1 while
+     * the interval around it was capped below 1 and the risk layer, computing
+     * the same quantity from the same counts, quietly disagreed.
+     */
+    const sens = (counts.tp + 0.5) / (counts.tp + counts.fn + 1);
+    const spec = (counts.tn + 0.5) / (counts.tn + counts.fp + 1);
+    expect(at50!.point).toBeCloseTo(ppv(sens, spec, 0.5), 4);
+    // And it can no longer be certain, which is the point of the prior.
+    expect(at50!.point).toBeLessThan(1);
+  });
+
+  it('the interval is a pure function of the rule, the prevalence and the corpus (seeded)', () => {
+    resetAccuracyMemo();
+    const first = ppvInterval('no_stub_output', 0.2);
+    resetAccuracyMemo();
+    const second = ppvInterval('no_stub_output', 0.2);
+    expect(first).toEqual(second);
+    expect(ppvInterval('no_stub_output', 0.2)).toBe(ppvInterval('no_stub_output', 0.2)); // memoised
+  });
+
+  /*
+   * The interval as 0.19.0 computed it, drawing afresh on every call, so
+   * the per-rule draws and the exact-prevalence memo are checked against
+   * something they did not produce.
+   */
+  const fresh = (rule: string, prevalence: number, which: 'ppv' | 'miss') => {
+    const counts = publishedAccuracyFor(rule)!;
+    const fn = which === 'ppv' ? ppv : missRate;
+    const rng = mulberry32(fnv1a(`${which}:${rule}:${publishedProvenance().corpusVersion}`));
+    const draws: number[] = [];
+    for (let i = 0; i < 2000; i++) {
+      const s = beta(counts.tp + 0.5, counts.fn + 0.5, rng);
+      const p = beta(counts.tn + 0.5, counts.fp + 0.5, rng);
+      draws.push(fn(s, p, prevalence));
+    }
+    const [lo, hi] = percentile95(draws);
+    const sens = (counts.tp + 0.5) / (counts.tp + counts.fn + 1);
+    const spec = (counts.tn + 0.5) / (counts.tn + counts.fp + 1);
+    const r4 = (x: number) => Math.round(x * 10_000) / 10_000;
+    return { point: r4(fn(sens, spec, prevalence)), lo: r4(lo), hi: r4(hi) };
+  };
+
+  it('remembers an interval per exact prevalence: two that round to the same three decimals get their own', () => {
+    resetAccuracyMemo();
+    // Both are "0.010" to three decimals; until 0.20.0 the second call returned the first one's interval.
+    const first = ppvInterval('no_pii', 0.0101);
+    const second = ppvInterval('no_pii', 0.0104);
+    expect(first).toEqual(fresh('no_pii', 0.0101, 'ppv'));
+    expect(second).toEqual(fresh('no_pii', 0.0104, 'ppv'));
+    expect(second).not.toEqual(first);
+    const missA = missRateInterval('no_pii', 0.3001);
+    const missB = missRateInterval('no_pii', 0.3004);
+    expect(missB).toEqual(fresh('no_pii', 0.3004, 'miss'));
+    expect(missB).not.toEqual(missA);
+  });
+
+  it('drawing once per rule gives every interval the per-call draws gave, for every rule and many prevalences', () => {
+    resetAccuracyMemo();
+    for (const rule of publishedRuleNames()) {
+      const counts = publishedAccuracyFor(rule)!;
+      if (counts.tp + counts.fn === 0 || counts.tn + counts.fp === 0) continue;
+      for (const prevalence of [0.001, 0.0101, 0.0104, 0.05, 0.2, 0.3333, 0.5, 0.9]) {
+        expect(ppvInterval(rule, prevalence), `${rule} ppv ${prevalence}`).toEqual(fresh(rule, prevalence, 'ppv'));
+        expect(missRateInterval(rule, prevalence), `${rule} miss ${prevalence}`).toEqual(fresh(rule, prevalence, 'miss'));
+      }
+    }
+  });
+
+  it('a rule that did not fire gets a residual miss rate below the prevalence', () => {
+    const miss = missRateInterval('no_hallucination_markers', 0.3);
+    expect(miss).not.toBeNull();
+    expect(miss!.point).toBeLessThanOrEqual(0.3);
+    expect(miss!.lo).toBeLessThanOrEqual(miss!.point);
+    expect(miss!.point).toBeLessThanOrEqual(miss!.hi);
+  });
+
+  it('ppvAt renders the field-prevalence table a reader needs beside a published precision', () => {
+    const table = ppvAt('no_pii');
+    expect(Object.keys(table)).toEqual(['0.01', '0.05', '0.20', '0.50']);
+    expect(table['0.01']!).toBeLessThan(table['0.50']!);
+    expect(ppvAt('no_such_rule')['0.50']).toBeNull();
+  });
+});

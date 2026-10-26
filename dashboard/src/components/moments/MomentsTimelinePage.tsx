@@ -1,0 +1,621 @@
+/*
+ * MomentsTimelinePage — Decision Moment Timeline (Phase B1).
+ *
+ * The category-defining surface. Renders a vertically-stacked timeline of
+ * Decision Moments derived from trace + eval data. Each moment is a card
+ * with a significance-coded rail glyph. By default the list is ranked by
+ * significance within a stated window of recent traces (#409), so a safety
+ * violation is not buried behind every pass since; `?sort=newest` is the
+ * plain newest-first stream.
+ *
+ * Filter state is encoded in URL search params so every filtered view is
+ * shareable (per Phase B1 enterprise-depth requirement: permalinks).
+ *
+ * State coverage (every state designed, not only the populated one):
+ *   - empty (no moments): hero CTA
+ *   - empty after filter: clear-filter inline action
+ *   - loading: skeleton cards
+ *   - error: retry button
+ */
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router';
+import { CADENCE, useMoments, useFilters } from '../../api/hooks';
+import { usePreferences } from '../../hooks/usePreferences';
+import { api } from '../../api/client';
+import type { DecisionMoment, DecisionMomentDetail, MomentSignificanceKind } from '../../api/types';
+import { Activity } from 'lucide-react';
+import { MomentCard } from './MomentCard';
+import { orderOf, rankingNote } from './momentOrder';
+import { BulkActionsBar } from './BulkActionsBar';
+import { MakeRuleModal } from './MakeRuleModal';
+import {
+  SIGNIFICANCE_KIND_OPTIONS,
+  VERDICT_OPTIONS,
+  getSignificanceVisual,
+} from './significance';
+import { LoadingSpinner } from '../shared/LoadingSpinner';
+import { QueryError } from '../shared/QueryError';
+import { PageHeader } from '../layout/PageHeader';
+import { PageToolbar } from '../layout/PageToolbar';
+import { PageEmptyState } from '../layout/PageEmptyState';
+
+const styles = {
+  page: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 'var(--space-6)',
+  } as const,
+  header: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 'var(--space-4)',
+    flexWrap: 'wrap',
+  } as const,
+  titleBlock: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 'var(--space-1)',
+  } as const,
+  title: {
+    fontSize: 'var(--font-size-2xl)',
+    fontWeight: 700,
+    margin: 0,
+    color: 'var(--text-primary)',
+  } as const,
+  subtitle: {
+    fontSize: 'var(--font-size-sm)',
+    color: 'var(--text-muted)',
+    margin: 0,
+    maxWidth: '720px',
+  } as const,
+  filterRow: {
+    display: 'flex',
+    gap: 'var(--space-3)',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    background: 'var(--bg-secondary)',
+    padding: 'var(--space-3) var(--space-4)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 'var(--border-radius)',
+  } as const,
+  filterLabel: {
+    fontSize: 'var(--font-size-xs)',
+    color: 'var(--text-muted)',
+    fontFamily: 'var(--font-mono)',
+    textTransform: 'uppercase',
+    letterSpacing: '0.05em',
+  } as const,
+  select: {
+    background: 'var(--bg-tertiary)',
+    color: 'var(--text-primary)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 'var(--border-radius-sm)',
+    padding: 'var(--space-1) var(--space-2)',
+    fontSize: 'var(--font-size-sm)',
+    fontFamily: 'inherit',
+  } as const,
+  legend: {
+    display: 'flex',
+    gap: 'var(--space-3)',
+    flexWrap: 'wrap',
+    fontSize: 'var(--font-size-xs)',
+    color: 'var(--text-muted)',
+  } as const,
+  legendItem: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 'var(--space-1)',
+  } as const,
+  legendDot: {
+    width: '14px',
+    height: '14px',
+    borderRadius: '50%',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: '10px',
+    fontFamily: 'var(--font-mono)',
+    fontWeight: 700,
+    color: 'var(--bg-primary)',
+  } as const,
+  list: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 'var(--space-3)',
+  } as const,
+  empty: {
+    background: 'var(--bg-secondary)',
+    border: '1px dashed var(--border-color)',
+    borderRadius: 'var(--border-radius-lg)',
+    padding: 'var(--space-12)',
+    textAlign: 'center',
+    color: 'var(--text-muted)',
+  } as const,
+  emptyTitle: {
+    fontSize: 'var(--font-size-lg)',
+    fontWeight: 600,
+    color: 'var(--text-primary)',
+    margin: '0 0 var(--space-2)',
+  } as const,
+  errorBox: {
+    background: 'oklch(28% 0.10 25 / 0.18)',
+    border: '1px solid var(--accent-error)',
+    borderRadius: 'var(--border-radius)',
+    padding: 'var(--space-4)',
+    color: 'var(--accent-error)',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 'var(--space-2)',
+  } as const,
+  retryBtn: {
+    appearance: 'none',
+    background: 'transparent',
+    border: '1px solid var(--accent-error)',
+    color: 'var(--accent-error)',
+    borderRadius: 'var(--border-radius-sm)',
+    padding: 'var(--space-1) var(--space-3)',
+    cursor: 'pointer',
+    fontSize: 'var(--font-size-sm)',
+    fontFamily: 'inherit',
+    width: 'fit-content',
+  } as const,
+  countBadge: {
+    fontSize: 'var(--font-size-xs)',
+    color: 'var(--text-muted)',
+    fontFamily: 'var(--font-mono)',
+  } as const,
+  installCmd: {
+    background: 'var(--bg-tertiary)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 'var(--border-radius-sm)',
+    padding: 'var(--space-2) var(--space-3)',
+    fontFamily: 'var(--font-mono)',
+    fontSize: 'var(--font-size-sm)',
+    color: 'var(--text-primary)',
+    display: 'inline-block',
+    margin: 'var(--space-3) 0',
+  } as const,
+};
+
+const LEGEND_KINDS = [
+  'safety-violation',
+  'cost-spike',
+  'rule-collision',
+  'normal-fail',
+  'normal-pass',
+] as const;
+
+export function MomentsTimelinePage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { data: filters } = useFilters();
+  const { preferences, patch } = usePreferences();
+  // Track whether we've already applied persisted filters once on this mount,
+  // so refreshes within the same visit don't keep re-applying them on top of
+  // the user's manual clears.
+  const hydratedFromPrefs = useRef(false);
+
+  // ── Permalink + persistence resolution ────────────────────────────
+  // 1. URL params present → permalink wins. Don't override.
+  // 2. URL params empty + persisted filters in preferences → hydrate URL.
+  // 3. URL params empty + no persisted filters → no-op.
+  useEffect(() => {
+    if (hydratedFromPrefs.current) return;
+    if (!preferences) return;
+    const hasUrlFilters =
+      searchParams.has('agent') || searchParams.has('verdict') || searchParams.has('kind');
+    if (hasUrlFilters) {
+      hydratedFromPrefs.current = true;
+      return;
+    }
+    const persisted = preferences.momentFilters;
+    /* Don't silently restore the lowest-signal kinds — `normal-pass` and
+     * `normal-fail` together account for ~95% of activity in a healthy
+     * fleet, which means restoring either one as a kind filter would hide
+     * almost everything significant. We saw this in deep-walk: a stale
+     * `kind=normal-pass` from an exploratory click persisted and made
+     * /moments look mostly empty on every subsequent visit.
+     *
+     * Other persisted filters (verdict, agent, and the high-signal
+     * significance kinds — safety-violation/cost-spike/rule-collision/
+     * first-failure/novel-pattern) are almost always intentional and
+     * still restore. */
+    const lowSignalKinds = new Set(['normal-pass', 'normal-fail', 'unevaluated']);
+    const safeKind = persisted.significanceKind && !lowSignalKinds.has(persisted.significanceKind)
+      ? persisted.significanceKind
+      : undefined;
+    const hasPersisted =
+      Boolean(persisted.agentName) || Boolean(persisted.verdict) || Boolean(safeKind);
+    if (hasPersisted) {
+      const next = new URLSearchParams();
+      if (persisted.agentName) next.set('agent', persisted.agentName);
+      if (persisted.verdict) next.set('verdict', persisted.verdict);
+      if (safeKind) next.set('kind', safeKind);
+      setSearchParams(next, { replace: true });
+    }
+    hydratedFromPrefs.current = true;
+  }, [preferences, searchParams, setSearchParams]);
+
+  const order = orderOf(searchParams);
+
+  const queryParams = useMemo<Record<string, string>>(() => {
+    const params: Record<string, string> = { limit: '50' };
+    if (orderOf(searchParams) === 'significance') params.sort_by = 'significance';
+    const agent = searchParams.get('agent');
+    const verdict = searchParams.get('verdict');
+    const kind = searchParams.get('kind');
+    const since = searchParams.get('since');
+    const until = searchParams.get('until');
+    if (agent) params.agent_name = agent;
+    if (verdict) params.verdict = verdict;
+    if (kind) params.significance_kind = kind;
+    if (since) params.since = since;
+    if (until) params.until = until;
+    return params;
+  }, [searchParams]);
+
+  // A ranking reads a whole window, not a live tail: poll it at the
+  // cadence the other window-reading views use.
+  const { data, loading, error, refetch } = useMoments(
+    queryParams,
+    order === 'significance' ? CADENCE.NORMAL : CADENCE.FAST,
+  );
+  const note = data ? rankingNote(data) : null;
+
+  // Persist filter changes back to preferences (best-effort; failures are
+  // surfaced as a console warning but don't block the UI). We only persist
+  // *after* the first hydration so initial mounts don't redundantly write
+  // back what we just read.
+  useEffect(() => {
+    if (!hydratedFromPrefs.current || !preferences) return;
+    const next = {
+      agentName: searchParams.get('agent') ?? undefined,
+      verdict: (searchParams.get('verdict') as
+        | 'pass'
+        | 'fail'
+        | 'partial'
+        | 'unevaluated'
+        | null) ?? undefined,
+      significanceKind: (searchParams.get('kind') as MomentSignificanceKind | null) ?? undefined,
+    };
+    const current = preferences.momentFilters;
+    const equal =
+      next.agentName === current.agentName &&
+      next.verdict === current.verdict &&
+      next.significanceKind === current.significanceKind;
+    if (equal) return;
+    // Strip undefined fields so we PATCH a clean object — server schema is strict
+    const cleaned: Record<string, string> = {};
+    if (next.agentName) cleaned.agentName = next.agentName;
+    if (next.verdict) cleaned.verdict = next.verdict;
+    if (next.significanceKind) cleaned.significanceKind = next.significanceKind;
+    patch({ momentFilters: cleaned as never }).catch((err) => {
+       
+      console.warn('[Iris] could not persist filter preference', err);
+    });
+  }, [searchParams, preferences, patch]);
+
+  const updateFilter = (key: string, value: string) => {
+    const next = new URLSearchParams(searchParams);
+    if (value) next.set(key, value);
+    else next.delete(key);
+    setSearchParams(next);
+  };
+
+  const clearFilters = () => {
+    // The order is not a filter: clearing filters keeps it.
+    const next = new URLSearchParams();
+    const sort = searchParams.get('sort');
+    if (sort) next.set('sort', sort);
+    setSearchParams(next);
+    patch({ momentFilters: {} }).catch(() => undefined);
+  };
+
+  // ── B8.5: bulk selection + archive + rule-from-selection ────────────
+  const navigate = useNavigate();
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showArchived, setShowArchived] = useState(false);
+  const [composerForBulk, setComposerForBulk] = useState<DecisionMomentDetail | null>(null);
+  const [bulkLoading, setBulkLoading] = useState(false);
+
+  const archivedSet = useMemo(
+    () => new Set(preferences?.archivedMoments ?? []),
+    [preferences],
+  );
+
+  const visibleMoments = useMemo<DecisionMoment[]>(() => {
+    const all = data?.moments ?? [];
+    return showArchived ? all : all.filter((m) => !archivedSet.has(m.id));
+  }, [data, archivedSet, showArchived]);
+
+  const selectedMoments = useMemo(
+    () => visibleMoments.filter((m) => selectedIds.has(m.id)),
+    [visibleMoments, selectedIds],
+  );
+
+  const allSelectedAreArchived = useMemo(
+    () => selectedMoments.length > 0 && selectedMoments.every((m) => archivedSet.has(m.id)),
+    [selectedMoments, archivedSet],
+  );
+
+  const toggleSelected = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const onArchiveSelected = async () => {
+    if (!preferences) return;
+    const next = Array.from(new Set([...preferences.archivedMoments, ...selectedIds]));
+    try {
+      await patch({ archivedMoments: next });
+      clearSelection();
+    } catch (err) {
+       
+      console.warn('[Iris] archive failed', err);
+    }
+  };
+
+  const onUnarchiveSelected = async () => {
+    if (!preferences) return;
+    const next = preferences.archivedMoments.filter((id) => !selectedIds.has(id));
+    try {
+      await patch({ archivedMoments: next });
+      clearSelection();
+    } catch (err) {
+       
+      console.warn('[Iris] unarchive failed', err);
+    }
+  };
+
+  const onMakeRuleFromSelection = async () => {
+    if (selectedMoments.length === 0) return;
+    setBulkLoading(true);
+    try {
+      // Fetch the first selected moment's full detail (composer needs eval results).
+      // Compose a multi-moment description noting how many other moments share the
+      // pattern. Full multi-moment composer (deduping rule chips, intersect failed
+      // sets) is a later optimization.
+      const first = selectedMoments[0];
+      const detail = await api.getMomentDetail(first.id);
+      const annotated: DecisionMomentDetail = {
+        ...detail,
+        significance: {
+          ...detail.significance,
+          reason:
+            selectedMoments.length === 1
+              ? detail.significance.reason
+              : `${detail.significance.reason} (Pattern observed across ${selectedMoments.length} selected moments — failed-rule snapshots: ${selectedMoments
+                  .map((m) => m.ruleSnapshot.failed.join(',') || '∅')
+                  .join(' · ')})`,
+        },
+      };
+      setComposerForBulk(annotated);
+    } catch (err) {
+       
+      console.warn('[Iris] could not load moment for bulk-compose', err);
+    } finally {
+      setBulkLoading(false);
+    }
+  };
+
+  const hasActiveFilters =
+    Boolean(searchParams.get('agent')) ||
+    Boolean(searchParams.get('verdict')) ||
+    Boolean(searchParams.get('kind')) ||
+    Boolean(searchParams.get('since')) ||
+    Boolean(searchParams.get('until'));
+
+  return (
+    <div style={styles.page}>
+      <PageHeader
+        subtitle={
+          order === 'significance'
+            ? 'Recent traces ranked by what they found: safety violations first, then departures from the agent\'s own baseline (cost spikes, regression alarms), then failures new to the agent, then routine failures and passes. Newest first among equals. Click a moment to see why it was flagged and turn the observed pattern into a deployable rule.'
+            : 'Every trace, newest first, classified by what makes it noteworthy. Switch the order to rank by significance. Click a moment to see why it was flagged and turn the observed pattern into a deployable rule.'
+        }
+        meta={
+          data && (
+            <span
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontSize: 'var(--text-caption)',
+                color: 'var(--text-muted)',
+              }}
+            >
+              {data.moments.length} of {data.total}
+            </span>
+          )
+        }
+      />
+
+      <PageToolbar
+        filters={
+          <>
+            <span style={styles.filterLabel}>Order</span>
+            <select
+              style={styles.select}
+              value={order}
+              onChange={(e) => updateFilter('sort', e.target.value === 'newest' ? 'newest' : '')}
+              aria-label="Order moments"
+            >
+              <option value="significance">Most significant</option>
+              <option value="newest">Newest first</option>
+            </select>
+            <span style={styles.filterLabel}>Filter</span>
+            <select
+              style={styles.select}
+              value={searchParams.get('kind') ?? ''}
+              onChange={(e) => updateFilter('kind', e.target.value)}
+              aria-label="Filter by significance"
+            >
+              {SIGNIFICANCE_KIND_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+            <select
+              style={styles.select}
+              value={searchParams.get('verdict') ?? ''}
+              onChange={(e) => updateFilter('verdict', e.target.value)}
+              aria-label="Filter by verdict"
+            >
+              {VERDICT_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+            <select
+              style={styles.select}
+              value={searchParams.get('agent') ?? ''}
+              onChange={(e) => updateFilter('agent', e.target.value)}
+              aria-label="Filter by agent"
+            >
+              <option value="">All agents</option>
+              {(filters?.agent_names ?? []).map((name) => (
+                <option key={name} value={name}>{name}</option>
+              ))}
+            </select>
+            {hasActiveFilters && (
+              <button
+                type="button"
+                onClick={clearFilters}
+                style={{ ...styles.select, cursor: 'pointer' }}
+              >
+                Clear
+              </button>
+            )}
+            {(preferences?.archivedMoments?.length ?? 0) > 0 && (
+              <label
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 'var(--space-1)',
+                  fontSize: 'var(--text-caption)',
+                  color: 'var(--text-muted)',
+                  fontFamily: 'var(--font-mono)',
+                  cursor: 'pointer',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={showArchived}
+                  onChange={(e) => setShowArchived(e.target.checked)}
+                  style={{ accentColor: 'var(--iris-500)' }}
+                />
+                Show archived ({preferences?.archivedMoments?.length ?? 0})
+              </label>
+            )}
+          </>
+        }
+        actions={
+          <div style={styles.legend} aria-label="Significance legend">
+            {LEGEND_KINDS.map((kind) => {
+              const v = getSignificanceVisual(kind);
+              return (
+                <span key={kind} style={styles.legendItem}>
+                  <span style={{ ...styles.legendDot, background: v.color }}>{v.glyph}</span>
+                  {v.name}
+                </span>
+              );
+            })}
+          </div>
+        }
+      />
+
+      {note && (
+        <p style={styles.subtitle} data-testid="ranking-note">
+          {note}
+        </p>
+      )}
+
+      {error && <QueryError error={error} what="decision moments" onRetry={refetch} />}
+
+      {loading && !data && <LoadingSpinner />}
+
+      {data && data.moments.length === 0 && (
+        hasActiveFilters ? (
+          <PageEmptyState
+            icon={Activity}
+            title="No moments match these filters"
+            body="Try widening the time window or removing filters."
+            cta={
+              <button
+                type="button"
+                onClick={clearFilters}
+                style={{
+                  appearance: 'none',
+                  background: 'transparent',
+                  border: '1px solid var(--iris-500)',
+                  color: 'var(--iris-400)',
+                  borderRadius: 'var(--radius-sm)',
+                  padding: 'var(--space-2) var(--space-4)',
+                  cursor: 'pointer',
+                  fontSize: 'var(--text-body-sm)',
+                  fontFamily: 'inherit',
+                }}
+              >
+                Clear all filters
+              </button>
+            }
+          />
+        ) : (
+          <PageEmptyState
+            icon={Activity}
+            title="No moments yet"
+            body="Run an agent through Iris and your first Decision Moment will appear here within seconds."
+            command="npx @iris-eval/mcp-server --dashboard"
+          />
+        )
+      )}
+
+      {data && visibleMoments.length === 0 && data.moments.length > 0 && !hasActiveFilters && (
+        <PageEmptyState
+          icon={Activity}
+          title="All moments archived"
+          body='Toggle "Show archived" above to see them, or run new agents through Iris.'
+        />
+      )}
+
+      {data && visibleMoments.length > 0 && (
+        <div style={styles.list}>
+          {visibleMoments.map((m) => (
+            <MomentCard
+              key={m.id}
+              moment={m}
+              archived={archivedSet.has(m.id)}
+              selected={selectedIds.has(m.id)}
+              onToggleSelected={toggleSelected}
+            />
+          ))}
+        </div>
+      )}
+
+      <BulkActionsBar
+        selectedMoments={selectedMoments}
+        allArchived={allSelectedAreArchived}
+        onArchive={onArchiveSelected}
+        onUnarchive={onUnarchiveSelected}
+        onMakeRule={() => {
+          if (!bulkLoading) onMakeRuleFromSelection();
+        }}
+        onClear={clearSelection}
+      />
+
+      {composerForBulk && (
+        <MakeRuleModal
+          moment={composerForBulk}
+          onClose={() => setComposerForBulk(null)}
+          onDeployed={() => {
+            clearSelection();
+            // Navigate to /rules so user sees the deployed rule
+            navigate('/rules');
+          }}
+        />
+      )}
+    </div>
+  );
+}

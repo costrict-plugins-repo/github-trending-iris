@@ -1,0 +1,203 @@
+#!/usr/bin/env node
+// Truthbase orchestrator — runs every generator in parallel, assembles
+// .claims.json, validates against the schema shape, writes if changed.
+//
+// Exit codes:
+//   0 — claims.json regenerated (or already current).
+//   1 — generator failure.
+//   2 — schema mismatch (developer must regen + commit).
+//
+// Usage:
+//   node scripts/claims/generate.mjs              # regen and write if changed
+//   node scripts/claims/generate.mjs --check      # regen and exit non-zero if disk diff (test totals as committed)
+//   node scripts/claims/generate.mjs --check --with-test-counts   # the same, with the captured test totals (a release)
+//   node scripts/claims/generate.mjs --print      # regen and print to stdout (no write)
+//   node scripts/claims/generate.mjs --live       # also re-sample the `maintenance` block
+//                                                 # from the GitHub API (the only generator
+//                                                 # that touches the network; see
+//                                                 # generators/issues.mjs for why it is opt-in)
+
+import { readFile, writeFile } from 'node:fs/promises';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { generate as version } from './generators/version.mjs';
+import { generate as tests } from './generators/tests.mjs';
+import { generate as mcpTools } from './generators/mcp-tools.mjs';
+import { generate as evalRules } from './generators/eval-rules.mjs';
+import { generate as llmJudgeTemplates } from './generators/llm-judge-templates.mjs';
+import { generate as capabilityMap } from './generators/capability-map.mjs';
+import { generate as clients } from './generators/clients.mjs';
+import { generate as brand } from './generators/brand.mjs';
+import { generate as release } from './generators/release.mjs';
+import { generate as security } from './generators/security.mjs';
+import { generate as maintenance } from './generators/issues.mjs';
+import { generate as proof } from './generators/proof.mjs';
+import { generate as evaluators } from './generators/evaluators.mjs';
+import { diffPaths } from './diff-paths.mjs';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const root = resolve(here, '..', '..');
+const CLAIMS_PATH = resolve(root, '.claims.json');
+const SCHEMA_VERSION = 1;
+
+const args = new Set(process.argv.slice(2));
+const CHECK = args.has('--check');
+const PRINT = args.has('--print');
+/*
+ * The test totals are measured at a release (claims:capture-tests, in the
+ * roll), not on every pull request. They feed one line of the website, they
+ * only move when a test is added or removed, and checking them on every PR
+ * made each PR that added a test run the whole suite a second time to count
+ * it, locally and again in CI, and conflict on every rebase. `--check` keeps
+ * the committed totals unless `--with-test-counts` asks for them.
+ */
+const WITH_TEST_COUNTS = args.has('--with-test-counts');
+
+async function committedTests() {
+  try {
+    return JSON.parse(await readFile(CLAIMS_PATH, 'utf-8')).tests ?? (await tests());
+  } catch {
+    return tests();
+  }
+}
+
+async function main() {
+  const generators = [
+    ['version', version],
+    ['tests', CHECK && !WITH_TEST_COUNTS ? committedTests : tests],
+    ['mcpTools', mcpTools],
+    ['evalRules', evalRules],
+    ['llmJudgeTemplates', llmJudgeTemplates],
+    ['brand', brand],
+    ['release', release],
+    ['security', security],
+    ['maintenance', maintenance],
+    ['proof', proof],
+    ['evaluators', evaluators],
+    ['capabilityMap', capabilityMap],
+    ['clients', clients],
+  ];
+
+  const results = await Promise.allSettled(
+    generators.map(async ([key, fn]) => [key, await fn()]),
+  );
+
+  const failed = results.filter(r => r.status === 'rejected');
+  if (failed.length > 0) {
+    for (const f of failed) {
+      console.error('[claims:generate] generator failure:', f.reason);
+    }
+    process.exit(1);
+  }
+
+  const fields = Object.fromEntries(results.map(r => r.value));
+
+  // Determine commit SHA at generation time, if available.
+  let generatedFromCommit = null;
+  try {
+    const { execSync } = await import('node:child_process');
+    generatedFromCommit = execSync('git rev-parse --short HEAD', {
+      cwd: root,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString()
+      .trim() || null;
+  } catch {
+    /* git not available; leave null */
+  }
+
+  const claims = {
+    $schema: 'https://iris-eval.com/claims-schema-v1.json',
+    schemaVersion: SCHEMA_VERSION,
+    generatedAt: new Date().toISOString(),
+    generatedFromCommit,
+    generatorVersion: '1.0.0',
+    ...fields,
+  };
+
+  // Stable JSON for diffability — sorted keys at top level + nested.
+  const serialized = stableStringify(claims);
+
+  if (PRINT) {
+    process.stdout.write(serialized + '\n');
+    return;
+  }
+
+  let existing = null;
+  try {
+    existing = await readFile(CLAIMS_PATH, 'utf-8');
+  } catch {
+    /* missing is fine on first run */
+  }
+
+  // For check-mode comparison, normalize both sides — strip generatedAt +
+  // generatedFromCommit since those legitimately change every commit.
+  const normalize = obj => {
+    const { generatedAt, generatedFromCommit, ...rest } = obj;
+    return rest;
+  };
+
+  const newNormalized = stableStringify(normalize(claims));
+  let oldNormalized = null;
+  if (existing) {
+    try {
+      oldNormalized = stableStringify(normalize(JSON.parse(existing)));
+    } catch {
+      oldNormalized = null;
+    }
+  }
+
+  if (CHECK) {
+    if (oldNormalized === newNormalized) {
+      console.log('[claims:check] OK — claims.json matches generator output');
+      process.exit(0);
+    } else {
+      console.error('[claims:check] FAIL — claims.json drifted from generator output');
+      // Name each field that differs, so the reader knows what moved before reading any advice.
+      const diffs = diffPaths(normalize(JSON.parse(existing ?? '{}')), normalize(claims));
+      for (const d of diffs.slice(0, 20)) console.error(`  ${d.path}: committed ${d.committed}, generated ${d.generated}`);
+      if (diffs.length > 20) console.error(`  … and ${diffs.length - 20} more`);
+      /*
+       * Name BOTH commands, in order. The test totals in this file come
+       * from capture-tests, not from generate, so a PR that adds a test
+       * fails here and the old one-line message sent you to the command
+       * that cannot fix it. Capture runs the suite, so it must come first
+       * and it must come from a GREEN run.
+       */
+      if (WITH_TEST_COUNTS) {
+        console.error('Run `node scripts/claims/capture-tests.mjs` (from a green suite) then `npm run claims:generate`, and commit the result.');
+        console.error('If only the test counts moved, capture-tests is the one you need — generate alone will not change them.');
+      } else {
+        console.error('Run `npm run claims:generate` and commit the result. (Test totals are not compared here; a release captures them.)');
+      }
+      process.exit(2);
+    }
+  }
+
+  if (oldNormalized === newNormalized && existing) {
+    console.log('[claims:generate] no change');
+    return;
+  }
+
+  await writeFile(CLAIMS_PATH, serialized + '\n', 'utf-8');
+  console.log(`[claims:generate] wrote ${CLAIMS_PATH}`);
+}
+
+function stableStringify(obj, indent = 2) {
+  // Recursive sort of object keys for stable output.
+  const sortKeys = v => {
+    if (Array.isArray(v)) return v.map(sortKeys);
+    if (v && typeof v === 'object' && v.constructor === Object) {
+      const sorted = {};
+      for (const k of Object.keys(v).sort()) sorted[k] = sortKeys(v[k]);
+      return sorted;
+    }
+    return v;
+  };
+  return JSON.stringify(sortKeys(obj), null, indent);
+}
+
+main().catch(err => {
+  console.error('[claims:generate] unexpected error:', err);
+  process.exit(1);
+});

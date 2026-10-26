@@ -1,0 +1,1016 @@
+import type {
+  EvalRule,
+  EvalContext,
+  EvalRuleResult,
+  EvalResult,
+  EvalResultType,
+  EvalType,
+  EvalCategoryResult,
+  CustomRuleDefinition,
+  EvidenceRecord,
+  NarrowedArgument,
+  Provenance,
+} from '../types/eval.js';
+import { getRulesForType, createCustomRule } from './rules/index.js';
+import { criticalityResolver, type CriticalityOverrides, type EffectiveCriticality } from './criticality.js';
+import { bundleState, compose, interpretations, roleOf, COMPOSER_RULES, DEFAULT_COMPOSE, type ComposeConfig } from './compose.js';
+import { inputsPresent, ruleStateOf, stampRuleResult, type PriorInForce } from './stamp.js';
+import type { LocalLabelSource } from './local-labels.js';
+import { toSteps } from './steps.js';
+import { readStructured, spanInOutput, type StructuredOutput } from './text/structured.js';
+import { toolsHash } from './catalogue.js';
+import { buildProvenance, configHash, deriveCoverage, rulesetHash } from './verdict.js';
+import { evidenceOf } from './evidence.js';
+import { PUBLISHED_CALIBRATION } from './published-calibration.js';
+import { answersTheAsk } from './rules/relevance.js';
+import { agentModelOf } from './llm-judge/family.js';
+import type { RelevanceJudge } from './llm-judge/relevance-judge.js';
+import type { JudgeBudget } from './llm-judge/budget.js';
+import { PKG_VERSION } from '../config/defaults.js';
+import { generateEvalId } from '../utils/ids.js';
+
+/**
+ * Every bundle eval_type="all" walks, in the order their categories are
+ * reported. 'custom' is last: it holds only deployed rules registered under
+ * evalType "custom" plus the call's inline custom_rules, so it is absent
+ * from the breakdown when neither exists.
+ */
+export const ALL_EVAL_TYPES: readonly EvalType[] = ['completeness', 'relevance', 'safety', 'cost', 'custom'];
+
+/**
+ * What runs when a caller never chose a bundle. It used to be
+ * 'completeness', so a CI gate keyed on `passed` skipped PII and injection
+ * unless the caller knew to set eval_type — six of seven UAT personas read
+ * passed:true on PII-laden text with nothing in the payload saying the
+ * safety bundle had not run. Every bundle is the only default under which
+ * an omitted argument cannot silently narrow the verdict. The MCP tool and
+ * the HTTP ingest route both read this constant, so the two surfaces
+ * cannot default differently.
+ */
+export const DEFAULT_EVAL_TYPE: EvalResultType = 'all';
+
+/**
+ * The one-line note both surfaces attach when the default ran, so a reader
+ * of the response knows the bundle was chosen for them and how to narrow it.
+ */
+export const DEFAULT_EVAL_TYPE_NOTE =
+  'eval_type was omitted, so the default ran every bundle — completeness, relevance, safety, cost and any custom rules — the same as eval_type="all"; pass a single bundle name to narrow the run.';
+
+/**
+ * The verdict arithmetic, shared by a single bundle, the overall
+ * eval_type="all" result, and each per-category entry inside it. One
+ * function so the three can never disagree about what `passed` means.
+ */
+interface Verdict {
+  score: number;
+  passed: boolean;
+  rulesEvaluated: number;
+  rulesSkipped: number;
+  criticalFailures: string[];
+  criticalSkipped: string[];
+}
+
+/** What one evaluation looked like, for a log line: never the text, never a key. */
+export interface EvaluationEvent {
+  evaluation_id: string;
+  eval_type: string;
+  verdict: 'pass' | 'fail' | 'unknown';
+  basis: string;
+  passed: boolean;
+  score: number;
+  rules_evaluated: number;
+  rules_skipped: number;
+  critical_failures: string[];
+  prior_source: string | null;
+  duration_ms: number;
+}
+
+export function evaluationEvent(result: EvalResult, durationMs: number): EvaluationEvent {
+  return {
+    evaluation_id: result.id,
+    eval_type: result.eval_type,
+    verdict: result.verdict?.state ?? (result.passed ? 'pass' : 'fail'),
+    basis: result.verdict?.basis ?? 'no_rules',
+    passed: result.passed,
+    score: result.score,
+    rules_evaluated: result.rules_evaluated ?? 0,
+    rules_skipped: result.rules_skipped ?? 0,
+    critical_failures: result.critical_failures ?? [],
+    prior_source: result.provenance?.composer?.priorSource ?? null,
+    duration_ms: Math.round(durationMs * 100) / 100,
+  };
+}
+
+export class EvalEngine {
+  private additionalRules: Map<EvalType, EvalRule[]> = new Map();
+  /**
+   * Registered-rule handles keyed by deployed rule id, so delete paths can
+   * hot-remove exactly the instance they registered. Keyed by id (not name)
+   * because deploy_rule doesn't enforce name uniqueness — two rules can
+   * share a name with different definitions.
+   */
+  private rulesById: Map<string, { evalType: EvalType; rule: EvalRule }> = new Map();
+  /**
+   * Reverse index, so each rule's result can carry its deployed id
+   * (EvalRuleResult.ruleId) without mutating the rule object itself.
+   */
+  private idByRule: Map<EvalRule, string> = new Map();
+  private threshold: number;
+  private ruleThresholds?: Record<string, unknown>;
+  private criticalityOverrides?: CriticalityOverrides;
+  /**
+   * Effective criticality per rule, bound to this engine's config overrides.
+   * Every veto decision reads THIS, never `rule.critical` directly, so a
+   * promotion or demotion cannot apply on one code path and not another.
+   */
+  private criticality: (rule: EvalRule) => EffectiveCriticality;
+
+  /** The verdict's six defaults, resolved once from the config this engine was built with. */
+  private compose: ComposeConfig;
+
+  /**
+   * The deployment's own labels, installed by
+   * refreshLocalLabels at boot and after every label write. Null on an
+   * engine nothing has labelled — the proof runner, a test, an embedder —
+   * which then evaluates exactly as before.
+   */
+  private localLabels: LocalLabelSource | null = null;
+
+  private observer: ((event: EvaluationEvent) => void) | null = null;
+
+  /**
+   * The relevance judge answers_the_ask gates on (#649), or null when the
+   * deployment installed none — then the rule reads the ask lexically and
+   * advises. The server installs it from IRIS_RELEVANCE_JUDGE_MODEL; an
+   * embedder calls setRelevanceJudge. Never installed by default: a judge
+   * call costs money, and this engine is what every evaluation door shares.
+   */
+  private relevanceJudge: RelevanceJudge | null = null;
+
+  /**
+   * The daily budget every judge call on the user's key draws on: the
+   * relevance judge's and the judge tools' (llm-judge/budget.ts). The
+   * server sets it from the environment over the database's ledger and
+   * hands the same one to the relevance judge, so the three share a balance.
+   */
+  private judgeBudget: JudgeBudget | null = null;
+
+  /**
+   * One structured event per evaluation, whichever door asked for it
+   * (0.15.0): the server wires it to the logger's `event('evaluation', …)`.
+   * The engine has no logger of its own on purpose — the tools, the ingest
+   * path and the CLI all reach it, so the seam is here, once. An observer
+   * that throws never fails the evaluation.
+   */
+  setObserver(observer: ((event: EvaluationEvent) => void) | null): void {
+    this.observer = observer;
+  }
+
+  /**
+   * Install (or clear) the relevance judge. From then on every evaluation
+   * that runs answers_the_ask on a call carrying an input makes one judge
+   * call first, capped by the judge's per-call cost cap, and the rule gates
+   * on its verdict. It changes the ruleset hash, so a stored verdict made
+   * without the judge is not taken as current for one made with it.
+   */
+  setRelevanceJudge(judge: RelevanceJudge | null): void {
+    this.relevanceJudge = judge;
+  }
+
+  /** The relevance judge in force, for the surfaces that describe it. */
+  relevanceJudgeInForce(): RelevanceJudge | null {
+    return this.relevanceJudge;
+  }
+
+  /** Set the daily budget the judge tools draw on; pass the same one to the relevance judge. */
+  setJudgeBudget(budget: JudgeBudget | null): void {
+    this.judgeBudget = budget;
+  }
+
+  /** The daily budget in force: the one set, else the relevance judge's, else none. */
+  judgeBudgetInForce(): JudgeBudget | null {
+    return this.judgeBudget ?? this.relevanceJudge?.budget ?? null;
+  }
+
+  /** The judge's identity as the ruleset and config hashes fold it in: absent without a judge, so no existing hash moves. */
+  private judgeIdentity(): string | undefined {
+    return this.relevanceJudge ? `relevance:${this.relevanceJudge.provider ?? 'unknown'}/${this.relevanceJudge.model}` : undefined;
+  }
+
+  /** Install (or clear) the local-label source every later evaluation reads. */
+  setLocalLabels(source: LocalLabelSource | null): void {
+    this.localLabels = source;
+  }
+
+  /**
+   * What this engine holds that other processes on the same data folder can
+   * change: the deployed rules (a file) and the labels (the database). The
+   * server installs one function for each; the engine calls them before it
+   * reads what they keep current, so a rule another process deployed and a
+   * label another process wrote apply to this process's next evaluation.
+   * Until this an engine read both once, at start. Null on an engine
+   * nothing shares: the proof runner, a test, an embedder.
+   *
+   * `rules` is synchronous because the ruleset hash is read synchronously;
+   * it may call registerRule and unregisterRule, which never call it back.
+   */
+  private shared: { rules?: () => void; labels?: () => Promise<void> } | null = null;
+
+  setSharedState(shared: { rules?: () => void; labels?: () => Promise<void> } | null): void {
+    this.shared = shared;
+  }
+
+  /** Bring the rules, then the labels, in step. A failure to read either is not an evaluation failure: the engine keeps what it had. */
+  private async inStep(): Promise<void> {
+    if (this.shared === null) return;
+    this.rulesInStep();
+    try {
+      await this.shared.labels?.();
+    } catch {
+      // The labels as last read stay in force.
+    }
+  }
+
+  private rulesInStep(): void {
+    try {
+      this.shared?.rules?.();
+    } catch {
+      // The rules as last read stay in force.
+    }
+  }
+
+  /** The source in force, for the surfaces that show it. */
+  localLabelSource(): LocalLabelSource | null {
+    return this.localLabels;
+  }
+
+  /**
+   * The prior in force and where it came from: the deployment's own
+   * eval.prior when it set one; else the prior its labels imply, once any
+   * detection or inference has LOCAL_LABEL_MIN labels; else the default.
+   * A configured prior always wins — the deployment said so.
+   */
+  private effectivePrior(): PriorInForce {
+    if (this.criticalityOverrides?.priorConfigured === true) return { pi: this.compose.prior, source: 'config' };
+    const estimated = this.localLabels?.estimatedPrior ?? null;
+    if (estimated !== null) return { pi: estimated.pi, source: 'estimated' };
+    return { pi: this.compose.prior, source: 'default' };
+  }
+
+  /** The composer configuration with the prior in force. */
+  private effectiveCompose(): ComposeConfig {
+    return { ...this.compose, prior: this.effectivePrior().pi };
+  }
+
+  /**
+   * The composer facts a stored row re-composes its verdict from
+   * (Provenance.composer). One writer for the two places that stamp a row,
+   * and every setting the composer reads: `requiredEvidence` was missing,
+   * so a verdict that was `unknown` for missing evidence read back as a
+   * pass.
+   */
+  private composerFacts(): NonNullable<Provenance['composer']> {
+    const prior = this.effectivePrior();
+    return {
+      defaultsGate: this.compose.defaultsGate,
+      falsePassCost: this.compose.falsePassCost,
+      onCriticalSkipped: this.compose.onCriticalSkipped,
+      prior: prior.pi,
+      priorSource: prior.source,
+      priorMode: this.compose.priorMode,
+      calibration: PUBLISHED_CALIBRATION.version,
+      ...(this.compose.requiredEvidence.length > 0 ? { requiredEvidence: [...this.compose.requiredEvidence] } : {}),
+      rules: COMPOSER_RULES,
+    };
+  }
+
+  /** The configuration hash for a verdict produced now: thresholds, criticality, the judge, and every composer setting that is not the shipped one. */
+  private configHashNow(): string {
+    const prior = this.effectivePrior();
+    return configHash({
+      threshold: this.threshold,
+      ruleThresholds: this.ruleThresholds,
+      criticalRules: this.criticalityOverrides?.criticalRules,
+      nonCriticalRules: this.criticalityOverrides?.nonCriticalRules,
+      judge: this.judgeIdentity(),
+      composer: {
+        defaultsGate: this.compose.defaultsGate,
+        falsePassCost: this.compose.falsePassCost,
+        onCriticalSkipped: this.compose.onCriticalSkipped,
+        requiredEvidence: this.compose.requiredEvidence,
+        prior: prior.pi,
+        priorSource: prior.source,
+        priorMode: this.compose.priorMode,
+      },
+    });
+  }
+
+  /**
+   * `criticalityOverrides` are `config.eval` — the criticalRules /
+   * nonCriticalRules lists. Validated here as well as in loadConfig, so an
+   * engine built directly (a test, an embedder) cannot silently ignore a
+   * misspelled rule name.
+   */
+  constructor(
+    threshold = 0.7,
+    ruleThresholds?: Record<string, unknown>,
+    criticalityOverrides?: CriticalityOverrides,
+  ) {
+    this.threshold = threshold;
+    this.ruleThresholds = ruleThresholds;
+    this.criticalityOverrides = criticalityOverrides;
+    this.criticality = criticalityResolver(criticalityOverrides);
+    this.compose = {
+      composer: criticalityOverrides?.composer ?? DEFAULT_COMPOSE.composer,
+      falsePassCost: criticalityOverrides?.falsePassCost ?? DEFAULT_COMPOSE.falsePassCost,
+      onCriticalSkipped: criticalityOverrides?.onCriticalSkipped ?? DEFAULT_COMPOSE.onCriticalSkipped,
+      requiredEvidence: (criticalityOverrides?.requiredEvidence as ComposeConfig['requiredEvidence']) ?? DEFAULT_COMPOSE.requiredEvidence,
+      defaultsGate: criticalityOverrides?.defaultsGate ?? DEFAULT_COMPOSE.defaultsGate,
+      prior: criticalityOverrides?.prior ?? DEFAULT_COMPOSE.prior,
+      priorMode: criticalityOverrides?.priorMode ?? DEFAULT_COMPOSE.priorMode,
+    };
+  }
+
+  /*
+   * The verdict, and `passed` with it.
+   *
+   * From 0.10.0 `passed` IS `verdict.state === 'pass'` — one definition, on
+   * every surface. The weighted `score` survives untouched as a quality
+   * gradient over the rules that ran, and is never re-meant: a reader who
+   * was using it as a gradient keeps it, and a reader who was using it as a
+   * safety signal was reading a number the 2026-09-05 audit measured as inert.
+   */
+  /**
+   * The composer's word on a row another tool judged (#375).
+   * evaluate_with_llm_judge and verify_citations store one judgment row
+   * each and used to report their own pass/fail beside it, so `passed`
+   * meant the threshold on those two and the composer everywhere else.
+   * Every stored row now carries the same verdict, basis and
+   * interpretations, from the one composer, under this engine's config.
+   * `evidence` is what the judged call carried and who recorded it
+   * (src/eval/evidence.ts), as the tool that judged it knows them;
+   * `narrowed`, the arguments the operator's settings held back
+   * (src/tools/operator-ceilings.ts).
+   */
+  verdictOf(result: EvalResult, evidence?: EvidenceRecord, narrowed?: NarrowedArgument[]): EvalResult {
+    /*
+     * The receipt too: a stored row derives its verdict on read only under
+     * the composer facts its provenance carries (rowToEvalResult), so a
+     * judgment stored without provenance read back with no verdict at all.
+     * The ruleset hash is this engine's whole roster — the hash a call of
+     * every bundle would stamp — since a judgment ran no built-in rule.
+     */
+    result.provenance ??= buildProvenance({
+      irisVersion: PKG_VERSION,
+      rulesetHash: this.rulesetHashForAll(),
+      configHash: this.configHashNow(),
+      threshold: this.threshold,
+      ruleThresholds: this.ruleThresholds,
+      composer: this.composerFacts(),
+      ...(evidence !== undefined ? { evidence } : {}),
+      ...(narrowed !== undefined ? { narrowed } : {}),
+      judgedAt: new Date().toISOString(),
+    });
+    return this.decide(result);
+  }
+
+  private decide(result: EvalResult): EvalResult {
+    // The role each result played, from the composer's own predicates — the
+    // one writer, after every stamp and before anything reads it.
+    for (const r of result.rule_results) r.role = roleOf(r, this.compose);
+    const cfg = this.effectiveCompose();
+    const verdict = compose(result, cfg);
+    result.verdict = verdict;
+    result.passed = verdict.passed;
+    /*
+     * Each bundle row is the verdict, read for the rules the bundle holds.
+     * The rows were filled by summarize(), the pre-0.10.0 arithmetic, which
+     * is still the score and no longer what passes: read as a verdict,
+     * every row could say passed on an evaluation that failed.
+     */
+    for (const [type, row] of Object.entries(result.categories ?? {})) {
+      row.state = bundleState(result.rule_results.filter((r) => r.category === type), verdict, cfg, result.rule_results, result.provenance?.evidence);
+      // null for a row that was not checked, whatever the reason: it is not a pass and it is not a failure.
+      row.passed = row.state === 'unknown' ? null : row.state === 'pass';
+    }
+    const notes = interpretations(result, verdict, cfg);
+    if (notes.length > 0) result.interpretations = notes;
+    return result;
+  }
+
+  /** The effective criticality of one rule under this engine's config. Read by the rule roster surfaces. */
+  effectiveCriticality(rule: EvalRule): EffectiveCriticality {
+    return this.criticality(rule);
+  }
+
+  /**
+   * Register a rule under a bundle. When `ruleId` is given the registration
+   * is IDEMPOTENT by id: registering an id that is already live replaces the
+   * earlier instance instead of adding a second one. That is what re-enable
+   * (delete_rule enabled:true) and a reload after edit need — without it,
+   * every toggle stacked another copy that fired alongside the first.
+   */
+  registerRule(evalType: EvalType, rule: EvalRule, ruleId?: string): void {
+    if (ruleId !== undefined && this.rulesById.has(ruleId)) {
+      this.unregisterRule(ruleId);
+    }
+    const existing = this.additionalRules.get(evalType) ?? [];
+    existing.push(rule);
+    this.additionalRules.set(evalType, existing);
+    if (ruleId !== undefined) {
+      this.rulesById.set(ruleId, { evalType, rule });
+      this.idByRule.set(rule, ruleId);
+    }
+  }
+
+  /**
+   * Hot-remove a rule registered under `ruleId` so it stops firing on the
+   * live process — what delete_rule's description promises (#332). Returns
+   * false when the id was never registered (already removed, or registered
+   * without an id); callers treat that as a no-op, not an error.
+   */
+  unregisterRule(ruleId: string): boolean {
+    const entry = this.rulesById.get(ruleId);
+    if (!entry) return false;
+    this.rulesById.delete(ruleId);
+    this.idByRule.delete(entry.rule);
+    const rules = this.additionalRules.get(entry.evalType);
+    if (rules) {
+      const idx = rules.indexOf(entry.rule);
+      if (idx !== -1) rules.splice(idx, 1);
+    }
+    return true;
+  }
+
+  /** Whether a deployed rule id is currently registered (and therefore firing). */
+  hasRule(ruleId: string): boolean {
+    return this.rulesById.has(ruleId);
+  }
+
+  /** What is registered under a deployed rule id: its bundle and the hash of its content, or undefined when nothing is. */
+  registeredAs(ruleId: string): { evalType: EvalType; contentHash?: string } | undefined {
+    const entry = this.rulesById.get(ruleId);
+    return entry ? { evalType: entry.evalType, contentHash: entry.rule.contentHash } : undefined;
+  }
+
+  async evaluate(
+    evalType: EvalType,
+    context: EvalContext,
+    customRules?: CustomRuleDefinition[],
+  ): Promise<EvalResult> {
+    /*
+     * Inline custom_rules are ADDITIVE, which is what evaluate_output's
+     * description promises in two places: "fires REGARDLESS of eval_type"
+     * and "otherwise both your rules AND the eval_type bundle run together".
+     *
+     * The old branch did neither. `evalType === 'custom' && customRules`
+     * meant:
+     *   - evaluate('safety', ctx, [myRule]) silently DISCARDED myRule and
+     *     returned a plausible score that never applied it. An agent
+     *     following the tool description got a wrong answer with no warning.
+     *   - evaluate('custom', ctx, [myRule]) replaced the rule list entirely,
+     *     EVICTING every rule the user had deployed and which the server
+     *     registers at boot. Passing one ad-hoc rule disabled their whole
+     *     library for that call.
+     *
+     * getRulesForType('custom') is [] (rules/index.ts), so eval_type="custom"
+     * still runs no built-in bundle — the documented "ONLY these" behaviour
+     * holds. What it now also includes is the caller's own deployed rules,
+     * which is the least surprising reading of having deployed them.
+     */
+    await this.inStep();
+    const rules: EvalRule[] = [
+      ...getRulesForType(evalType),
+      ...(this.additionalRules.get(evalType) ?? []),
+      ...(customRules ?? []).map((def) => createCustomRule(def, def.severity)),
+    ];
+    return this.run(evalType, rules, undefined, context);
+  }
+
+  /**
+   * eval_type="all" (#370): every built-in bundle, each with the deployed
+   * rules registered under it, plus the rules deployed under "custom" and
+   * the call's inline custom_rules — in ONE pass, sharing one regex budget,
+   * so the whole call is bounded exactly like a single bundle. The overall
+   * verdict is the same arithmetic as a single bundle applied to every rule
+   * that ran (weighted score against the threshold, critical veto across
+   * all bundles); `categories` carries the same arithmetic per bundle.
+   */
+  /**
+   * The ruleset hash a call of this shape would stamp, without running one.
+   *
+   * `evaluate_runs` has to decide which stored traces still need scoring
+   * BEFORE it scores anything, and "has this trace been judged by the
+   * current rules?" is exactly a question about this hash. The alternative
+   * — evaluate one throwaway trace to read the hash off its provenance —
+   * works, but it makes a decision about the whole run depend on whichever
+   * trace happened to be first.
+   *
+   * It gathers rules the same way evaluateAll does, because a hash derived
+   * any other way would be a second definition of the ruleset and would
+   * disagree the first time the two drifted.
+   */
+  rulesetHashForAll(): string {
+    this.rulesInStep();
+    const rules: EvalRule[] = [];
+    for (const type of ALL_EVAL_TYPES) {
+      rules.push(...getRulesForType(type), ...(this.additionalRules.get(type) ?? []));
+    }
+    return rulesetHash(rules, (r) => this.criticality(r), this.judgeIdentity());
+  }
+
+  async evaluateAll(context: EvalContext, customRules?: CustomRuleDefinition[]): Promise<EvalResult> {
+    await this.inStep();
+    const rules: EvalRule[] = [];
+    const categories: EvalType[] = [];
+    for (const type of ALL_EVAL_TYPES) {
+      for (const rule of [...getRulesForType(type), ...(this.additionalRules.get(type) ?? [])]) {
+        rules.push(rule);
+        categories.push(type);
+      }
+    }
+    for (const def of customRules ?? []) {
+      rules.push(createCustomRule(def, def.severity));
+      categories.push('custom');
+    }
+    return this.run('all', rules, categories, context);
+  }
+
+  /*
+   * Async from 0.10.0. Nothing it awaits yet: every rule the package ships
+   * is synchronous, and `EvalRule.evaluate` stays synchronous so the type
+   * system keeps proving that a deterministic rule cannot reach the network
+   * — which is what makes "evaluate_output never spends" a compile-time
+   * fact rather than a test. The signature moves first, in one mechanical
+   * change, so the judgment rule that DOES call a provider can be added
+   * without re-touching every caller a second time.
+   */
+  private async run(
+    evalType: EvalResultType,
+    rules: EvalRule[],
+    categories: EvalType[] | undefined,
+    context: EvalContext,
+  ): Promise<EvalResult> {
+    const started = performance.now();
+    const result = await this.runRules(evalType, rules, categories, context);
+    if (this.observer) {
+      try {
+        this.observer(evaluationEvent(result, performance.now() - started));
+      } catch {
+        // The observer is a log seam; a failure there is not an evaluation failure.
+      }
+    }
+    return result;
+  }
+
+  private async runRules(
+    evalType: EvalResultType,
+    rules: EvalRule[],
+    categories: EvalType[] | undefined,
+    context: EvalContext,
+  ): Promise<EvalResult> {
+    // Merge system-level thresholds into customConfig (user-provided values
+    // take precedence) — and record, BEFORE the merge erases it, which keys
+    // this call supplied and which the deployment's config file supplied.
+    // That is what thresholdSourceOf() answers from; the rules never
+    // compare a value to the shipped number (src/eval/thresholds.ts).
+    const callKeys = new Set(Object.keys(context.customConfig ?? {}));
+    // Provenance comes from loadConfig alone (the server passes config.eval,
+    // which it stamped). An engine built directly with ruleThresholds and no
+    // configuredThresholdKeys — the proof runner, a test, an embedder — is
+    // treated as running the shipped defaults: a threshold is the
+    // deployment's only when something recorded that the deployment set it.
+    const fileKeys = new Set(this.criticalityOverrides?.configuredThresholdKeys ?? []);
+    context = {
+      ...context,
+      ...(this.ruleThresholds ? { customConfig: { ...this.ruleThresholds, ...context.customConfig } } : {}),
+      thresholdSourceOf: (key: string) => (callKeys.has(key) || fileKeys.has(key) ? 'config' : 'default'),
+      thresholdSetBy: (key: string) => (callKeys.has(key) ? 'call' : fileKeys.has(key) ? 'config' : undefined),
+    };
+    /*
+     * A blank input is no input and a negative cost is no cost. Each used
+     * to be judged as though it had been sent: one space in place of the
+     * input ran the relevance rules against nothing and passed them, and a
+     * cost of -1 sat under every ceiling. Both are now what they are, a
+     * field that was not sent, so the rules that read them skip and the
+     * verdict says so where somebody had asked.
+     */
+    if (typeof context.input === 'string' && context.input.trim() === '') context = { ...context, input: undefined };
+    if (typeof context.costUsd === 'number' && context.costUsd < 0) context = { ...context, costUsd: undefined };
+
+    if (rules.length === 0) {
+      // Through decide(), like every other return: the composer stamps the
+      // verdict and writes the sentence that says nothing was judged, so
+      // "no rules are configured for this eval type" is one writer's line
+      // rather than a string this branch keeps in its own hand.
+      return this.decide({
+        id: generateEvalId(),
+        eval_type: evalType,
+        output_text: context.output,
+        expected_text: context.expected,
+        score: 0,
+        passed: false,
+        rule_results: [],
+        rules_evaluated: 0,
+        rules_skipped: 0,
+        insufficient_data: true,
+      });
+    }
+
+    /*
+     * Shallow copy so the regex circuit breaker is scoped to THIS evaluation
+     * and never leaks into a caller-held context object. All rules in one
+     * evaluation share the breaker: after MAX_REGEX_BREACHES_PER_EVAL sandbox
+     * budget breaches (see rules/custom.ts), remaining regex rules skip
+     * without running — one hostile output cannot stall the request once per
+     * rule it carries.
+     */
+    const evalContext: EvalContext = { ...context, regexBudget: { breaches: 0 }, steps: toSteps(context) };
+    /*
+     * An output written as JSON, read as the text it carries (0.20.0). The
+     * built-in text rules used to read a structured answer in its escaped
+     * form: a line break was the two characters `\n` and a phrase in a
+     * value sat between quotes, so an injection was missed and an empty
+     * answer was not empty. Each rule that reads the output declares which
+     * reading it takes (EvalRule.outputView); custom rules read the output
+     * as sent. Parsed once per evaluation, and only when the output is a
+     * JSON object or array. A structured `expected` is read the same way,
+     * so a rule that compares the two compares like with like.
+     */
+    const structured = readingsOf(context);
+    delete evalContext.outputRead;
+    /*
+     * The relevance judge, asked once and before any rule (#649). Only when
+     * the deployment installed one, answers_the_ask is among the rules this
+     * call runs, and the call carries an ask and an answer to compare — so a
+     * completeness-only call, an output-only call and an empty output never
+     * spend. A caller-supplied relevanceJudgment is discarded first: only
+     * the engine may say what the judge said.
+     */
+    delete evalContext.relevanceJudgment;
+    const judge = this.relevanceJudge;
+    if (judge !== null && rules.includes(answersTheAsk) && typeof context.input === 'string' && context.input.trim() !== '' && context.output.trim() !== '') {
+      evalContext.relevanceJudgment = await judge.judge(
+        {
+          input: context.input,
+          output: context.output,
+          agentModel: agentModelOf({ metadata: context.metadata, spans: context.spans as Array<{ attributes?: Record<string, unknown> }> | undefined }),
+        },
+        {
+          ...(context.tenantId !== undefined ? { tenantId: context.tenantId } : {}),
+          ...(context.judgeRequest !== undefined ? { request: context.judgeRequest } : {}),
+        },
+      );
+    }
+    const judgeSpend = evalContext.relevanceJudgment;
+    /*
+     * Sequential, and it must stay sequential when a rule becomes awaitable:
+     * every rule in one evaluation shares the regex circuit breaker above,
+     * and running them concurrently would race the breach count that bounds
+     * a hostile output.
+     */
+    const ruleResults: EvalRuleResult[] = [];
+    for (const [i, rule] of rules.entries()) {
+      /*
+       * A judgment rule calls a provider and costs money. It runs only when
+       * the caller has said this evaluation may spend — which the free
+       * evaluation path never does. Enforced here, on the one path every
+       * evaluation takes, so no tool can forget it and no future rule can
+       * quietly opt itself in.
+       */
+      const raw =
+        rule.kind === 'judgment' && evalContext.allowPaid !== true
+          ? {
+              ruleName: rule.name,
+              passed: false,
+              score: 0,
+              message: 'Judgment rules are not run on this path: it may not call a paid provider.',
+              skipped: true,
+              skipReason: 'this evaluation may not spend (context.allowPaid is not set)',
+            }
+          : readingAs(rule, evalContext, structured);
+      const ruleId = this.idByRule.get(rule);
+      /*
+       * The bundle this rule ran under. `categories` is only supplied for
+       * eval_type="all"; for a single bundle the rule's own evalType is the
+       * answer and is just as true. It used to be left off, which meant a
+       * single-bundle call could not tell a custom rule from a built-in one
+       * — and the composer needs that, because a custom rule's severity is
+       * the deployment's own statement of how much it matters.
+       */
+      const category = categories?.[i] ?? (evalType === 'all' ? rule.evalType : evalType);
+      /*
+       * Every result says whether THIS rule vetoes and who decided that.
+       * Without it, a reader holding a failed evaluation cannot tell a
+       * hard violation from a merely low score without knowing the rule
+       * library by heart — and once eval.criticalRules exists, cannot tell
+       * a shipped default from their own promotion at all. Stamped here, on
+       * the one path every evaluation takes, so a surface cannot render the
+       * declared criticality where the engine applied a configured one.
+       */
+      const effective = this.criticality(rule);
+      const { critical, source } = effective;
+      // ruleId / category sit right after the name so a reader scanning
+      // rule_results sees WHICH deployed rule (and which bundle) spoke.
+      const { ruleName, ...rest } = raw;
+      /*
+       * The stamp (0.9.0): what kind of claim this is, what the composer
+       * did with it, which question it answers, what it saw, why it skipped,
+       * and how wrong it tends to be — from the rule's declaration, the
+       * inputs this call carried, and the published accuracy that ships in
+       * the package. Computed here, on the one path every evaluation takes,
+       * so no surface can show a result without its receipt. It changes no
+       * verdict: summarize() below still decides passed exactly as before.
+       */
+      ruleResults.push({
+        ruleName,
+        ...(ruleId !== undefined ? { ruleId } : {}),
+        ...(category !== undefined ? { category } : {}),
+        critical,
+        criticalSource: source,
+        state: ruleStateOf(raw),
+        ...rest,
+        ...stampRuleResult(rule, raw, context, effective, {
+          prior: this.effectivePrior(),
+          local: this.localLabels?.precision.get(rule.name),
+          deployed: ruleId !== undefined,
+          judgeInForce: this.relevanceJudge !== null,
+        }),
+      });
+    }
+
+    const overall = this.summarize(rules, ruleResults);
+    const perCategory = categories ? this.categorize(rules, ruleResults, categories) : undefined;
+
+    /*
+     * The receipt for the whole evaluation (0.9.0): what produced it, which
+     * questions it judged, and the basis of its verdict. Computed here from
+     * what the engine already holds; persisted as provenance and derived
+     * again on every read, so a stored row answers "why did this pass on
+     * that day" without a backfill. Changes no verdict.
+     */
+    const provenance = buildProvenance({
+      toolsHash: toolsHash(context.tools),
+      irisVersion: PKG_VERSION,
+      rulesetHash: rulesetHash(rules, (r) => this.criticality(r), this.judgeIdentity()),
+      configHash: this.configHashNow(),
+      threshold: this.threshold,
+      ruleThresholds: this.ruleThresholds,
+      composer: this.composerFacts(),
+      // What the call carried and who recorded it: the composer reads it, now and on every read of the stored row.
+      evidence: evidenceOf(context),
+      judgedAt: new Date().toISOString(),
+    });
+    const coverage = deriveCoverage(ruleResults, inputsPresent(context), provenance.evidence);
+
+    // Handle "all rules skipped" — insufficient data
+    if (overall.rulesEvaluated === 0) {
+      // Same field as the main path below: the tool description promises
+      // that EVERY critical rule that skipped is named here, and a caller
+      // whose only rules were critical ones should not have to infer that
+      // from insufficient_data alone.
+      const unknown: EvalResult = {
+        id: generateEvalId(),
+        eval_type: evalType,
+        output_text: context.output,
+        expected_text: context.expected,
+        score: 0,
+        passed: false,
+        rule_results: ruleResults,
+        rules_evaluated: 0,
+        rules_skipped: overall.rulesSkipped,
+        insufficient_data: true,
+        ...(overall.criticalSkipped.length > 0 ? { critical_skipped: overall.criticalSkipped } : {}),
+        ...(perCategory ? { categories: perCategory } : {}),
+        coverage,
+        provenance,
+        ...spendOf(judgeSpend),
+      };
+      return this.decide(unknown);
+    }
+
+    /*
+     * There was a `suggestions: string[]` built here, and every line in it
+     * restated a field this result already carries: the failing rules
+     * (rule_results), the veto (verdict.basis `detector_veto` and
+     * critical_failures), each skip and its reason (rule_results[].skipped
+     * and .skipReason), and the critical rules that could not judge
+     * (critical_skipped, and the composer's block-severity sentence). A
+     * second copy of a verdict is a second verdict, and the day the two
+     * disagree a reader cannot tell which one the product meant.
+     * interpretations[] is where a sentence lives now — it says who it is
+     * for and which setting changes it, which a flat string could not.
+     */
+    const result: EvalResult = {
+      id: generateEvalId(),
+      eval_type: evalType,
+      output_text: context.output,
+      expected_text: context.expected,
+      score: Math.round(overall.score * 1000) / 1000,
+      passed: overall.passed,
+      rule_results: ruleResults,
+      rules_evaluated: overall.rulesEvaluated,
+      rules_skipped: overall.rulesSkipped,
+      insufficient_data: false,
+      ...(overall.criticalFailures.length > 0 ? { critical_failures: overall.criticalFailures } : {}),
+      ...(overall.criticalSkipped.length > 0 ? { critical_skipped: overall.criticalSkipped } : {}),
+      ...(perCategory ? { categories: perCategory } : {}),
+      coverage,
+      provenance,
+      ...spendOf(judgeSpend),
+    };
+    return this.decide(result);
+  }
+
+  /**
+   * Weighted average over the rules that ran, plus the critical veto.
+   *
+   * Critical rules hard-fail. Before this existed, the weighted average
+   * routinely outvoted a genuine violation: an output containing a real
+   * SSN failed no_pii while the other safety rules passed, landing at
+   * ~0.765 — over the 0.7 threshold — so `passed`, the one field every
+   * automated gate keys on, said true about the product's flagship
+   * failure scenario. A detection that reports an all-clear is worse
+   * than no detection.
+   *
+   * Only EVALUATED failures count: a critical rule that skipped (missing
+   * context, broken config) has not judged the output and must not veto
+   * it. The score is left as-is — it stays a quality gradient; `passed`
+   * is the verdict, and the two answer different questions.
+   *
+   * A critical rule that SKIPPED is the fail-open seam between the
+   * release's two headline features: an adversary who knows a deployed
+   * critical regex can craft output that stalls it past the sandbox
+   * budget, and the rule then neither judges nor vetoes — so the eval
+   * returns passed=true with an EMPTY critical_failures on output that
+   * nobody actually cleared. The trade-off is deliberate (failing closed
+   * would let the same adversary force false violations on benign
+   * output), but before `criticalSkipped` the only trace of it was a
+   * interpretation — prose. A gate that must fail closed should not
+   * have to walk rule_results[].budgetExceeded to discover it was defeated.
+   */
+  private summarize(rules: EvalRule[], ruleResults: EvalRuleResult[]): Verdict {
+    const evaluatedIndices: number[] = [];
+    const skippedIndices: number[] = [];
+    for (let i = 0; i < ruleResults.length; i++) {
+      if (ruleResults[i].skipped) {
+        skippedIndices.push(i);
+      } else {
+        evaluatedIndices.push(i);
+      }
+    }
+
+    const criticalSkipped = skippedIndices
+      .filter((i) => this.criticality(rules[i]).critical)
+      .map((i) => ruleResults[i].ruleName);
+
+    if (evaluatedIndices.length === 0) {
+      return {
+        score: 0,
+        passed: false,
+        rulesEvaluated: 0,
+        rulesSkipped: skippedIndices.length,
+        criticalFailures: [],
+        criticalSkipped,
+      };
+    }
+
+    // Weighted average across evaluated rules only (exclude skipped)
+    const totalWeight = evaluatedIndices.reduce((sum, i) => sum + rules[i].weight, 0);
+    const weightedScore = evaluatedIndices.reduce((sum, i) => {
+      const ruleScore = Number.isFinite(ruleResults[i].score) ? ruleResults[i].score : 0;
+      return sum + ruleScore * rules[i].weight;
+    }, 0);
+    const rawScore = totalWeight > 0 ? weightedScore / totalWeight : 0;
+    const score = Number.isFinite(rawScore) ? rawScore : 0;
+
+    const criticalFailures = evaluatedIndices
+      .filter((i) => this.criticality(rules[i]).critical && !ruleResults[i].passed)
+      .map((i) => ruleResults[i].ruleName);
+
+    return {
+      score,
+      passed: score >= this.threshold && criticalFailures.length === 0,
+      rulesEvaluated: evaluatedIndices.length,
+      rulesSkipped: skippedIndices.length,
+      criticalFailures,
+      criticalSkipped,
+    };
+  }
+
+  /** The per-bundle breakdown for eval_type="all": summarize() over each bundle's slice. */
+  private categorize(
+    rules: EvalRule[],
+    ruleResults: EvalRuleResult[],
+    categories: EvalType[],
+  ): Partial<Record<EvalType, EvalCategoryResult>> {
+    const breakdown: Partial<Record<EvalType, EvalCategoryResult>> = {};
+    for (const type of ALL_EVAL_TYPES) {
+      const indices = categories.flatMap((c, i) => (c === type ? [i] : []));
+      if (indices.length === 0) continue;
+      const verdict = this.summarize(
+        indices.map((i) => rules[i]),
+        indices.map((i) => ruleResults[i]),
+      );
+      /*
+       * A bundle whose every rule skipped was not judged (#406). Reporting
+       * it as passed:false / score:0 read as "failing" to anyone regrouping
+       * by category — cost "failed" on a call that carried no cost data.
+       * Inside the breakdown, null is the honest value: neither passing
+       * nor failing, and it never counted toward the overall verdict
+       * (summarize() already excludes skipped rules). The TOP-LEVEL
+       * `passed` is deliberately not made nullable — it is the verdict a
+       * gate keys on, and a gate must fail closed when nothing was judged;
+       * `insufficient_data: true` is the "unknown" marker at that level.
+       */
+      const judged = verdict.rulesEvaluated > 0;
+      breakdown[type] = {
+        score: judged ? Math.round(verdict.score * 1000) / 1000 : null,
+        passed: judged ? verdict.passed : null,
+        rules_evaluated: verdict.rulesEvaluated,
+        rules_skipped: verdict.rulesSkipped,
+        insufficient_data: !judged,
+        ...(verdict.criticalFailures.length > 0 ? { critical_failures: verdict.criticalFailures } : {}),
+        ...(verdict.criticalSkipped.length > 0 ? { critical_skipped: verdict.criticalSkipped } : {}),
+      };
+    }
+    return breakdown;
+  }
+}
+
+/**
+ * One rule's result over the output as the rule reads it: as sent, or, for
+ * a structured output and a rule that declares a reading, that reading's
+ * text, with every span the rule reports mapped back onto the output as
+ * sent (a leak detector's offsets are what a redaction cuts).
+ */
+interface Readings {
+  output: StructuredOutput | null;
+  expected: StructuredOutput | null;
+}
+
+function readingsOf(context: EvalContext): Readings {
+  return { output: readStructured(context.output), expected: typeof context.expected === 'string' ? readStructured(context.expected) : null };
+}
+
+function readingAs(
+  rule: EvalRule,
+  context: EvalContext,
+  readings: Readings,
+  run: (rule: EvalRule, context: EvalContext) => EvalRuleResult = evaluateGuarded,
+): EvalRuleResult {
+  const structured = readings.output;
+  if (structured === null || rule.outputView === undefined) return run(rule, context);
+  const view = structured[rule.outputView];
+  const expected = readings.expected?.[rule.outputView].text;
+  const result = run(rule, { ...context, output: view.text, outputRead: rule.outputView, ...(expected !== undefined ? { expected } : {}) });
+  const evidence = result.evidence?.map((e) => (e.type === 'span' && e.source === 'output' ? { ...e, ...spanInOutput(view, e.start, e.end) } : e));
+  return { ...result, ...(evidence !== undefined ? { evidence } : {}), ...(result.skipped === true ? {} : { read: rule.outputView }) };
+}
+
+/**
+ * One rule over one context, reading the output the way the engine hands it
+ * to that rule. For the proof runner, which measures each rule on its own:
+ * a rule measured on the escaped form of a structured output would publish
+ * the accuracy of a reading the product does not perform. A rule that
+ * throws throws here, so a measurement never counts an error as a skip.
+ */
+export function evaluateRuleAsRead(rule: EvalRule, context: EvalContext): EvalRuleResult {
+  const asSent: EvalContext = { ...context };
+  delete asSent.outputRead;
+  return readingAs(rule, asSent, readingsOf(asSent), (r, c) => r.evaluate(c));
+}
+
+/**
+ * One rule's result, or a SKIP naming the failure when the rule throws. A
+ * rule that throws used to throw the whole evaluation, so an output that
+ * tripped one rule (a 100,000-digit "number" handed to a runtime-built regex,
+ * 2026-09-23 red team) turned every other rule's answer into an error. A skip
+ * is the honest shape: a critical rule that could not run leaves the verdict
+ * unknown, never passed.
+ */
+function evaluateGuarded(rule: EvalRule, context: EvalContext): EvalRuleResult {
+  try {
+    return rule.evaluate(context);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      ruleName: rule.name,
+      passed: false,
+      score: 0,
+      message: `This rule failed while evaluating the output and gave no answer: ${reason.slice(0, 200)}`,
+      skipped: true,
+      skipReason: 'the rule threw on this input',
+    };
+  }
+}
+
+/** What the evaluation itself spent on a judge, stored on the row beside the verdict it bought; nothing when no judge was called. */
+function spendOf(j: EvalContext['relevanceJudgment']): Pick<EvalResult, 'eval_cost_usd' | 'eval_tokens'> {
+  if (!j) return {};
+  const tokens = j.inputTokens + j.outputTokens;
+  return {
+    ...(j.costUsd !== null && j.costUsd > 0 ? { eval_cost_usd: j.costUsd } : {}),
+    ...(tokens > 0 ? { eval_tokens: tokens } : {}),
+  };
+}

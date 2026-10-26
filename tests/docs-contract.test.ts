@@ -1,0 +1,583 @@
+/*
+ * The docs contract — prose names only things that exist.
+ *
+ * An audit on 2026-09-05 found three surfaces that named things the product
+ * does not have: delete_trace's description told an agent to use a
+ * `--retention-days` flag (no such flag; retention is `retention.days` in
+ * config.json), get_traces pointed at "the dashboard's SSE endpoint" (no such
+ * endpoint), and server.json omitted three IRIS_* variables the server reads.
+ * tests/manifest-env-parity.test.ts checks that the manifests name only
+ * variables the code reads, but not the reverse, and nothing checked flags,
+ * routes or resource URIs at all.
+ *
+ * This test extracts each vocabulary FROM THE CODE and asserts every mention
+ * on a prose surface is in it:
+ *
+ *   --flags        ⊆ the CLI's parseArgs options (src/index.ts) ∪ an explicit
+ *                    list of other tools' flags the docs quote in commands
+ *   /api/v1/...    ⊆ the routes the dashboard router registers
+ *   iris://...     ⊆ the resources the MCP server registers
+ *   IRIS_*         ⊆ the variables src/ reads — and every variable src/ reads
+ *                    is listed in server.json, bar the internal test hook
+ *   rule names     no prose names a retired rule; every shipped rule is in
+ *                    both skill files
+ *
+ * Every extractor asserts a floor — a thing it must find — so a regex that
+ * stops matching fails loudly instead of passing vacuously (the scanner's
+ * "MATCHED NOTHING" rule, in test form). Dated artifacts (docs/blog,
+ * docs/launch) keep their period voice and are not surfaces here.
+ */
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { defaultConfig } from '../src/config/defaults.js';
+import { rulesByType } from '../src/eval/rules/index.js';
+import { ERROR_CODE_CATALOGUE, WARNING_CODE_CATALOGUE } from '../src/tools/errors.js';
+
+const root = resolve(__dirname, '..');
+const read = (rel: string): string => readFileSync(join(root, rel), 'utf8');
+
+function walk(dir: string, out: string[] = []): string[] {
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    if (statSync(full).isDirectory()) walk(full, out);
+    else if (/\.(ts|tsx|mjs|js)$/.test(name)) out.push(full);
+  }
+  return out;
+}
+
+/** The prose an agent or a developer reads: not the blog, not the frozen launch drafts. */
+const PROSE_SURFACES: string[] = [
+  'README.md',
+  ...readdirSync(join(root, 'docs'))
+    .filter((f) => f.endsWith('.md'))
+    .map((f) => `docs/${f}`),
+  'skills/iris-eval/SKILL.md',
+  'claude-plugin/skills/iris-eval/SKILL.md',
+  'claude-plugin-capture/README.md',
+  'server.json',
+  ...readdirSync(join(root, 'src', 'tools'))
+    .filter((f) => f.endsWith('.ts') && f !== 'index.ts')
+    .map((f) => `src/tools/${f}`),
+  // The agent-native surfaces (0.9.0): the server instructions, the prompt,
+  // the judge enablement steps and the capabilities object are prose an
+  // agent reads at connection, so they are held to the same contract.
+  'src/instructions.ts',
+  'src/prompts.ts',
+  'src/judge-enablement.ts',
+  'src/capabilities.ts',
+  // The Python client's README: a recipe a reader copies, held to the same routes and variables.
+  'packages/python/README.md',
+  // The gate action: a workflow file a reader copies, held to the same flags and variables.
+  '.github/actions/gate/action.yml',
+  // The Python client's README: a recipe a reader copies, held to the same routes and variables.
+  'packages/python/README.md',
+];
+
+const prose = PROSE_SURFACES.map((rel) => ({ rel, text: read(rel) }));
+
+const claims = JSON.parse(read('.claims.json')) as {
+  mcpTools: { names: string[] };
+  evalRules: { customRuleTypes: string[] };
+  brand: { dataResidency: string; discoverySentence: string };
+};
+
+/* ── --flags ─────────────────────────────────────────────────────── */
+
+/** The CLI's own flags, read off the parseArgs options block in src/index.ts. */
+function cliFlags(): Set<string> {
+  const src = read('src/index.ts');
+  const block = src.match(/parseArgs\(\{\s*options:\s*\{([\s\S]*?)\n\s*\},\s*strict:/);
+  if (!block) throw new Error('docs-contract: the parseArgs options block in src/index.ts was not found');
+  const flags = new Set<string>();
+  for (const m of block[1].matchAll(/^\s*'?([a-z][a-z0-9-]*)'?:\s*\{/gm)) flags.add(m[1]);
+  // `install` parses its own flags (src/cli/install/command.ts), handed off before the block above.
+  const install = read('src/cli/install/command.ts').match(/parseArgs\(\{\s*args: argv,\s*options:\s*\{([\s\S]*?)\n\s*\},\s*allowPositionals/);
+  if (!install) throw new Error('docs-contract: the parseArgs options block in src/cli/install/command.ts was not found');
+  for (const m of install[1].matchAll(/^\s*'?([a-z][a-z0-9-]*)'?:\s*\{/gm)) flags.add(m[1]);
+  // `export` too (src/cli/export.ts): its own options, and its filter flags, listed once in FILTERS.
+  const exportSrc = read('src/cli/export.ts');
+  const exportOptions = exportSrc.match(/parseArgs\(\{\s*args: argv,\s*options:\s*\{([\s\S]*?)\n\s*\},\s*strict:/);
+  const exportFilters = exportSrc.match(/const FILTERS = \{([\s\S]*?)\n\} as const;/);
+  if (!exportOptions || !exportFilters) throw new Error('docs-contract: the export options or FILTERS block in src/cli/export.ts was not found');
+  for (const m of exportOptions[1].matchAll(/^\s*'?([a-z][a-z0-9-]*)'?:\s*\{/gm)) flags.add(m[1]);
+  for (const m of exportFilters[1].matchAll(/'([a-z][a-z0-9-]*)'/g)) flags.add(m[1]);
+  return flags;
+}
+
+/**
+ * Flags that belong to OTHER tools and appear in commands the docs quote
+ * (npm, cosign, the proof runner). Explicit so a new foreign flag is a
+ * conscious addition, and each must still appear somewhere so the list
+ * cannot rot into an exemption nobody uses.
+ */
+const FOREIGN_FLAGS = new Set([
+  'check', // npm run proof -- --check, claims --check
+  'composite', // npm run proof -- --composite (the verdict on the composite corpus)
+  'transcripts', // npm run proof -- --transcripts (the held-out line on 24 staged real agent runs)
+  'invariants', // npm run proof -- --invariants (what a verdict does when evidence is left out, and when a failure is added)
+  'outside', // npm run proof -- --outside (Iris on AgentDojo's published runs, scored against AgentDojo's labels)
+  'yes', // cosign sign --yes
+  'ignore-scripts', // npm ci --ignore-scripts
+  'provenance', // npm publish --provenance
+  'certificate-oidc-issuer', // cosign verify-blob
+  'certificate-identity', // cosign verify / verify-blob, the exact signing workflow
+  'iris-url', // pytest --iris-url (the Python client's plugin, packages/python)
+  'iris-api-key', // pytest --iris-api-key (the same plugin)
+]);
+
+describe('docs contract — every --flag in prose is a flag the CLI parses', () => {
+  const known = cliFlags();
+
+  it('the extractor found the CLI flags (guards the regex itself)', () => {
+    for (const f of ['dashboard', 'self-test', 'purge', 'transport', 'api-key']) expect(known.has(f), f).toBe(true);
+  });
+
+  it('no prose surface names a flag that does not exist', () => {
+    const unknown: string[] = [];
+    const seenForeign = new Set<string>();
+    for (const { rel, text } of prose) {
+      for (const m of text.matchAll(/(?<![\w-])--([a-z][a-z0-9-]*)/g)) {
+        const flag = m[1];
+        if (known.has(flag)) continue;
+        if (FOREIGN_FLAGS.has(flag)) {
+          seenForeign.add(flag);
+          continue;
+        }
+        unknown.push(`${rel}: --${flag}`);
+      }
+    }
+    expect(unknown).toEqual([]);
+    // The foreign list must earn its place: a flag nobody quotes any more is
+    // an exemption to delete, not to keep.
+    expect([...FOREIGN_FLAGS].filter((f) => !seenForeign.has(f))).toEqual([]);
+  });
+});
+
+/* ── /api/v1 routes ──────────────────────────────────────────────── */
+
+const normaliseRoute = (path: string): string =>
+  path
+    .replace(/[.,;:)`'"]+$/, '')
+    .replace(/:[A-Za-z_]+|\{[A-Za-z_]+\}|<[A-Za-z_]+>/g, ':param')
+    .replace(/\/+$/, '');
+
+/** Every route the dashboard router registers, mounted at /api/v1 (src/dashboard/server.ts). */
+function registeredRoutes(): Set<string> {
+  const routes = new Set<string>();
+  for (const file of walk(join(root, 'src', 'dashboard', 'routes'))) {
+    const text = readFileSync(file, 'utf8');
+    for (const m of text.matchAll(/router\.(?:get|post|patch|put|delete)\(\s*'([^']+)'/g)) {
+      routes.add(normaliseRoute(`/api/v1${m[1]}`));
+    }
+  }
+  return routes;
+}
+
+describe('docs contract — every /api/v1 path in prose is a registered route', () => {
+  const routes = registeredRoutes();
+
+  it('the extractor found the routes (guards the regex itself)', () => {
+    for (const r of ['/api/v1/health', '/api/v1/traces', '/api/v1/traces/:param', '/api/v1/rules/custom']) {
+      expect(routes.has(r), r).toBe(true);
+    }
+  });
+
+  it('no prose surface names a route that does not exist', () => {
+    const unknown: string[] = [];
+    for (const { rel, text } of prose) {
+      for (const m of text.matchAll(/\/api\/v1\/[A-Za-z0-9_\-/:{}<>.]+/g)) {
+        const route = normaliseRoute(m[0]);
+        if (!routes.has(route)) unknown.push(`${rel}: ${m[0]}`);
+      }
+    }
+    expect(unknown).toEqual([]);
+  });
+});
+
+/* ── iris:// resources ───────────────────────────────────────────── */
+
+/** Every resource URI src/resources registers. */
+function registeredResources(): Set<string> {
+  const uris = new Set<string>();
+  for (const file of walk(join(root, 'src', 'resources'))) {
+    for (const m of readFileSync(file, 'utf8').matchAll(/'(iris:\/\/[^']+)'/g)) uris.add(m[1]);
+  }
+  return uris;
+}
+
+describe('docs contract — every iris:// URI in prose is a registered resource', () => {
+  const uris = registeredResources();
+
+  it('the extractor found the resources (guards the regex itself)', () => {
+    expect(uris.has('iris://dashboard/summary')).toBe(true);
+    expect(uris.size).toBeGreaterThanOrEqual(2);
+  });
+
+  it('no prose surface names a resource that does not exist', () => {
+    const unknown: string[] = [];
+    for (const { rel, text } of prose) {
+      for (const m of text.matchAll(/iris:\/\/[A-Za-z0-9_/{}:.-]+/g)) {
+        const uri = m[0].replace(/[.,;:)]+$/, '');
+        if (!uris.has(uri)) unknown.push(`${rel}: ${uri}`);
+      }
+    }
+    expect(unknown).toEqual([]);
+  });
+});
+
+/* ── IRIS_* environment variables, both directions ───────────────── */
+
+function envVarsReadBySrc(): Set<string> {
+  const names = new Set<string>();
+  for (const file of walk(join(root, 'src'))) {
+    for (const m of readFileSync(file, 'utf8').matchAll(/process\.env\.(IRIS_[A-Z0-9_]+)/g)) names.add(m[1]);
+  }
+  return names;
+}
+
+/**
+ * Variables the capture plugin's hooks read (claude-plugin-capture/hooks/*.mjs).
+ * They are the plugin's settings, not the server's: its README may name them,
+ * and server.json — the server's manifest — must not list them.
+ */
+function envVarsReadByCapturePlugin(): Set<string> {
+  const names = new Set<string>();
+  const dir = join(root, 'claude-plugin-capture', 'hooks');
+  for (const f of readdirSync(dir).filter((f) => f.endsWith('.mjs'))) {
+    for (const m of readFileSync(join(dir, f), 'utf8').matchAll(/process\.env\.(IRIS_[A-Z0-9_]+)/g)) names.add(m[1]);
+  }
+  return names;
+}
+
+/** The variables the Python client reads (packages/python): its own, beside the server's. */
+function envVarsReadByPythonClient(): Set<string> {
+  const names = new Set<string>();
+  const dir = join(root, 'packages', 'python', 'src', 'iris_eval');
+  for (const f of readdirSync(dir).filter((f) => f.endsWith('.py'))) {
+    for (const m of readFileSync(join(dir, f), 'utf8').matchAll(/os\.environ(?:\.get\(|\[)"(IRIS_[A-Z0-9_]+)"/g)) names.add(m[1]);
+  }
+  return names;
+}
+
+function envVarsInServerJson(): Set<string> {
+  const j = JSON.parse(read('server.json')) as { packages: Array<{ environmentVariables?: Array<{ name: string }> }> };
+  return new Set(j.packages.flatMap((p) => (p.environmentVariables ?? []).map((e) => e.name)));
+}
+
+/** Read by the code, deliberately not in the registry manifest: a test hook, not a user setting. */
+const INTERNAL_ENV_VARS = new Set(['IRIS_NO_AUTO_LAUNCH']);
+
+describe('docs contract — IRIS_* variables', () => {
+  const read_ = envVarsReadBySrc();
+  const pluginRead = envVarsReadByCapturePlugin();
+  const pythonRead = envVarsReadByPythonClient();
+  const listed = envVarsInServerJson();
+
+  it('the extractor found the variables (guards the regex itself)', () => {
+    for (const v of ['IRIS_API_KEY', 'IRIS_HOME', 'IRIS_OTEL_ENDPOINT']) expect(read_.has(v), v).toBe(true);
+  });
+
+  it('no prose surface names a variable the server does not read', () => {
+    const unknown: string[] = [];
+    for (const { rel, text } of prose) {
+      for (const m of text.matchAll(/\bIRIS_[A-Z0-9_]+\b/g)) {
+        // The error catalogue shares the prefix; a code is not a variable.
+        if ((ERROR_CODE_CATALOGUE as readonly string[]).includes(m[0])) continue;
+        if ((WARNING_CODE_CATALOGUE as readonly string[]).includes(m[0])) continue;
+        if (!read_.has(m[0]) && !pluginRead.has(m[0]) && !pythonRead.has(m[0])) unknown.push(`${rel}: ${m[0]}`);
+      }
+    }
+    expect([...new Set(unknown)]).toEqual([]);
+  });
+
+  it('the capture plugin reads its own variables and shares one with the server (IRIS_HOME, where both keep their files); its own are not server settings', () => {
+    expect(pluginRead.has('IRIS_CAPTURE_WAIT')).toBe(true);
+    expect([...pluginRead].filter((v) => read_.has(v)).sort()).toEqual(['IRIS_HOME']);
+    const own = [...pluginRead].filter((v) => !read_.has(v));
+    expect(own.filter((v) => listed.has(v))).toEqual([]);
+  });
+
+  it('the Python client reads its own variables (IRIS_URL, IRIS_REQUIRE) and shares two with the server (IRIS_HOME, IRIS_API_KEY); its own are not server settings', () => {
+    expect([...pythonRead].sort()).toEqual(['IRIS_API_KEY', 'IRIS_HOME', 'IRIS_REQUIRE', 'IRIS_URL']);
+    const own = [...pythonRead].filter((v) => !read_.has(v)).sort();
+    expect(own).toEqual(['IRIS_REQUIRE', 'IRIS_URL']);
+    expect(own.filter((v) => listed.has(v))).toEqual([]);
+  });
+
+  it('every variable the server reads is listed in server.json (the reverse of manifest-env-parity)', () => {
+    const missing = [...read_].filter((v) => !listed.has(v) && !INTERNAL_ENV_VARS.has(v)).sort();
+    expect(missing).toEqual([]);
+  });
+
+  it('the README environment-variable table has a row for every variable the server reads, and no other', () => {
+    const readme = read('README.md').replace(/\r\n/g, '\n');
+    const start = readme.indexOf('\n### Environment Variables\n');
+    expect(start, 'the README section').toBeGreaterThan(-1);
+    const section = readme.slice(start + 1, readme.indexOf('\n#', start + 2));
+    const rows = new Set([...section.matchAll(/^\| `(IRIS_[A-Z0-9_]+)` \|/gm)].map((m) => m[1]));
+    expect(rows.size, 'rows found (guards the parse)').toBeGreaterThan(10);
+    expect([...read_].filter((v) => !rows.has(v) && !INTERNAL_ENV_VARS.has(v)).sort()).toEqual([]);
+    expect([...rows].filter((v) => !read_.has(v)).sort()).toEqual([]);
+  });
+});
+
+/* ── rule names ──────────────────────────────────────────────────── */
+
+/**
+ * Names a rule no longer has. A rename (0.10.0 renamed verbosity_ratio)
+ * adds the old name here, and any prose still quoting it fails.
+ */
+const RETIRED_RULE_NAMES = new Set<string>([
+  // Renamed in 0.10.0: the rule measures output verbosity relative to prompt
+  // size, and "efficiency" named something it does not measure. Dated blog
+  // posts keep the old name — they described the product on their day — and
+  // this list is what stops NEW prose reintroducing it.
+  'token_efficiency',
+]);
+
+describe('docs contract — rule names', () => {
+  // The runtime registry, not the truthbase: .claims.json evalRules.names are the
+  // camelCase export identifiers; the prose quotes the rule's own snake_case name.
+  const ruleNames = new Set(Object.values(rulesByType).flat().map((r) => r.name));
+  const customTypes = new Set(claims.evalRules.customRuleTypes);
+
+  it('the registry and the truthbase carry the roster (guards the read itself)', () => {
+    expect(ruleNames.has('no_pii')).toBe(true);
+    expect(customTypes.has('regex_match')).toBe(true);
+  });
+
+  it('both skill files name every shipped rule and every custom-rule type', () => {
+    for (const rel of ['skills/iris-eval/SKILL.md', 'claude-plugin/skills/iris-eval/SKILL.md']) {
+      const text = read(rel);
+      for (const name of ruleNames) expect(text, `${rel} lacks ${name}`).toContain(name);
+      for (const type of customTypes) expect(text, `${rel} lacks ${type}`).toContain(`\`${type}\``);
+    }
+  });
+
+  it('no prose surface names a retired rule', () => {
+    const stale: string[] = [];
+    for (const { rel, text } of prose) {
+      for (const m of text.matchAll(/`([a-z]+(?:_[a-z]+)+)`/g)) {
+        if (RETIRED_RULE_NAMES.has(m[1])) stale.push(`${rel}: ${m[1]}`);
+      }
+    }
+    expect(stale).toEqual([]);
+  });
+
+  it('every tool name the prose quotes in backticks is a registered tool or a known identifier', () => {
+    // A backticked snake_case token that begins with one of the registered
+    // tools' own verbs is a tool-shaped name and must be a registered tool.
+    // The verb set is DERIVED from the registered names: a hand-typed list
+    // here said "only the nine verbs" from 0.4 through 0.12 and could not
+    // see compare_runs or compare_traces at all — a guard is evidence only
+    // for the exact proposition it tests.
+    const tools = new Set(claims.mcpTools.names);
+    const verbs = [...new Set(claims.mcpTools.names.map((n) => n.split('_')[0]))];
+    expect(verbs.length, 'the verb set read from the registered names').toBeGreaterThanOrEqual(7);
+    const toolShaped = new RegExp(`^(?:${verbs.join('|')})_[a-z_]+$`);
+    const unknown: string[] = [];
+    for (const { rel, text } of prose) {
+      for (const m of text.matchAll(/`([a-z]+(?:_[a-z]+)+)`/g)) {
+        if (toolShaped.test(m[1]) && !tools.has(m[1])) unknown.push(`${rel}: ${m[1]}`);
+      }
+    }
+    expect([...new Set(unknown)]).toEqual([]);
+  });
+});
+
+/**
+ * Paths the repository no longer has. A file deleted in a release (0.10.0
+ * deleted proof/lib/risk.ts when the harness started importing the module
+ * that ships) goes here, and any prose still pointing a reader at it fails.
+ */
+const RETIRED_PATHS = new Set<string>(['proof/lib/risk.ts']);
+
+/**
+ * Sentences that were true while the risk composer ran in the harness only,
+ * and false from the moment it shipped. This is not a wording preference: a
+ * reader who believes "nothing about which outputs pass has changed" will
+ * upgrade without reading the changelog. The assertion is keyed on the
+ * shipped default, so it cannot go stale in either direction — if a future
+ * release makes 'legacy' the default again, these sentences become sayable
+ * again and this test stops demanding their absence.
+ */
+const PROSPECTIVE_COMPOSER_PHRASES = [
+  'a future release may adopt',
+  'runs in the harness only',
+  'run in the harness only',
+  'nothing about which outputs pass has changed',
+];
+
+/*
+ * The rule the risk composer REPLACED, in the words the README and the API
+ * reference used for it until 2026-09-07 — two minors after it stopped
+ * being true. The docs-reference coverage guard checks that every tool and
+ * route has a heading, which is coverage; this is truth. Keyed on the same
+ * runtime fact as the block above.
+ */
+const LEGACY_VERDICT_PHRASES = [
+  'evaluation passes when the score',
+  'clears the pass threshold',
+  'score meets or exceeds the configured threshold',
+  'true only when the score',
+  'they do not veto `passed`',
+  // The skill template's form, missed by the first list: "`score >= threshold` (default 0.7) AND no critical rule failed".
+  'score >= threshold',
+  'score ≥ threshold',
+  'score >= the threshold',
+];
+
+/*
+ * The public /proof page is prose a reader trusts exactly as much as the
+ * docs, and it is NOT in PROSE_SURFACES (which stops at the repo's own
+ * markdown and the agent-facing strings). These two blocks read it directly.
+ */
+const COMPOSER_PROSE = [
+  ...prose,
+  ...['website/src/app/proof/measurements.tsx', 'website/src/app/proof/page.tsx']
+    .filter((rel) => existsSync(join(root, rel)))
+    .map((rel) => ({ rel, text: read(rel) })),
+];
+
+describe('docs contract — the composer is described as shipped', () => {
+  it('the assertion is keyed on a runtime fact (guards the read itself)', () => {
+    expect(defaultConfig.eval.composer).toBe('risk');
+  });
+
+  it('no prose surface calls the shipped composer prospective', () => {
+    if (defaultConfig.eval.composer !== 'risk') return;
+    const stale: string[] = [];
+    for (const { rel, text } of COMPOSER_PROSE) {
+      const folded = text.toLowerCase();
+      for (const phrase of PROSPECTIVE_COMPOSER_PHRASES) {
+        if (folded.includes(phrase)) stale.push(`${rel}: "${phrase}"`);
+      }
+    }
+    expect(stale).toEqual([]);
+  });
+
+  it('no prose surface describes passed as the score against a threshold', () => {
+    if (defaultConfig.eval.composer !== 'risk') return;
+    const stale: string[] = [];
+    for (const { rel, text } of COMPOSER_PROSE) {
+      const folded = text.toLowerCase();
+      for (const phrase of LEGACY_VERDICT_PHRASES) {
+        if (folded.includes(phrase.toLowerCase())) stale.push(`${rel}: "${phrase}"`);
+      }
+    }
+    expect(stale).toEqual([]);
+  });
+
+  it('no surface lists run comparison as planned while compare_runs is registered', () => {
+    // The site roadmap and docs/roadmap.md both said "still planned: datasets
+    // and run comparison" the day after 0.12.0 shipped compare_runs. The
+    // assertion is keyed on the registration, so it cannot go stale in
+    // either direction.
+    expect(claims.mcpTools.names).toContain('compare_runs');
+    const surfaces = [...COMPOSER_PROSE, { rel: 'website/src/components/roadmap.tsx', text: read('website/src/components/roadmap.tsx') }];
+    const stale: string[] = [];
+    for (const { rel, text } of surfaces) {
+      for (const m of text.matchAll(/(?:still planned|not shipped|planned)[^.\n]{0,200}?\b(?:run comparison|compare_runs)\b/gi)) {
+        stale.push(`${rel}: ${m[0].slice(0, 80)}`);
+      }
+    }
+    expect(stale).toEqual([]);
+  });
+
+  it('the rule-by-category tables match the bundles the engine ships', () => {
+    // The truthbase roster carries no category; the skill template and the
+    // architecture guide type the bundle membership by hand, on three
+    // tables. This reads every row and asserts it against rulesByType, the
+    // one place membership is decided.
+    const byBundle = new Map(Object.entries(rulesByType).map(([k, rules]) => [k, new Set(rules.map((r) => r.name))]));
+    const wrong: string[] = [];
+    const skill = read('skills/iris-eval/SKILL.template.md');
+    const skillRows = [...skill.matchAll(/^\| (Completeness|Relevance|Safety|Cost) \| ([a-z_]+) \|/gm)];
+    expect(skillRows.length, 'skill template category rows').toBeGreaterThanOrEqual(15);
+    for (const [, cat, rule] of skillRows) {
+      if (!byBundle.get(cat.toLowerCase())?.has(rule)) wrong.push(`SKILL.template.md: ${rule} is not in the ${cat.toLowerCase()} bundle`);
+    }
+    const arch = read('docs/architecture.md');
+    /*
+     * The architecture guide's data-flow step said `passed` "requires the
+     * score to meet the configured threshold AND no critical rule to have
+     * failed" — the pre-0.10.0 rule — four minors after the composer
+     * replaced it, while the same file's verdict section described the
+     * composer correctly (found by the 0.14.0 distribution audit). The
+     * retired sentence must not come back, and the step must say what
+     * decides `passed` now.
+     */
+    expect(arch).not.toMatch(/requires the score to meet the configured threshold/);
+    expect(arch).toMatch(/`passed` is the verdict/);
+    const archRows = [...arch.matchAll(/^\| `(completeness|relevance|safety|cost)`\s*\| ((?:`[a-z_]+`(?:, )?)+)/gm)];
+    expect(archRows.length, 'architecture guide bundle rows').toBe(4);
+    for (const [, cat, list] of archRows) {
+      for (const [, rule] of list.matchAll(/`([a-z_]+)`/g)) {
+        if (!byBundle.get(cat)?.has(rule)) wrong.push(`architecture.md: ${rule} is not in the ${cat} bundle`);
+      }
+    }
+    expect(wrong).toEqual([]);
+  });
+
+  it('the residency and discovery sentences come from the truthbase, and their retired forms are gone', () => {
+    // Said ten and five different ways on 2026-09-07; now one fact each in
+    // .claims.json (brand.dataResidency, brand.discoverySentence). The README
+    // is not a rendered target, so its restatement is asserted equal here.
+    const readme = read('README.md').replace(/`/g, '');
+    expect(readme).toContain(claims.brand.dataResidency);
+    const retired = /stays on your machine|never leaves? your machine|discovers it automatically|discovers automatically/i;
+    const surfaces = [
+      ...prose,
+      ...walk(join(root, 'website', 'src')).map((full) => ({ rel: full.slice(root.length + 1).split('\\').join('/'), text: readFileSync(full, 'utf8') })),
+    ];
+    const stale: string[] = [];
+    for (const { rel, text } of surfaces) {
+      const m = text.match(retired);
+      if (m) stale.push(`${rel}: "${m[0]}"`);
+    }
+    expect(stale).toEqual([]);
+  });
+
+  it('no prose surface points a reader at a path the repository no longer has', () => {
+    const stale: string[] = [];
+    for (const { rel, text } of COMPOSER_PROSE) {
+      for (const path of RETIRED_PATHS) {
+        if (text.includes(path)) stale.push(`${rel}: ${path}`);
+      }
+    }
+    expect(stale).toEqual([]);
+  });
+
+  it('every retired path really is gone (the list cannot rot into a no-op)', () => {
+    for (const path of RETIRED_PATHS) {
+      expect(existsSync(join(root, path)), `${path} still exists; take it off RETIRED_PATHS`).toBe(false);
+    }
+  });
+});
+
+/*
+ * The README ships in the npm package alone — `files` is dist, LICENSE,
+ * README.md and server.json — so a relative link to docs/, examples/ or a
+ * sibling package is dead for everyone who reads it from node_modules
+ * (#369 item 1). Every link is absolute, or names a file the package
+ * carries. `cursor://` and `#anchors` are not files.
+ */
+describe('docs contract — every README link survives the npm package', () => {
+  const pkg = JSON.parse(read('package.json')) as { files: string[] };
+  const shipped = new Set(pkg.files);
+  it('the pack list is what this contract assumes', () => {
+    for (const f of ['dist', 'LICENSE', 'README.md', 'server.json']) expect(shipped.has(f), f).toBe(true);
+  });
+  it('no README link is relative to a file the package does not carry', () => {
+    const readme = read('README.md');
+    const offenders: string[] = [];
+    for (const m of readme.matchAll(/\]\(([^)\s]+)\)/g)) {
+      const target = m[1];
+      if (/^(https?:|mailto:|cursor:|vscode:|#)/.test(target)) continue;
+      const top = target.split(/[/#?]/)[0];
+      if (!shipped.has(top)) offenders.push(target);
+    }
+    expect(offenders, `relative README links to files the package does not ship: ${offenders.join(', ')}`).toEqual([]);
+  });
+});

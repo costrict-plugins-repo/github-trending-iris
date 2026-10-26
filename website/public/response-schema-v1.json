@@ -1,0 +1,1347 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://iris-eval.com/response-schema-v1.json",
+  "title": "Iris evaluation response (schema version 1)",
+  "description": "The object the evaluate_output MCP tool returns, and the `evaluation` block POST /api/v1/traces returns when asked to evaluate. Rendered from the schema the server validates against; see https://iris-eval.com/capabilities for what each field means.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "the evaluation id, readable at iris://evaluations/{id}"
+    },
+    "trace_id": {
+      "description": "the trace this is the verdict of",
+      "type": "string"
+    },
+    "reference_trace_id": {
+      "description": "the trace it was made beside when it is NOT that trace verdict; never with trace_id",
+      "type": "string"
+    },
+    "verdict": {
+      "description": "state, passed, basis (which layer decided), by (the rules), risk",
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "unknown"
+          ]
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "basis": {
+          "type": "string",
+          "enum": [
+            "policy_gate",
+            "detector_veto",
+            "critical_unknown",
+            "required_evidence_missing",
+            "risk_over_loss",
+            "clean",
+            "no_rules"
+          ]
+        },
+        "by": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "risk": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "pBad": {
+                  "type": "number"
+                },
+                "lo": {
+                  "type": "number"
+                },
+                "hi": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "pBad",
+                "lo",
+                "hi"
+              ],
+              "additionalProperties": {}
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "confidence": {
+          "description": "present when the risk estimate decided the verdict. decisive: the credible interval on pBad excludes the loss threshold AND the composite corpus measured the estimate holding at that risk level, relative to this deployment's threshold; marginal otherwise, with an interpretation naming which test it did not pass. Absent on a stored row labelled under a different calibration table than this release reads.",
+          "type": "string",
+          "enum": [
+            "decisive",
+            "marginal"
+          ]
+        },
+        "also": {
+          "description": "every other layer that would have decided this verdict on its own, in the order the layers are asked. basis names one layer (the first that fails, else the first that could not check); anything that acts on one basis reads basis AND also. Absent when the deciding layer was the only one, and on every pass.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "basis": {
+                "type": "string",
+                "enum": [
+                  "detector_veto",
+                  "critical_unknown",
+                  "required_evidence_missing",
+                  "risk_over_loss"
+                ]
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "fail",
+                  "unknown"
+                ]
+              },
+              "by": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "basis",
+              "state",
+              "by"
+            ],
+            "additionalProperties": {}
+          }
+        }
+      },
+      "required": [
+        "state",
+        "passed",
+        "basis",
+        "by",
+        "risk"
+      ],
+      "additionalProperties": {}
+    },
+    "coverage": {
+      "description": "per question: judged, unjudged and why, or not_applicable; plus the inputs carried",
+      "type": "object",
+      "properties": {
+        "inputs": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "boolean"
+          }
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "enum": [
+                  "safe_output",
+                  "grounded",
+                  "complete",
+                  "relevant",
+                  "task_completed",
+                  "tool_use_correct",
+                  "within_budget"
+                ]
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "judged",
+                  "unjudged",
+                  "not_applicable"
+                ]
+              },
+              "why": {
+                "type": "string"
+              },
+              "evaluated": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "of": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "id",
+              "status"
+            ],
+            "additionalProperties": {}
+          }
+        },
+        "dormant": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "ruleId": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "ruleId",
+              "name",
+              "reason"
+            ],
+            "additionalProperties": {}
+          }
+        }
+      },
+      "required": [
+        "inputs",
+        "questions"
+      ],
+      "additionalProperties": {}
+    },
+    "provenance": {
+      "description": "Iris version, ruleset and config hashes, thresholds, composer facts, corpus version, time",
+      "type": "object",
+      "properties": {
+        "irisVersion": {
+          "type": "string"
+        },
+        "rulesetHash": {
+          "type": "string"
+        },
+        "configHash": {
+          "type": "string"
+        },
+        "thresholds": {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "number"
+            },
+            "perRule": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "default"
+          ],
+          "additionalProperties": {}
+        },
+        "composer": {
+          "type": "object",
+          "properties": {
+            "defaultsGate": {
+              "type": "boolean"
+            },
+            "falsePassCost": {
+              "type": "number"
+            },
+            "onCriticalSkipped": {
+              "type": "string",
+              "enum": [
+                "unknown",
+                "fail",
+                "pass"
+              ]
+            },
+            "prior": {
+              "type": "number"
+            },
+            "priorSource": {
+              "type": "string",
+              "enum": [
+                "default",
+                "config",
+                "estimated"
+              ]
+            },
+            "priorMode": {
+              "description": "how the prior was spread over the failure classes",
+              "type": "string",
+              "enum": [
+                "per-output",
+                "per-class"
+              ]
+            },
+            "calibration": {
+              "description": "the version of the calibration table the confidence label was read from",
+              "type": "string"
+            },
+            "requiredEvidence": {
+              "description": "the inputs the deployment requires on every evaluation, when it requires any",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "rules": {
+              "description": "which composer rules produced the verdict: 2 from 0.20.0 (a failure outranks a layer that could not check); absent on earlier rows, which read back under rules 1",
+              "type": "number"
+            }
+          },
+          "required": [
+            "defaultsGate",
+            "falsePassCost",
+            "onCriticalSkipped"
+          ],
+          "additionalProperties": {}
+        },
+        "evidence": {
+          "description": "what the call carried and who recorded it; absent on evaluations stored before 0.20.0",
+          "type": "object",
+          "properties": {
+            "recordedBy": {
+              "type": "string",
+              "enum": [
+                "harness",
+                "agent",
+                "not_declared"
+              ],
+              "description": "who wrote what was judged: harness (software that watched the agent and declared itself as capture), agent (its own report, through log_trace or evaluate_output), not_declared"
+            },
+            "capture": {
+              "description": "the capture source and what it records in full; an empty list of tool calls from it says none were made, and a field it names that the trace left out makes the verdict not checked",
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "complete": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "input",
+                      "tool_calls",
+                      "tool_outputs"
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "additionalProperties": {}
+            },
+            "carried": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "the inputs the call carried; the deployment's required evidence is met from this"
+            },
+            "toolCalls": {
+              "description": "how many tool calls the record carried, when it carried them",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "recordedBy",
+            "carried"
+          ],
+          "additionalProperties": {}
+        },
+        "corpusVersion": {
+          "type": "string"
+        },
+        "judgedAt": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "irisVersion",
+        "rulesetHash",
+        "configHash",
+        "thresholds",
+        "corpusVersion",
+        "judgedAt"
+      ],
+      "additionalProperties": {}
+    },
+    "run_id": {
+      "description": "the run this belongs to",
+      "type": "string"
+    },
+    "interpretations": {
+      "description": "why a failed rule did not decide; unjudged questions; close calls",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "block",
+              "warn",
+              "note"
+            ]
+          },
+          "addressee": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "operator",
+              "author"
+            ]
+          },
+          "rule": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "configKey": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "addressee",
+          "text"
+        ],
+        "additionalProperties": {}
+      }
+    },
+    "erased_at": {
+      "description": "set once the linked trace was deleted",
+      "type": "string"
+    },
+    "eval_type": {
+      "type": "string",
+      "enum": [
+        "completeness",
+        "relevance",
+        "safety",
+        "cost",
+        "custom",
+        "all"
+      ],
+      "description": "the bundle that ran"
+    },
+    "score": {
+      "type": "number",
+      "description": "0..1 weighted quality over the rules that ran"
+    },
+    "passed": {
+      "type": "boolean",
+      "description": "the ship verdict; false when nothing was judged"
+    },
+    "rule_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ruleName": {
+            "type": "string"
+          },
+          "ruleId": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "completeness",
+              "relevance",
+              "safety",
+              "cost",
+              "custom"
+            ]
+          },
+          "critical": {
+            "type": "boolean"
+          },
+          "criticalSource": {
+            "type": "string",
+            "enum": [
+              "default",
+              "config"
+            ]
+          },
+          "state": {
+            "description": "read this, not passed: a rule that skipped is not_checked, and carries passed false",
+            "type": "string",
+            "enum": [
+              "pass",
+              "fail",
+              "not_checked"
+            ]
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "score": {
+            "type": "number"
+          },
+          "message": {
+            "type": "string"
+          },
+          "skipped": {
+            "type": "boolean"
+          },
+          "skipReason": {
+            "type": "string"
+          },
+          "configInvalid": {
+            "type": "boolean"
+          },
+          "budgetExceeded": {
+            "type": "boolean"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "measurement",
+              "detection",
+              "inference",
+              "judgment",
+              "policy",
+              "verification"
+            ]
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "gate",
+              "veto",
+              "risk",
+              "advisory"
+            ]
+          },
+          "question": {
+            "type": "string",
+            "enum": [
+              "safe_output",
+              "grounded",
+              "complete",
+              "relevant",
+              "task_completed",
+              "tool_use_correct",
+              "within_budget"
+            ]
+          },
+          "classes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "ruleVersion": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "saw": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "output",
+                "input",
+                "expected",
+                "expected_trajectory",
+                "tool_calls",
+                "tool_outputs",
+                "tools_catalogue",
+                "cost",
+                "tokens",
+                "citations"
+              ]
+            }
+          },
+          "read": {
+            "description": "when the output was a JSON object or array: which reading of it this rule judged, its values or its values with their field names. Evidence offsets still point into the output as sent",
+            "type": "string",
+            "enum": [
+              "values",
+              "labelled"
+            ]
+          },
+          "skipClass": {
+            "type": "string",
+            "enum": [
+              "not_applicable",
+              "defeated",
+              "config_invalid"
+            ]
+          },
+          "lacked": {
+            "description": "on a rule that skipped for missing evidence: the inputs it reads that the call did not carry",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "asked": {
+            "description": "on such a rule, when somebody had asked for it: the deployment (a threshold it set, a promotion, a deployed gating rule, an installed judge) or the call itself. The verdict is then unknown, not pass",
+            "type": "string",
+            "enum": [
+              "config",
+              "call"
+            ]
+          },
+          "uncertainty": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "basis": {
+                    "type": "string",
+                    "const": "published_accuracy"
+                  },
+                  "fired": {
+                    "type": "boolean"
+                  },
+                  "ppv": {
+                    "type": "object",
+                    "properties": {
+                      "point": {
+                        "type": "number"
+                      },
+                      "lo": {
+                        "type": "number"
+                      },
+                      "hi": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "point",
+                      "lo",
+                      "hi"
+                    ],
+                    "additionalProperties": {}
+                  },
+                  "missRate": {
+                    "type": "object",
+                    "properties": {
+                      "point": {
+                        "type": "number"
+                      },
+                      "lo": {
+                        "type": "number"
+                      },
+                      "hi": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "point",
+                      "lo",
+                      "hi"
+                    ],
+                    "additionalProperties": {}
+                  },
+                  "prior": {
+                    "type": "object",
+                    "properties": {
+                      "pi": {
+                        "type": "number"
+                      },
+                      "source": {
+                        "type": "string",
+                        "enum": [
+                          "default",
+                          "config",
+                          "estimated"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "pi",
+                      "source"
+                    ],
+                    "additionalProperties": {}
+                  },
+                  "corpus": {
+                    "type": "object",
+                    "properties": {
+                      "n": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "tp": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "fp": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "fn": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "tn": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "version": {
+                        "type": "string"
+                      },
+                      "release": {
+                        "type": "string"
+                      },
+                      "labelling": {
+                        "type": "string",
+                        "enum": [
+                          "same-model",
+                          "human-verified"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "n",
+                      "tp",
+                      "fp",
+                      "fn",
+                      "tn",
+                      "version",
+                      "release",
+                      "labelling"
+                    ],
+                    "additionalProperties": {}
+                  }
+                },
+                "required": [
+                  "basis",
+                  "fired",
+                  "prior",
+                  "corpus"
+                ],
+                "additionalProperties": {}
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "basis": {
+                    "type": "string",
+                    "const": "definition"
+                  },
+                  "conformance": {
+                    "type": "object",
+                    "properties": {
+                      "n": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "matched": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      }
+                    },
+                    "required": [
+                      "n",
+                      "matched"
+                    ],
+                    "additionalProperties": {}
+                  }
+                },
+                "required": [
+                  "basis",
+                  "conformance"
+                ],
+                "additionalProperties": {}
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "basis": {
+                    "type": "string",
+                    "const": "self_consistency"
+                  },
+                  "samples": {
+                    "type": "integer",
+                    "minimum": -9007199254740991,
+                    "maximum": 9007199254740991
+                  },
+                  "voteFraction": {
+                    "type": "number"
+                  },
+                  "scoreSd": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "basis",
+                  "samples",
+                  "voteFraction",
+                  "scoreSd"
+                ],
+                "additionalProperties": {}
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "basis": {
+                    "type": "string",
+                    "const": "local_labels"
+                  },
+                  "precision": {
+                    "type": "object",
+                    "properties": {
+                      "point": {
+                        "type": "number"
+                      },
+                      "lo": {
+                        "type": "number"
+                      },
+                      "hi": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "point",
+                      "lo",
+                      "hi"
+                    ],
+                    "additionalProperties": {}
+                  },
+                  "n": {
+                    "type": "integer",
+                    "minimum": -9007199254740991,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "basis",
+                  "precision",
+                  "n"
+                ],
+                "additionalProperties": {}
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "basis": {
+                    "type": "string",
+                    "const": "policy"
+                  }
+                },
+                "required": [
+                  "basis"
+                ],
+                "additionalProperties": {}
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "basis": {
+                    "type": "string",
+                    "const": "unmeasured"
+                  },
+                  "why": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "basis",
+                  "why"
+                ],
+                "additionalProperties": {}
+              }
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "span"
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "start": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "end": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "label": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "source",
+                    "start",
+                    "end",
+                    "label"
+                  ],
+                  "additionalProperties": {}
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "pattern"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "count": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "name",
+                    "count"
+                  ],
+                  "additionalProperties": {}
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "toolCall"
+                    },
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "toolName": {
+                      "type": "string"
+                    },
+                    "label": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "index",
+                    "toolName",
+                    "label"
+                  ],
+                  "additionalProperties": {}
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "citation"
+                    },
+                    "url": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "resolved",
+                        "dead",
+                        "unverifiable",
+                        "supported",
+                        "unsupported"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "url",
+                    "status"
+                  ],
+                  "additionalProperties": {}
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "count"
+                    },
+                    "stat": {
+                      "type": "string"
+                    },
+                    "unit": {
+                      "type": "string"
+                    },
+                    "value": {
+                      "type": "number"
+                    },
+                    "threshold": {
+                      "type": "number"
+                    },
+                    "thresholdSource": {
+                      "type": "string",
+                      "enum": [
+                        "default",
+                        "config",
+                        "call",
+                        "rule"
+                      ]
+                    },
+                    "costSource": {
+                      "type": "string",
+                      "enum": [
+                        "reported",
+                        "estimated"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "stat",
+                    "unit",
+                    "value"
+                  ],
+                  "additionalProperties": {}
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "sample"
+                    },
+                    "score": {
+                      "type": "number"
+                    },
+                    "selfReportedPass": {
+                      "type": "boolean"
+                    },
+                    "rationaleHash": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "score",
+                    "rationaleHash"
+                  ],
+                  "additionalProperties": {}
+                }
+              ]
+            }
+          },
+          "value": {
+            "type": "object",
+            "properties": {
+              "stat": {
+                "type": "string"
+              },
+              "unit": {
+                "type": "string"
+              },
+              "value": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "stat",
+              "unit",
+              "value"
+            ],
+            "additionalProperties": {}
+          },
+          "judge": {
+            "description": "answers_the_ask only, when IRIS_RELEVANCE_JUDGE_MODEL installed a relevance judge: what it scored against which pass line, why, and what it cost; redacted counts what was replaced before sending; withheld (daily_budget | request_cap) when a spend limit kept the call from being made; error when it did not answer and the rule fell back to its lexical reading",
+            "type": "object",
+            "properties": {
+              "template": {
+                "type": "string",
+                "const": "relevance"
+              },
+              "provider": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "anthropic",
+                      "openai"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "model": {
+                "type": "string"
+              },
+              "score": {
+                "type": "number"
+              },
+              "passThreshold": {
+                "type": "number"
+              },
+              "passed": {
+                "type": "boolean"
+              },
+              "selfReportedPass": {
+                "type": "boolean"
+              },
+              "disagreement": {
+                "type": "boolean"
+              },
+              "rationale": {
+                "type": "string"
+              },
+              "dimensions": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {
+                  "type": "number"
+                }
+              },
+              "costUsd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "inputTokens": {
+                "type": "number"
+              },
+              "outputTokens": {
+                "type": "number"
+              },
+              "latencyMs": {
+                "type": "number"
+              },
+              "agentModel": {
+                "type": "string"
+              },
+              "sameFamily": {
+                "type": "boolean"
+              },
+              "redacted": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {
+                  "type": "number"
+                }
+              },
+              "sentUnredacted": {
+                "type": "boolean"
+              },
+              "withheld": {
+                "type": "string",
+                "enum": [
+                  "daily_budget",
+                  "request_cap"
+                ]
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "template",
+              "provider",
+              "model",
+              "costUsd",
+              "inputTokens",
+              "outputTokens",
+              "latencyMs"
+            ],
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "ruleName",
+          "passed",
+          "score",
+          "message"
+        ],
+        "additionalProperties": {}
+      },
+      "description": "per rule: verdict, message, kind, role, question, saw, evidence, uncertainty"
+    },
+    "rules_evaluated": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "description": "rules that judged"
+    },
+    "rules_skipped": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "description": "rules that skipped"
+    },
+    "insufficient_data": {
+      "type": "boolean",
+      "description": "true when no rule could judge"
+    },
+    "critical_failures": {
+      "description": "critical rules that failed and vetoed passed",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "critical_skipped": {
+      "description": "critical rules that could not judge; treat as unknown",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "categories": {
+      "description": "per-bundle verdicts for eval_type all",
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "score": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "the verdict, read for the rules this bundle holds: fail when a layer of the verdict rests on one of them; unknown is not checked",
+            "type": "string",
+            "enum": [
+              "pass",
+              "fail",
+              "unknown"
+            ]
+          },
+          "passed": {
+            "description": "state is pass; null when the bundle evaluated no rule",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "rules_evaluated": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "rules_skipped": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "insufficient_data": {
+            "type": "boolean"
+          },
+          "critical_failures": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "critical_skipped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "score",
+          "passed",
+          "rules_evaluated",
+          "rules_skipped",
+          "insufficient_data"
+        ],
+        "additionalProperties": {}
+      }
+    },
+    "note": {
+      "description": "present when eval_type was omitted",
+      "type": "string"
+    },
+    "rules_changed": {
+      "description": "present when deployed custom rules changed since the server started: count, last change, iris://audit; never alters the verdict",
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "last_change_at": {
+          "type": "string"
+        },
+        "since": {
+          "type": "string"
+        },
+        "audit": {
+          "type": "string",
+          "const": "iris://audit"
+        }
+      },
+      "required": [
+        "count",
+        "last_change_at",
+        "since",
+        "audit"
+      ],
+      "additionalProperties": {}
+    }
+  },
+  "required": [
+    "id",
+    "eval_type",
+    "score",
+    "passed",
+    "rule_results",
+    "rules_evaluated",
+    "rules_skipped",
+    "insufficient_data"
+  ],
+  "additionalProperties": {}
+}

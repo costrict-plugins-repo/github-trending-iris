@@ -1,0 +1,450 @@
+import Link from "next/link";
+import { EVALUATORS, PUBLIC_REPO_URL, type ProofClaims, type ProofComposite, type ProofRule } from "@/lib/claims";
+
+/*
+ * The per-rule measurement blocks of the proof page. Each renders two-state from the same
+ * truthbase field: measured (the block is present in `.claims.json → proof`)
+ * or pending (it is not), and in both states names the file a release roll
+ * regenerates and the command that reproduces it. No number here is typed;
+ * every one is read from the block, and the file link beside it is the
+ * measurement the claims law requires.
+ */
+
+const code = "rounded bg-bg-surface px-1.5 py-0.5 font-mono text-[13px] text-text-primary";
+const link = "font-semibold text-text-accent hover:underline";
+const h2 = "mb-3 font-display text-xl font-bold text-text-primary";
+const th = "px-3 py-2 text-left text-[11px] font-bold uppercase tracking-[0.15em] text-text-muted";
+const td = "px-3 py-2 align-middle font-mono text-[13px] tabular-nums text-text-secondary";
+
+const pct = (x: number | null | undefined): string => (x === null || x === undefined ? "—" : `${(x * 100).toFixed(1)}%`);
+const ci = (i: [number, number] | null | undefined): string => (i ? `[${(i[0] * 100).toFixed(1)}, ${(i[1] * 100).toFixed(1)}]` : "");
+
+function FileLink({ path, label }: { path: string; label?: string }): React.ReactElement {
+  return (
+    <a href={`${PUBLIC_REPO_URL}/blob/main/${path}`} className={`${link} font-mono text-[13px]`} rel="noopener noreferrer" target="_blank">
+      {label ?? path}
+    </a>
+  );
+}
+
+function Pending({ what, command, file }: { what: string; command: string; file: string }): React.ReactElement {
+  return (
+    <p className="mt-3 rounded-xl border border-border-default bg-bg-card p-4 text-[14px] leading-relaxed text-text-secondary">
+      <strong className="text-text-primary">Pending.</strong> {what} is not in the truthbase for this release. It is produced by{" "}
+      <code className={code}>{command}</code> and committed as <FileLink path={file} />; when a release roll carries it, this block renders the numbers.
+    </p>
+  );
+}
+
+export function OutOfSample({ proof }: { proof: ProofClaims }): React.ReactElement {
+  const t = proof.transcripts;
+  return (
+    <section>
+      <h2 className={h2}>Held out: 24 real agent runs, staged</h2>
+      <p>
+        Every other number on this page is measured on a corpus written alongside the rule it measures. These are agent runs against this repository with an answer key written at capture time, and no labelled case behind any per-rule number above is copied from, varied from or modelled on one of them, so the verdict that scores them was not composed from rates estimated on them. Read what that does and does not buy before quoting a number from this table:
+      </p>
+      <ul className="mt-3 list-disc space-y-1 pl-6">
+        <li>
+          <strong className="text-text-primary">Staged, not sampled.</strong> Each run was scripted with an intended failure{t && t.totals.stagedToFail !== undefined ? <>: {t.totals.stagedToFail} of {t.totals.transcripts} are bad by design</> : null}. That base rate is chosen, not observed, so these are not the error rates of any real deployment.
+        </li>
+        <li>
+          <strong className="text-text-primary">Held out, not blind.</strong> Several rules were written or revised after an acceptance pass on these runs, so the rules have seen them even though the accuracy numbers have not.
+        </li>
+        <li>
+          <strong className="text-text-primary">Small and narrow.</strong> Twenty-four traces from one agent on one repository, reported without an interval. There is no sample of unstaged production traffic yet.
+        </li>
+      </ul>
+      {t ? (
+        <>
+          <div className="mt-4 overflow-x-auto rounded-xl border border-border-default bg-bg-card">
+            <table className="w-full min-w-[640px] border-collapse text-left text-[14px]">
+              <thead>
+                <tr className="border-b border-border-default">
+                  <th className="px-4 py-3 font-semibold">Question</th>
+                  <th className="px-4 py-3 font-semibold">Result</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr className="border-b border-border-subtle">
+                  <td className="px-4 py-3">Failure classes present that some rule caught</td>
+                  <td className="px-4 py-3 font-mono">{t.totals.classesCaught} of {t.totals.classesPresent}</td>
+                </tr>
+                <tr className="border-b border-border-subtle">
+                  <td className="px-4 py-3">Ship/no-ship verdicts agreeing with the key</td>
+                  <td className="px-4 py-3 font-mono">{t.totals.shipAgrees} of {t.totals.transcripts}</td>
+                </tr>
+                <tr className="border-b border-border-subtle">
+                  <td className="px-4 py-3">Transcripts whose four bundle verdicts all agree</td>
+                  <td className="px-4 py-3 font-mono">{t.totals.allBundlesAgree} of {t.totals.transcripts}</td>
+                </tr>
+                <tr>
+                  <td className="px-4 py-3">Bundle verdicts agreeing</td>
+                  <td className="px-4 py-3 font-mono">{t.totals.bundleVerdictsAgree} of {t.totals.bundleVerdicts}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-4 text-[14px] text-text-secondary">
+            The three are not the same question. Classes caught is the one to read: it needs no relabelling as rules are added. A bundle verdict is a weighted mean, so one failing non-critical rule in a bundle of six does not move it — the weakest of the three, and kept for continuity. {t.gaps.length} of the {t.totals.transcripts} transcripts have at least one bundle verdict that disagrees with the key; those gaps are <em>measured</em> and read back by the test suite, so a gap that closes cannot stay recorded as open. Transcripts <span className="font-mono">{t.transcriptsVersion}</span> ·{" "}
+            <FileLink path="proof/TRANSCRIPTS.md" /> · <FileLink path="proof/transcript-results.json" /> ·{" "}
+            <code className={code}>npm run proof -- --transcripts</code>.
+          </p>
+        </>
+      ) : (
+        <Pending what="The held-out transcript measurement" command="npm run proof -- --transcripts" file="proof/transcript-results.json" />
+      )}
+    </section>
+  );
+}
+
+/*
+ * The calibration answer. Every figure below is computed
+ * here from the proof files: the class prior from the method's prior and
+ * the number of classes, the PPV of one fire from a rule's own confusion
+ * counts, the direction from the reliability bins. Nothing is typed.
+ */
+function tauReading(c: ProofComposite, rules: ProofRule[]) {
+  const classes = c.perClass.length;
+  const prior = typeof c.method.prior === "number" ? c.method.prior : 0.5;
+  // Per-output prior spread over the K classes an output can carry: 1 − (1−π)^(1/K).
+  const classPrior = 1 - Math.pow(1 - prior, 1 / Math.max(1, classes));
+  const rule = rules.find((r) => r.name === "no_stub_output") ?? null;
+  const sensitivity = rule ? rule.tp / (rule.tp + rule.fn) : null;
+  const specificity = rule ? rule.tn / (rule.tn + rule.fp) : null;
+  const ppv =
+    sensitivity !== null && specificity !== null
+      ? (sensitivity * classPrior) / (sensitivity * classPrior + (1 - specificity) * (1 - classPrior))
+      : null;
+  const bins = (c.risk.test.calibration?.bins ?? []).filter(
+    (b): b is { from: number; to: number; n: number; meanPredicted: number; observedRate: number } =>
+      b.n > 0 && b.meanPredicted !== null && b.observedRate !== null,
+  );
+  const above = bins.filter((b) => b.observedRate > b.meanPredicted).length;
+  const total = bins.reduce((acc, b) => acc + b.n, 0);
+  const gap = total > 0 ? bins.reduce((acc, b) => acc + b.n * (b.observedRate - b.meanPredicted), 0) / total : null;
+  const tau = 1 / (1 + c.method.falsePassCost);
+  return { classes, prior, classPrior, rule, sensitivity, specificity, ppv, bins, above, gap, tau };
+}
+
+function WhyTauStays({ c, rules }: { c: ProofComposite; rules: ProofRule[] }): React.ReactElement {
+  const r = tauReading(c, rules);
+  const direction =
+    r.bins.length >= 3 && r.above > r.bins.length / 2
+      ? `In ${r.above} of the ${r.bins.length} populated reliability bins on the test split the observed bad rate sits above the mean predicted P(bad) (n-weighted gap ${r.gap === null ? "—" : `${r.gap >= 0 ? "+" : ""}${(r.gap * 100).toFixed(1)} points`}): the risk estimate is under-confident on bad outputs. That is what the bins say, and it is the direction a local prior corrects.`
+      : `The populated reliability bins on the test split do not agree on a direction (${r.above} of ${r.bins.length} sit above the diagonal), so no direction is claimed here.`;
+  return (
+    <div className="mt-4 rounded-xl border border-border-default bg-bg-card p-4 text-[14px] leading-relaxed text-text-secondary">
+      <p>
+        <strong className="text-text-primary">Why τ stays at {r.tau.toFixed(2)} when the sweep peaks at {c.sweep.argmaxUtility.toFixed(2)}.</strong> The threshold sweep on the dev split ({c.sweep.note}) finds its utility-optimal cut at <span className="font-mono text-text-primary">{c.sweep.argmaxUtility.toFixed(2)}</span>; the shipped cut is <span className="font-mono text-text-primary">{c.sweep.shippedTau.toFixed(2)}</span>, which is 1 / (1 + <code className={code}>eval.falsePassCost</code>) at the shipped cost of {c.method.falsePassCost}. The arithmetic behind the gap: the per-output prior π = {r.prior.toFixed(2)} is spread over the {r.classes} failure classes an output can carry, so one class starts at π<sub>c</sub> = 1 − (1 − π)<sup>1/{r.classes}</sup> ≈ {r.classPrior.toFixed(3)}; a single fire from{" "}
+        {r.rule ? (
+          <>
+            <code className={code}>{r.rule.name}</code> (sensitivity {pct(r.sensitivity)}, specificity {pct(r.specificity)} on the labelled corpus) then has a positive predictive value of about {pct(r.ppv)}
+          </>
+        ) : (
+          <>a typical detector then has a positive predictive value well</>
+        )}{" "}
+        — below τ, so one fire passes, and a corpus that is {pct(c.counts.mustNotShip / Math.max(1, c.counts.cases))} must-not-ship rewards a lower cut.
+      </p>
+      <p className="mt-2">
+        <strong className="text-text-primary">Established:</strong> the sweep&rsquo;s optimum is a fact about this corpus, not about the field; adopting it would fit the threshold to the cases it is scored on, and the prior is a stated assumption about a deployment we have never seen. The honest way to move the number is to let the deployment&rsquo;s own prior in — <code className={code}>eval.prior</code> is a config key today, with its source printed on every result, and the local labels that estimate it are the next arc. <strong className="text-text-primary">From the bins:</strong> {direction}
+      </p>
+      <p className="mt-2">
+        <strong className="text-text-primary">The same idea under another name.</strong> A conformal prediction set for a two-valued verdict is either one label or both. Iris has the both-labels case in one of its forms: <code className={code}>confidence: &quot;marginal&quot;</code> with a credible interval on p<sub>bad</sub> that straddles τ is exactly the set {"{pass, fail}"}. The analogy stops there. A verdict is also marginal where the reliability table above has not confirmed the estimate: too few labelled verdicts or detector patterns in its tenth of p<sub>bad</sub>, or an observed bad rate on the dev split that disagrees with the prediction or reaches τ. That is a statement about how far the estimate has been checked, not a prediction set, and it carries no coverage guarantee.
+      </p>
+    </div>
+  );
+}
+
+export function VerdictMeasured({ proof }: { proof: ProofClaims }): React.ReactElement {
+  const c = proof.composite;
+  return (
+    <section>
+      <h2 className={h2}>The verdict, measured</h2>
+      <p>
+        A gate does not key on a rule; it keys on <code className={code}>passed</code>, the verdict the composer makes from every rule that ran. The composite corpus scores that verdict: the 24 real transcripts, promoted as they are, plus cases composed by splicing a rule family&rsquo;s case into a clean transcript so the failure classes present are true by construction. It scores the risk composer that has decided <code className={code}>passed</code> since 0.10.0 beside the arithmetic that decided it before, on the same rule results, so the change is readable rather than asserted.
+      </p>
+      {c ? (
+        <>
+          <div className="mt-4 overflow-x-auto rounded-xl border border-border-default bg-bg-card">
+            <table className="w-full min-w-[640px] border-collapse text-left text-[14px]">
+              <thead>
+                <tr className="border-b border-border-default">
+                  <th scope="col" className={th}>Split</th>
+                  <th scope="col" className={th}>Composer</th>
+                  <th scope="col" className={th}>Accuracy vs should-ship (95% CI)</th>
+                  <th scope="col" className={th}>False blocks on clean</th>
+                  <th scope="col" className={th}>Missed blocks</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(
+                  [
+                    ["test", "test"],
+                    ["real transcripts (held out, staged)", "realTranscripts"],
+                  ] as const
+                ).flatMap(([label, split]) =>
+                  (
+                    [
+                      ["legacy", c.legacy],
+                      [`risk, ${c.method.priorMode} prior`, c.risk],
+                    ] as const
+                  ).map(([name, slices]) => {
+                    const s = slices[split];
+                    return (
+                      <tr key={`${split}-${name}`} className="border-b border-border-subtle last:border-b-0">
+                        <td className={td}>{label}</td>
+                        <td className={td}>{name}</td>
+                        <td className={td}>
+                          {pct(s.accuracy.rate)} {ci(s.accuracy.ci95)} <span className="text-text-muted">n={s.accuracy.n}</span>
+                        </td>
+                        <td className={td}>
+                          {pct(s.falseBlock.rate)} <span className="text-text-muted">n={s.falseBlock.n}</span>
+                        </td>
+                        <td className={td}>
+                          {pct(s.missedBlock.rate)} <span className="text-text-muted">n={s.missedBlock.n}</span>
+                        </td>
+                      </tr>
+                    );
+                  }),
+                )}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-3 text-[14px] leading-relaxed text-text-secondary">
+            Difference from legacy on the test split, risk composer with the {c.method.priorMode} prior:{" "}
+            <span className="font-mono text-[13px] text-text-primary">
+              {c.difference.risk.test ? `${(c.difference.risk.test.delta * 100).toFixed(1)} points [${(c.difference.risk.test.lo * 100).toFixed(1)}, ${(c.difference.risk.test.hi * 100).toFixed(1)}]` : "—"}
+            </span>{" "}
+            (Newcombe 95%). An interval that straddles zero says the corpus cannot yet tell the two apart. Read per class, the plan&rsquo;s prior blocks nearly every clean case; read per output it holds the legacy false-block rate — both readings are in the file, and which one ships is a decision the numbers inform. Cases: {c.counts.cases} ({c.counts.realTranscripts} real transcripts — staged runs held out of every per-rule rate, not production traffic, as the next section says — and {c.counts.composed} composed; {c.counts.dev} dev / {c.counts.test} test by a hash of the id). Composite <span className="font-mono">{c.compositeVersion}</span> ·{" "}
+            <FileLink path="proof/COMPOSITE.md" /> · <FileLink path="proof/composite-results.json" /> ·{" "}
+            <code className={code}>npm run proof -- --composite</code>.
+          </p>
+          <WhyTauStays c={c} rules={proof.rules} />
+        </>
+      ) : (
+        <Pending what="The composite measurement" command="npm run proof -- --composite" file="proof/composite-results.json" />
+      )}
+    </section>
+  );
+}
+
+export function Transforms({ proof }: { proof: ProofClaims }): React.ReactElement {
+  const t = proof.transforms;
+  const rules = t ? [...new Set(t.rows.map((r) => r.rule))] : [];
+  return (
+    <section>
+      <h2 className={h2}>The evasions a leak arrives in</h2>
+      <p>
+        The three critical rules match text. For every positive a rule caught with a span into the raw output, the text inside the span is transformed — a zero-width space, Cyrillic homoglyphs, fullwidth forms, a no-break space, a tab, a line break, swapped case — and the rule is run again. Recall per transform is the share still caught; a case the rule missed in the clear is not counted, and a transform that does not apply to a span (no letters to swap, no space to replace) is not counted for that case.
+      </p>
+      {t ? (
+        <>
+          <div className="mt-4 overflow-x-auto rounded-xl border border-border-default bg-bg-card">
+            <table className="w-full min-w-[720px] border-collapse text-left text-[14px]">
+              <thead>
+                <tr className="border-b border-border-default">
+                  <th scope="col" className={th}>Rule</th>
+                  {t.transforms.map((x) => (
+                    <th key={x.id} scope="col" className={th}>
+                      {x.id.replace("_", " ")}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rules.map((rule) => (
+                  <tr key={rule} className="border-b border-border-subtle last:border-b-0">
+                    <th scope="row" className="px-3 py-2 text-left font-mono text-[13px] font-medium text-text-primary">
+                      {rule}
+                    </th>
+                    {t.transforms.map((x) => {
+                      const row = t.rows.find((r) => r.rule === rule && r.transform === x.id);
+                      return (
+                        <td key={x.id} className={td} title={row ? `${row.caught} of ${row.n} still caught ${ci(row.ci95)}` : undefined}>
+                          {row && row.n > 0 ? (
+                            <>
+                              {pct(row.recall)} <span className="text-text-muted">n={row.n}</span>
+                            </>
+                          ) : (
+                            "n/a"
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-3 text-[13px] text-text-muted">
+            Per-transform intervals and the dropped case ids are in <FileLink path="proof/RESULTS.md" /> (<FileLink path="proof/results.json" label="results.json → transforms" />). The table measures the rules as shipped; a normalisation pass that changes it will change these numbers.
+          </p>
+        </>
+      ) : (
+        <Pending what="The transforms table" command="npm run proof" file="proof/results.json" />
+      )}
+    </section>
+  );
+}
+
+export function ByEntity({ proof }: { proof: ProofClaims }): React.ReactElement {
+  const e = proof.entities?.find((x) => x.rule === "no_pii");
+  return (
+    <section>
+      <h2 className={h2}>
+        What <code className={code}>no_pii</code> finds, by entity
+      </h2>
+      <p>
+        Every positive in the PII family names what it contains — by the case author, never by the detector. Per entity: <em>present</em> (cases containing it), <em>caught</em> (the rule failed the case for any reason), <em>named</em> (the rule&rsquo;s evidence named this entity). The vocabulary includes things the rule&rsquo;s definition does not cover, so a gap shows as a row with named 0 rather than as silence, and a case caught for another reason shows as the difference between caught and named.
+      </p>
+      {e ? (
+        <div className="mt-4 overflow-x-auto rounded-xl border border-border-default bg-bg-card">
+          <table className="w-full min-w-[520px] border-collapse text-left text-[14px]">
+            <thead>
+              <tr className="border-b border-border-default">
+                <th scope="col" className={th}>Entity</th>
+                <th scope="col" className={th}>Present</th>
+                <th scope="col" className={th}>Caught</th>
+                <th scope="col" className={th}>Named</th>
+                <th scope="col" className={th}>Recall (95% CI)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {e.rows.map((r) => (
+                <tr key={r.entity} className="border-b border-border-subtle last:border-b-0">
+                  <th scope="row" className="px-3 py-2 text-left font-mono text-[13px] font-medium text-text-primary">
+                    {r.entity}
+                  </th>
+                  <td className={td}>{r.present}</td>
+                  <td className={td}>{r.caught}</td>
+                  <td className={td}>{r.named}</td>
+                  <td className={td}>
+                    {pct(r.recall)} {ci(r.ci95)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <Pending what="The per-entity table" command="npm run proof" file="proof/results.json" />
+      )}
+    </section>
+  );
+}
+
+export function CustomTypes({ proof }: { proof: ProofClaims }): React.ReactElement {
+  const c = proof.custom;
+  return (
+    <section>
+      <h2 className={h2}>Custom rule types — conformance</h2>
+      <p>
+        A custom rule is your own constraint, so its accuracy is whether the type does what its documented definition says under a declared config. One family per type, run through the same factory <code className={code}>custom_rules</code> and deployed rules go through; a disagreement here is a rule defect or a definition error, never an opinion.
+      </p>
+      {c ? (
+        <div className="mt-4 overflow-x-auto rounded-xl border border-border-default bg-bg-card">
+          <table className="w-full min-w-[640px] border-collapse text-left text-[14px]">
+            <thead>
+              <tr className="border-b border-border-default">
+                <th scope="col" className={th}>Type</th>
+                <th scope="col" className={th}>Config</th>
+                <th scope="col" className={th}>n</th>
+                <th scope="col" className={th}>Skipped</th>
+                <th scope="col" className={th}>Precision (95% CI)</th>
+                <th scope="col" className={th}>Recall (95% CI)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {c.types.map((t) => (
+                <tr key={t.type} className="border-b border-border-subtle last:border-b-0">
+                  <th scope="row" className="px-3 py-2 text-left font-mono text-[13px] font-medium text-text-primary">
+                    {t.type}
+                  </th>
+                  <td className={`${td} whitespace-nowrap`}>{JSON.stringify(t.config)}</td>
+                  <td className={td}>{t.n}</td>
+                  <td className={td}>{t.skipped}</td>
+                  <td className={td}>
+                    {pct(t.precision)} {ci(t.ci95.precision)}
+                  </td>
+                  <td className={td}>
+                    {pct(t.recall)} {ci(t.ci95.recall)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <Pending what="The conformance table" command="npm run proof" file="proof/results.json" />
+      )}
+      {c ? (
+        <p className="mt-3 text-[13px] text-text-muted">
+          Families: <FileLink path="proof/corpus/custom" label="proof/corpus/custom/<type>.json" />. The <code className={code}>json_schema</code> family&rsquo;s definition says the schema is not consulted in this version; its cases are labelled by that.
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+export function EvaluatorOfEvaluators(): React.ReactElement {
+  const m = EVALUATORS;
+  return (
+    <section>
+      <h2 className={h2}>Evaluator of evaluators</h2>
+      <p>
+        Thirteen trust questions — does it work, when does it fail, what does it measure, is it calibrated, can it be gamed, can it produce false confidence, and seven more — asked of every evaluator Iris ships: the built-in rules, the custom rule types, the judge templates, the citation verifier and the verdict composer. Every cell is derived from the committed proof files by a generator, never typed; a cell reads <em>measured</em> only when a number for it exists and the evidence names the file.
+      </p>
+      {m ? (
+        <>
+          <dl className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
+            {[
+              { k: "Evaluators", v: String(m.counts.evaluators) },
+              { k: "Questions each", v: String(m.counts.questions) },
+              { k: "≥ 3 questions measured", v: `${m.counts.measuredThreeOrMore} / ${m.counts.evaluators}` },
+            ].map((t) => (
+              <div key={t.k} className="rounded-xl border border-border-default bg-bg-card p-4">
+                <dt className="text-[11px] font-bold uppercase tracking-[0.15em] text-text-muted">{t.k}</dt>
+                <dd className="mt-1 font-mono text-xl font-semibold text-text-primary">{t.v}</dd>
+              </div>
+            ))}
+          </dl>
+          <ul className="mt-4 list-disc space-y-1 pl-6 text-[14px] text-text-secondary">
+            {m.groups.map((g) => (
+              <li key={g.id}>
+                <span className="capitalize">{g.text}</span>: {m.counts.byGroup[g.id].measuredThreeOrMore} of {m.counts.byGroup[g.id].evaluators} with three or more questions measured
+                {g.id === "judge" || g.id === "citations" ? " — measurable, pending a judge key that you or the maintainer supplies" : ""}.
+              </li>
+            ))}
+          </ul>
+          <p className="mt-3 text-[13px] text-text-muted">
+            The full matrix with the evidence per cell: <FileLink path="docs/evaluators.md" />. Regenerated by <code className={code}>npm run claims:generate</code> and <code className={code}>npm run llms:render</code> at every release.
+          </p>
+        </>
+      ) : (
+        <Pending what="The matrix" command="npm run claims:generate" file=".claims.json" />
+      )}
+    </section>
+  );
+}
+
+export function ArcTwoSections({ proof }: { proof: ProofClaims | null }): React.ReactElement | null {
+  if (!proof) return null;
+  return (
+    <>
+      <VerdictMeasured proof={proof} />
+      <OutOfSample proof={proof} />
+      <Transforms proof={proof} />
+      <ByEntity proof={proof} />
+      <CustomTypes proof={proof} />
+      <EvaluatorOfEvaluators />
+      <p className="text-[13px] text-text-muted">
+        Related:{" "}
+        <Link href="/capabilities" className={link}>
+          the capability map
+        </Link>{" "}
+        says what Iris can judge; this page says how well.
+      </p>
+    </>
+  );
+}

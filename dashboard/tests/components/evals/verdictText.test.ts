@@ -1,0 +1,97 @@
+/*
+ * The verdict vocabulary table.
+ */
+import { describe, it, expect } from 'vitest';
+import {
+  BASIS_TEXT,
+  QUESTION_LABEL,
+  STATE_TEXT,
+  notCheckedSuffix,
+  stateBadge,
+  composerFacts,
+  confidenceChip,
+  evidenceText,
+  fmtRisk,
+  tauOf,
+} from '../../../src/components/evals/verdictText';
+
+describe('verdictText', () => {
+  it('says who recorded what was judged: the capture source and what it holds in full, the agent, or nobody; nothing on a row from before the record', () => {
+    expect(evidenceText(undefined)).toBeNull();
+    expect(
+      evidenceText({ recordedBy: 'harness', capture: { name: 'iris-eval-capture', version: '0.20.0', complete: ['input', 'tool_calls'] }, carried: ['input', 'output', 'tool_calls'], toolCalls: 0 }),
+    ).toBe('Recorded by iris-eval-capture 0.20.0, which records input, tool_calls in full, watching the agent. Carried: input, output, tool_calls. It recorded no tool call: none was made.');
+    expect(evidenceText({ recordedBy: 'harness', capture: { name: 'otel-agent' }, carried: ['output'] })).toBe('Recorded by otel-agent, watching the agent. Carried: output.');
+    expect(evidenceText({ recordedBy: 'agent', carried: ['input', 'output'] })).toBe("The agent's own report, through its Iris tool: nothing outside the agent recorded it. Carried: input, output.");
+    expect(evidenceText({ recordedBy: 'not_declared', carried: ['output'] })).toMatch(/^Recorder not declared/);
+  });
+
+  it('every basis the composer can return has its own sentence', () => {
+    const bases = ['policy_gate', 'detector_veto', 'critical_unknown', 'required_evidence_missing', 'risk_over_loss', 'clean', 'no_rules'];
+    expect(Object.keys(BASIS_TEXT).sort()).toEqual([...bases].sort());
+    const sentences = Object.values(BASIS_TEXT);
+    for (const s of sentences) expect(s).toMatch(/\.$/);
+    expect(new Set(sentences).size).toBe(sentences.length);
+  });
+
+  it('every question the server asks has a short label', () => {
+    expect(Object.keys(QUESTION_LABEL).sort()).toEqual(
+      ['safe_output', 'grounded', 'complete', 'relevant', 'task_completed', 'tool_use_correct', 'within_budget'].sort(),
+    );
+  });
+
+  it('the three states have a label and a tone', () => {
+    expect(STATE_TEXT.pass.label).toBe('PASS');
+    expect(STATE_TEXT.fail.label).toBe('FAIL');
+    // The third state is said as what happened, not as a shrug.
+    expect(STATE_TEXT.unknown).toEqual({ label: 'NOT CHECKED', tone: 'unknown' });
+  });
+
+  it('a list badge reads the state, and a verdict that was not checked is never drawn as a failure', () => {
+    expect(stateBadge('unknown', false)).toEqual({ label: 'NOT CHECKED', tone: 'unknown' });
+    expect(stateBadge('fail', false)).toEqual({ label: 'FAIL', tone: 'fail' });
+    expect(stateBadge('pass', true)).toEqual({ label: 'PASS', tone: 'pass' });
+    // A row from a server older than the state says what `passed` can.
+    expect(stateBadge(undefined, false).label).toBe('FAIL');
+    expect(stateBadge(undefined, true).label).toBe('PASS');
+  });
+
+  it('a count says how many were not checked only when some were', () => {
+    expect(notCheckedSuffix(2)).toBe(' · 2 not checked');
+    expect(notCheckedSuffix(0)).toBe('');
+    expect(notCheckedSuffix(undefined)).toBe('');
+  });
+
+  it('the loss threshold derives from the stored cost, never typed', () => {
+    expect(tauOf({ defaultsGate: false, falsePassCost: 1, onCriticalSkipped: 'unknown' })).toBeCloseTo(0.5);
+    expect(tauOf({ defaultsGate: false, falsePassCost: 3, onCriticalSkipped: 'unknown' })).toBeCloseTo(0.25);
+  });
+
+  it('the composer facts are three, each naming its key and carrying a sentence', () => {
+    const facts = composerFacts({ defaultsGate: true, falsePassCost: 4, onCriticalSkipped: 'fail' });
+    expect(facts.map((f) => f.key)).toEqual(['eval.falsePassCost', 'eval.defaultsGate', 'eval.onCriticalSkipped']);
+    expect(facts[0].sentence).toContain('0.20');
+    expect(facts[1].sentence).toMatch(/gate/);
+    expect(facts[2].sentence).toMatch(/fails the verdict/);
+  });
+
+  it('the risk prints to two places with its interval', () => {
+    expect(fmtRisk({ pBad: 0.123, lo: 0.05, hi: 0.3, perClass: {}, assumptions: [] })).toBe('p(bad) 0.12 [0.05, 0.30]');
+  });
+
+  it('the confidence chip: a marginal pass that clears the threshold is neutral; a marginal fail or a straddle warns; nothing promises a note that is absent', () => {
+    const composer = { defaultsGate: false, falsePassCost: 1, onCriticalSkipped: 'unknown' as const };
+    const risk = (pBad: number, lo: number, hi: number) => ({ pBad, lo, hi, perClass: {}, assumptions: [] });
+    const pass = confidenceChip({ state: 'pass', risk: risk(0.13, 0.1, 0.16), confidence: 'marginal' }, composer, true)!;
+    expect(pass.tone).toBe('muted');
+    expect(pass.tooltip).toContain('labelled data has not confirmed the risk estimate');
+    expect(pass.tooltip).toContain('may be too low or too high');
+    expect(pass.tooltip).not.toContain('not that this output is a close call');
+    expect(pass.tooltip).toContain('The note below says which');
+    expect(confidenceChip({ state: 'fail', risk: risk(0.75, 0.6, 0.9), confidence: 'marginal' }, composer, true)!.tone).toBe('warn');
+    expect(confidenceChip({ state: 'pass', risk: risk(0.45, 0.3, 0.6), confidence: 'marginal' }, composer, true)!.tone).toBe('warn');
+    // A row stored without composer facts carries no notes: the tooltip must not point at one.
+    expect(confidenceChip({ state: 'pass', risk: risk(0.13, 0.1, 0.16), confidence: 'marginal' }, null, false)!.tooltip).not.toContain('note below');
+    expect(confidenceChip({ state: 'pass', risk: null, confidence: undefined }, composer, true)).toBeNull();
+  });
+});

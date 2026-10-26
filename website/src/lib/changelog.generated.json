@@ -1,0 +1,373 @@
+{
+  "generatedFrom": "CHANGELOG.md",
+  "current": {
+    "version": "0.21.0",
+    "date": "2026-10-25",
+    "lead": "A security release: what an agent or a client sends Iris is bounded before Iris reads it, and a tool argument can narrow what the operator allows but never widen it",
+    "intro": [
+      "**A security release: what an agent or a client sends Iris is bounded before Iris reads it, and a tool argument can narrow what the operator allows but never widen it.** 0.21.0:",
+      "- A tool call, a dashboard API body and an OTLP batch are each held to `security.maxInputElements` (100,000 array elements and object keys by default) before any schema reads them, and a validation error lists at most 20 issues and the total.",
+      "- `verify_citations` and `evaluate_with_llm_judge` take the operator's fetch setting, domain list and cost caps as ceilings; every judge call on a key draws on one daily budget; and stored text comes back inside a fence that marks it as text someone else wrote.",
+      "- With an allowlist set, the citation fetcher looks up only the hosts on it.",
+      "- The lowest versions Iris accepts are now `@modelcontextprotocol/sdk` 1.32.0, `body-parser` 2.4.0 and `zod` 4.6.7, and the Docker image runs Node.js 24.22.1.",
+      "- Also: `npm run preflight`, which runs what CI will run before you push, and proof measured on agent runs Iris did not write.",
+      "**Check before upgrading.** Three entries under Security are marked BREAKING. Read them if an agent passes `allow_fetch`, `domain_allowlist`, `max_cost_usd` or `max_cost_usd_total` to Iris's tools, if the judge tools spend more than 1 USD a day on your key (`IRIS_LLM_JUDGE_DAILY_BUDGET_USD`), or if a script reads stored text from `get_traces`, `list_rules` or a trace resource."
+    ],
+    "sections": [
+      {
+        "title": "Added",
+        "items": [
+          "**`npm run preflight`: what CI will say, before you push.** It runs, in CI's order, every check a pull request's workflows run that can run on your machine: the lint, the type checks, the proof checks, the builds, every test with the coverage floors, and the truthbase regenerated and compared with the committed one, then records the tree it verified. `git config core.hooksPath scripts/git-hooks` turns on a pre-push hook that refuses a branch the preflight has not passed at that tree. A test holds it to the workflows: every job a pull request runs is a step or is listed as CI-only with the reason (Playwright, the real MCP clients, Docker, the Python client and the other jobs that install or start something this machine would have to set up).",
+          "**Proof on agent runs Iris did not write.** `npm run proof -- --outside` judges a fixed sample of the runs [AgentDojo](https://github.com/ethz-spylab/agentdojo) publishes, with the shipped engine at its defaults, and scores the verdicts against the labels AgentDojo's environment computed by checking the world after each run: was the user's task done, and did the attacker's goal happen. Every other proof line is measured on cases written or labelled here; this one is not. The sample is 700 runs of 29 agents and defences on all 97 of AgentDojo's user tasks, each file checked against the hash AgentDojo's repository lists for it, and CI regenerates the report on every change. What it found, at the shipped defaults:\n- The verdict shipped 312 of 419 bad runs and blocked 68 of 281 good ones.\n- No injection rule caught any of the 200 runs where the attack succeeded. In every one the rule judged, it found no directive: AgentDojo's attack is worded in a way the directive list does not hold.\n- Nearly half the good runs blocked were failed by `no_pii`: an email assistant naming the addresses its user asked about, a banking assistant giving its own user an account number. The next most common was `no_silent_tool_failure`.\nHalf the tasks are held out by a seed, so a rule changed after reading these runs is judged on runs it was not fitted to. The report, with every rate also counted over tasks, is `proof/OUTSIDE.md`."
+        ]
+      },
+      {
+        "title": "Changed",
+        "items": [
+          "**Building Iris from a clone with pnpm 11 or later works again.** pnpm 11 stopped reading its settings from `package.json`, so `pnpm install` refused the install scripts of `better-sqlite3` and `esbuild` and stopped, and directories that build Iris that way, such as Glama, got no build. The allow-list is in `pnpm-workspace.yaml` again, in the forms pnpm 10 and pnpm 11 and later each read. npm, which Iris itself installs with, is unaffected.",
+          "**On Node 24.22.0 and later, a better-sqlite3 compiled on your machine loads as usual.** Node 24.22.0 keeps the global list of addon cleanup hooks ([nodejs/node#63985](https://github.com/nodejs/node/pull/63985)), so a binary compiled against Node 24.19+ headers no longer aborts when V8 frees one of its statements. Iris now loads that binary on 24.22.0 and later; on 24.19 to 24.21 it still holds the store with Node's built-in SQLite and says why. The CI job that compiles the addon from source on Node 24 confirmed it: the compiled binary survived collection on 24.22.0.",
+          "**The website and two blog posts give the EU AI Act's current dates.** The agent-eval guide and the posts from March 2026 said the Act's requirements for high-risk systems took effect in August 2026, the date in the Act when they were written. An amendment in July 2026 moved them: they apply from 2 December 2027 for the systems listed in Annex III and from 2 August 2028 for those covered by Annex I. The guide now says so, and each post carries a dated correction.",
+          "**A shutdown that has to stop a storage thread says why.** `close()` gives the checkpoint thread and the search thread 5 s to end on their own. When one has not, Iris now writes one line to stderr before stopping it, naming the thread and what it was doing: still starting, in a request this process made (and for how long), or in its own periodic checkpoint. A shutdown that waited was silent before.",
+          "**Links to the old roadmap resolve.** `docs/roadmap.md` points at the capability map, which replaced it, so links to it in published posts and on other sites land somewhere current; the editor's notes on three posts link the map directly.",
+          "**The homepage's research section leads with published research:** the four-way comparison of Iris, Langfuse, Phoenix and Promptfoo, and each rule's measured precision and recall on /proof, in place of a survey card marked \"Coming Soon\". The terms add how a hosted or paid service would be offered: under its own terms, published before it starts, with no change to the open-source software's license.",
+          "**iris-eval.com counts page views with Vercel Web Analytics**, as its privacy page describes: cookie-free, no personal data, no cross-site tracking. The script runs under the site's nonce-based Content Security Policy."
+        ]
+      },
+      {
+        "title": "Security",
+        "items": [
+          "**A tool call's arguments may hold at most 100,000 array elements and object keys, on every transport.** The MCP SDK can count them before it validates the arguments, but only when the server sets a limit, and Iris set none ([GHSA-46jr-4wx8-v453](https://github.com/advisories/GHSA-46jr-4wx8-v453), high). Arguments that fail validation are reported element by element, so one 1 MB request of 524,229 elements (zeros where `spans` belong) cost the server 260 MB, and 20 requests of that size at once, the MCP endpoint's per-minute limit for one client, up to 1,148 MB and 41 s to answer them. A call over the limit now gets an `isError` result that names the limit, before its arguments are validated, and the session goes on. The default clears every legitimate input measured, even one that fills the whole 1 MB request: real agent transcripts reach about 12,600 elements at 1 MB, and the densest shape found, a trace of 201 short tool calls, 68,506. Set it with `security.maxInputElements` in `config.json` or `IRIS_MAX_INPUT_ELEMENTS`; the same limit bounds the dashboard's request bodies (below). A server reachable beyond loopback can go lower: at 10,000 the same burst costs about 250 MB. `scripts/bench-tool-input-elements.ts` measures it.",
+          "**Iris requires `@modelcontextprotocol/sdk` 1.32.0 or later.** It required 1.30.0. A published package does not carry Iris's lockfile, so a project that already held SDK 1.30.x or 1.31.x kept it, and those versions are affected by [GHSA-46jr-4wx8-v453](https://github.com/advisories/GHSA-46jr-4wx8-v453), [GHSA-22jm-h49p-29qw](https://github.com/advisories/GHSA-22jm-h49p-29qw), [GHSA-rvq5-wwqv-78pq](https://github.com/advisories/GHSA-rvq5-wwqv-78pq) and [GHSA-6prh-2h8m-c8cw](https://github.com/advisories/GHSA-6prh-2h8m-c8cw), and 1.30.x also by [GHSA-6qxp-vccf-f47h](https://github.com/advisories/GHSA-6qxp-vccf-f47h) and, at 1.30.0, [GHSA-f897-62hf-6gxq](https://github.com/modelcontextprotocol/typescript-sdk/security/advisories/GHSA-f897-62hf-6gxq). The element limit above also needs 1.32.0: an older SDK ignores the option. Iris's own lockfile already installed 1.32.0.",
+          "**`ip-address` 10.7.4** ([GHSA-rxp7-6hxx-x8q5](https://github.com/advisories/GHSA-rxp7-6hxx-x8q5), moderate: `Address6` strips a zone identifier in quadratic time before applying its length limit). Iris reaches it only through `express-rate-limit`, which parses the request's own socket address: Iris leaves Express's `trust proxy` off, so a client cannot hand it a long string. The `overrides` floor is raised from 10.5.1 to 10.7.4.",
+          "**With an allowlist set, the citation fetcher resolves only the hosts on it.** `IRIS_CITATION_DOMAINS` is now checked before the DNS lookup, so a host that an output cites and the list does not hold is refused with `not_allowed_domain` and never looked up. It applies at every redirect hop. A host that is both outside the list and unsafe, such as a private address, now reports `not_allowed_domain` where it reported `ssrf`.",
+          "**BREAKING — A tool argument can no longer widen what the operator allows for fetching or spend.** Three arguments could. `verify_citations` with `allow_fetch: true` fetched the cited URLs on a server whose operator had not set `IRIS_CITATION_ALLOW_FETCH=1`; its `domain_allowlist` was added to the operator's `IRIS_CITATION_DOMAINS` instead of narrowing it; and `max_cost_usd` on `evaluate_with_llm_judge` and `max_cost_usd_total` on `verify_citations` replaced the operator's cap with any larger number. An agent's arguments can be steered by text it read, including text stored in Iris, so each is now a ceiling: an argument can narrow the operator's setting for one call and never widen it. When one asks for more, the operator's setting applies and the call goes on, the response carries a warning with code `IRIS_ARGUMENT_NARROWED` naming the argument and the setting that applied, and the stored evaluation keeps the same fact (`provenance.narrowed`) with a sentence to the operator in its `interpretations`, on every later read. Fetching now needs `IRIS_CITATION_ALLOW_FETCH=1` on the server; a caller that relied on `allow_fetch: true` gets no fetch and the warning. The per-call cap on `verify_citations` is a new setting, `IRIS_CITATION_MAX_COST_USD_TOTAL`, default 1 USD as before.",
+          "**BREAKING — Every judge call on your key draws on one daily budget.** `evaluate_with_llm_judge` and `verify_citations` had a per-call cap and no daily limit, so an agent calling either in a loop, or steered into doing so, could spend the key without end; only the relevance judge had a daily budget. All three now share one, `IRIS_LLM_JUDGE_DAILY_BUDGET_USD` (default 1 USD per UTC day, per tenant, kept in the database). A call is made only if its worst case fits in what is left. When it does not, nothing is spent: `evaluate_with_llm_judge` answers `IRIS_BUDGET_EXCEEDED` (retryable, with the time the budget resets), and `verify_citations` marks the citation `daily_budget_reached` and makes no further call. A deployment that spends more than 1 USD a day on the judge tools raises the budget. The variable was `IRIS_RELEVANCE_JUDGE_DAILY_BUDGET_USD`; that name is still read when the new one is unset, and the server says so at startup. In the Claude Desktop extension the setting is now \"LLM judge daily budget\", and a value set under the old one is not carried over. Today's spend is `judge.dailyBudget` on `iris://capabilities`.",
+          "**BREAKING — Stored text comes back fenced, and a page of traces carries snippets.** Iris hands back what agents, their users and their tools wrote, and the agent reading it sits beside tools that delete traces and rules; a sentence planted in a trace reached the model as plain JSON. Every read that returns stored text now puts each value someone else wrote inside a tag carrying an id made for that response, `<untrusted_output id=\"…\">…</untrusted_output id=\"…\">`, the fence Iris already used for its own judge, and the response starts with `untrusted: { id, notice }`. The fence is on the values, so it reaches the model from the text block, from `structuredContent` and from a resource alike. A short value with no whitespace (an agent name, a session id, a tool name) is left as it is, so it still works as a filter. Covered: `get_traces`, `list_rules`, `iris://traces/{trace_id}`, `iris://evaluations/{id}` (a custom rule's name and a judge's rationale; what Iris wrote stays outside), `iris://audit` and `iris://dashboard/summary`. `get_traces` cuts each fenced value to 500 characters unless `include_text: true`, and says what it cut in each trace's `cut`. `deploy_rule` and `evaluate_output`'s `custom_rules` refuse a value carrying a fence tag, and `deploy_rule` takes the rule names the dashboard always required (letters, digits, dot, dash, underscore). `get_traces` and `list_rules` advertise `openWorldHint: true`. A script that read a trace's text from `get_traces` reads it inside the tags, and passes `include_text: true` for more than 500 characters.",
+          "**Three dependency advisories, each patched within a day of GitHub publishing it; none affects Iris as shipped.** `proxy-addr` 2.0.8 ([GHSA-jqcg-44mw-7w3h](https://github.com/advisories/GHSA-jqcg-44mw-7w3h), critical) fixes how a trusted proxy address range is matched; that matching runs only when Express's `trust proxy` is set to a range, and Iris leaves `trust proxy` off. `source-map-js` 1.2.2 ([GHSA-68fv-2mgg-jv7q](https://github.com/advisories/GHSA-68fv-2mgg-jv7q), high) is in the build and test tools only. `@modelcontextprotocol/client` 2.3.1 ([GHSA-6qxp-vccf-f47h](https://github.com/advisories/GHSA-6qxp-vccf-f47h), high) is in the OpenTelemetry example only.",
+          "**Dashboard and OTLP request bodies are held to the same element limit.** A JSON body sent to the dashboard API or to `POST /v1/traces` that holds more than `security.maxInputElements` (default 100,000) array elements and object keys is answered `413` before any schema reads it; JSON bodies of every legitimate shape measured stay under it at the full 1 MB request size. A protobuf body on `POST /v1/traces` is counted as it is decoded against its own ceiling, one element per 5 bytes of `security.requestSizeLimit` (209,716 at the default 1 MB) or `maxInputElements` when that is higher. An OTLP exporter drops a batch it gets a `413` for, and decoded protobuf is denser than JSON: the densest real exporter body measured, from the plain Python exporter, holds one element per 7.5 bytes, so a batch that dense is taken up to the full request size with half again as much room to spare, and raising `requestSizeLimit` raises the ceiling with it. While the limit covered tool calls only it was named `maxToolInputElements` (`IRIS_MAX_TOOL_INPUT_ELEMENTS`); that name is still read when the new one is unset.",
+          "**Validation errors return at most 20 issues and the total.** A 400 from the dashboard API or the MCP HTTP transport for a body or query that fails validation still lists the issues in `details`, the first 20 of them, and now carries `issueCount`, how many there were, with `detailsNote` saying so when some were left out. An issue about unknown keys names at most 20 of them (`keyCount` gives how many), and a message is cut at 1,000 characters. The same bound holds for the reasons `POST /v1/traces` gives for dropped spans (three issues for each span), for `IRIS_INVALID_RULE_CONFIG`, and for the unknown-argument message of every MCP tool. A request wrong in a few places is still told every one of them; the size of the answer no longer grows with the request. Twenty covers a trace, the largest body the API takes, with all 18 of its top-level fields wrong.",
+          "**`body-parser` 2.4.0 and `zod` 4.6.7 are now the lowest versions Iris accepts.** `body-parser` before 2.4.0 ([GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828), high) could end the process when a compressed request body was followed by stray bytes. Iris decompresses request bodies on both HTTP servers, because OpenTelemetry exporters send gzip, and parses them before the API-key check. `zod` before 4.6.6 ([GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5), high) collected one issue for every failing element of an array with no length limit. Iris validates every tool call and request body with it, and the element limit above already bounds how many one request can make it collect. A published package does not carry Iris's lockfile, so Iris now declares `body-parser` at `^2.4.0` (Express's own range admits 2.3.0) and `zod` at `^4.6.7`: a project that held an older version moves when it upgrades.",
+          "**`fast-uri` 3.1.9** ([GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg), [GHSA-wjr9-j795-jxcr](https://github.com/advisories/GHSA-wjr9-j795-jxcr), moderate). Iris reaches it only through `ajv`'s `format: \"uri\"` check, which Iris's own validator does not run. The `overrides` floor is raised from 3.1.8.",
+          "**The Docker image runs Node.js 24.22.1**, the security release of 2026-10-20, on Alpine 3.24.3. It ran 24.21.0. The release fixes advisories in Node's `http`, `tls`, `dns` and brotli code, and carries undici 7.30.1 for Node's own `fetch`, which the citation fetcher uses."
+        ]
+      }
+    ]
+  },
+  "history": [
+    {
+      "version": "0.21.0",
+      "date": "2026-10-25",
+      "note": null,
+      "lead": "A security release: what an agent or a client sends Iris is bounded before Iris reads it, and a tool argument can narrow what the operator allows but never widen it",
+      "itemCount": 22
+    },
+    {
+      "version": "0.20.0",
+      "date": "2026-10-03",
+      "note": null,
+      "lead": "Iris says what it checked. A verdict tells a pass from a check that never ran, names who recorded the evidence it judged, and cannot be replaced by the agent it judges",
+      "itemCount": 119
+    },
+    {
+      "version": "0.19.0",
+      "date": "2026-09-25",
+      "note": null,
+      "lead": "Verdicts that say how sure they are, detectors that see through disguises, and one command to set up any client",
+      "itemCount": 9
+    },
+    {
+      "version": "0.18.0",
+      "date": "2026-09-24",
+      "note": null,
+      "lead": "Honest numbers, a lighter footprint, nothing done silently",
+      "itemCount": 15
+    },
+    {
+      "version": "0.17.0",
+      "date": "2026-09-23",
+      "note": null,
+      "lead": "Hostile input, honest verdicts, a harder release path",
+      "itemCount": 11
+    },
+    {
+      "version": "0.16.0",
+      "date": "2026-09-22",
+      "note": null,
+      "lead": "Earn the comparison",
+      "itemCount": 26
+    },
+    {
+      "version": "0.15.0",
+      "date": "2026-09-21",
+      "note": null,
+      "lead": "Reach, honestly",
+      "itemCount": 26
+    },
+    {
+      "version": "0.14.0",
+      "date": "2026-09-20",
+      "note": null,
+      "lead": "The dashboard is a product",
+      "itemCount": 25
+    },
+    {
+      "version": "0.13.0",
+      "date": "2026-09-08",
+      "note": null,
+      "lead": "Found and fed",
+      "itemCount": 31
+    },
+    {
+      "version": "0.12.1",
+      "date": "2026-09-07",
+      "note": null,
+      "lead": "Truth patch 3",
+      "itemCount": 10
+    },
+    {
+      "version": "0.12.0",
+      "date": "2026-09-07",
+      "note": null,
+      "lead": "Compare",
+      "itemCount": 17
+    },
+    {
+      "version": "0.11.0",
+      "date": "2026-09-06",
+      "note": null,
+      "lead": "The act layer",
+      "itemCount": 24
+    },
+    {
+      "version": "0.10.0",
+      "date": "2026-09-05",
+      "note": null,
+      "lead": "The verdict",
+      "itemCount": 18
+    },
+    {
+      "version": "0.9.0",
+      "date": "2026-09-05",
+      "note": null,
+      "lead": "Iris explains its verdicts",
+      "itemCount": 12
+    },
+    {
+      "version": "0.8.2",
+      "date": "2026-09-05",
+      "note": null,
+      "lead": "The truth patch",
+      "itemCount": 5
+    },
+    {
+      "version": "0.8.1",
+      "date": "2026-09-04",
+      "note": null,
+      "lead": "The honest-surfaces patch",
+      "itemCount": 0
+    },
+    {
+      "version": "0.8.0",
+      "date": "2026-09-04",
+      "note": null,
+      "lead": "The trajectory release",
+      "itemCount": 10
+    },
+    {
+      "version": "0.7.0",
+      "date": "2026-09-04",
+      "note": null,
+      "lead": "The proof release",
+      "itemCount": 21
+    },
+    {
+      "version": "0.6.0",
+      "date": "2026-09-03",
+      "note": null,
+      "lead": "The correctness release",
+      "itemCount": 47
+    },
+    {
+      "version": "0.5.1",
+      "date": "2026-09-03",
+      "note": null,
+      "lead": "The verdict-integrity patch",
+      "itemCount": 9
+    },
+    {
+      "version": "0.5.0",
+      "date": "2026-08-12",
+      "note": null,
+      "lead": "The acceptance-test release",
+      "itemCount": 19
+    },
+    {
+      "version": "0.4.6",
+      "date": "2026-08-10",
+      "note": null,
+      "lead": "Security and data-integrity release",
+      "itemCount": 14
+    },
+    {
+      "version": "0.4.5",
+      "date": "2026-08-07",
+      "note": null,
+      "lead": "Security release",
+      "itemCount": 12
+    },
+    {
+      "version": "0.4.4",
+      "date": "2026-06-12",
+      "note": null,
+      "lead": null,
+      "itemCount": 2
+    },
+    {
+      "version": "0.4.3",
+      "date": "2026-05-21",
+      "note": null,
+      "lead": null,
+      "itemCount": 5
+    },
+    {
+      "version": "0.4.3-rc.0",
+      "date": "2026-05-16",
+      "note": null,
+      "lead": null,
+      "itemCount": 0
+    },
+    {
+      "version": "0.4.2",
+      "date": "2026-05-06",
+      "note": null,
+      "lead": null,
+      "itemCount": 3
+    },
+    {
+      "version": "0.4.1",
+      "date": "2026-05-06",
+      "note": "WITHDRAWN",
+      "lead": null,
+      "itemCount": 12
+    },
+    {
+      "version": "0.4.0",
+      "date": "2026-04-24",
+      "note": null,
+      "lead": null,
+      "itemCount": 28
+    },
+    {
+      "version": "0.3.1",
+      "date": "2026-04-22",
+      "note": null,
+      "lead": null,
+      "itemCount": 9
+    },
+    {
+      "version": "0.3.0",
+      "date": "2026-04-21",
+      "note": null,
+      "lead": null,
+      "itemCount": 9
+    },
+    {
+      "version": "0.2.4",
+      "date": "2026-04-17",
+      "note": null,
+      "lead": null,
+      "itemCount": 9
+    },
+    {
+      "version": "0.2.3",
+      "date": "2026-04-16",
+      "note": null,
+      "lead": null,
+      "itemCount": 5
+    },
+    {
+      "version": "0.2.2",
+      "date": "2026-04-16",
+      "note": null,
+      "lead": null,
+      "itemCount": 7
+    },
+    {
+      "version": "0.2.1",
+      "date": "2026-04-16",
+      "note": null,
+      "lead": null,
+      "itemCount": 16
+    },
+    {
+      "version": "0.2.0",
+      "date": "2026-04-14",
+      "note": null,
+      "lead": null,
+      "itemCount": 29
+    },
+    {
+      "version": "0.1.9",
+      "date": "2026-04-07",
+      "note": null,
+      "lead": null,
+      "itemCount": 7
+    },
+    {
+      "version": "0.1.8",
+      "date": "2026-03-25",
+      "note": null,
+      "lead": null,
+      "itemCount": 10
+    },
+    {
+      "version": "0.1.7",
+      "date": "2026-03-25",
+      "note": null,
+      "lead": null,
+      "itemCount": 8
+    },
+    {
+      "version": "0.1.6",
+      "date": "2026-03-23",
+      "note": null,
+      "lead": null,
+      "itemCount": 3
+    },
+    {
+      "version": "0.1.5",
+      "date": "2026-03-21",
+      "note": null,
+      "lead": null,
+      "itemCount": 21
+    },
+    {
+      "version": "0.1.4",
+      "date": "2026-03-20",
+      "note": null,
+      "lead": null,
+      "itemCount": 19
+    },
+    {
+      "version": "0.1.3",
+      "date": "2026-03-15",
+      "note": null,
+      "lead": null,
+      "itemCount": 3
+    },
+    {
+      "version": "0.1.2",
+      "date": "2026-03-14",
+      "note": null,
+      "lead": null,
+      "itemCount": 13
+    },
+    {
+      "version": "0.1.0",
+      "date": "2026-03-13",
+      "note": null,
+      "lead": null,
+      "itemCount": 35
+    }
+  ]
+}

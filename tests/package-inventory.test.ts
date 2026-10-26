@@ -1,0 +1,237 @@
+/*
+ * Every package in the repository is exactly one thing.
+ *
+ * scripts/claims/packages.mjs walks every package.json and pyproject.toml
+ * (not node_modules, not anything git ignores, and not website/, dashboard/,
+ * examples/ or tests/, which ship nothing on a registry of their own) and classifies each from its
+ * own manifest: the server release.yml publishes to npm, the Python client
+ * publish-python.yml publishes to PyPI, an npm library release.yml's
+ * publish-packages job publishes, a "private": true package, or the
+ * `iris-eval` launcher. This suite fails on anything else, and
+ * checks the workflows really do what the classification says — two in-repo
+ * packages once had install commands on public surfaces, CI jobs building
+ * them and publish workflows that could not publish, because nothing asked
+ * which of these each one was.
+ */
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+// @ts-ignore — plain .mjs module
+import { LAUNCHER_DIR, LAUNCHER_SERVER_RANGE, LAUNCHER_VERSION, NPM_PACKAGE_DIRS, PYPI_DIR, RELEASED_WITH_SERVER, findManifests, inventory } from '../scripts/claims/packages.mjs';
+// @ts-ignore — plain .mjs module
+import { PUBLISH_ORDER, RELEASE_ORDER, packageProblems } from '../scripts/check-npm-packages.mjs';
+
+const ROOT = resolve(__dirname, '..');
+const read = (rel: string): string => readFileSync(join(ROOT, rel), 'utf8').replace(/\r\n/g, '\n');
+
+type Entry = { manifest: string; dir: string; key: string; name: string | null; version: string | null; kind: string; published: boolean; reason?: string };
+const packages = inventory() as Entry[];
+const workflows = readdirSync(join(ROOT, '.github', 'workflows')).filter((f) => /\.ya?ml$/.test(f));
+
+describe('the package inventory', () => {
+  it('classifies every manifest in the repository as release, pypi, npm, private or launcher', () => {
+    const unclassified = packages.filter((p) => p.kind === 'unclassified').map((p) => `${p.manifest}: ${p.reason}`);
+    expect(unclassified).toEqual([]);
+  });
+
+  it('walks the tree it says it walks: the server, the Python client and the launcher are found, excluded directories are not', () => {
+    const manifests = findManifests() as string[];
+    expect(manifests).toContain('package.json');
+    expect(manifests).toContain(`${PYPI_DIR}/pyproject.toml`);
+    expect(manifests).toContain(`${LAUNCHER_DIR}/package.json`);
+    for (const m of manifests) expect(m, m).not.toMatch(/^(website|dashboard|examples|tests)\/|(^|\/)node_modules\//);
+  });
+
+  it('leaves out a manifest git ignores, and keeps one that is new and not ignored', () => {
+    // A leftover directory the repository ignores is not a package Iris
+    // ships: a manifest inside one once reached the truthbase from a
+    // checkout that happened to hold it.
+    const root = mkdtempSync(join(tmpdir(), 'iris-inventory-'));
+    try {
+      const git = (...args: string[]): void => void execFileSync('git', ['-C', root, ...args], { stdio: 'ignore' });
+      git('init', '-q');
+      writeFileSync(join(root, '.gitignore'), 'leftover/');
+      writeFileSync(join(root, 'package.json'), '{}');
+      for (const dir of ['leftover', 'fresh']) {
+        mkdirSync(join(root, dir));
+        writeFileSync(join(root, dir, 'package.json'), '{}');
+      }
+      expect(findManifests(root)).toEqual(['fresh/package.json', 'package.json']);
+    } finally {
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    }
+  });
+
+  it('has exactly one package of each released kind', () => {
+    expect(packages.filter((p) => p.kind === 'release').map((p) => p.dir)).toEqual(['.']);
+    expect(packages.filter((p) => p.kind === 'pypi').map((p) => p.dir)).toEqual([PYPI_DIR]);
+    expect(packages.filter((p) => p.kind === 'launcher').map((p) => p.dir)).toEqual([LAUNCHER_DIR]);
+    expect(packages.filter((p) => p.kind === 'npm').map((p) => p.dir).sort()).toEqual([...NPM_PACKAGE_DIRS].sort());
+  });
+
+  it('the npm libraries and the launcher can be published as they stand, in an order where each comes after what it depends on', () => {
+    expect(PUBLISH_ORDER).toEqual([...NPM_PACKAGE_DIRS, LAUNCHER_DIR]);
+    expect(packageProblems()).toEqual([]);
+  });
+
+  it('a release publishes only the packages it can, and says which: the recorded list, in publish order, possibly empty', () => {
+    // Every library and the launcher has a recorded answer, and nothing else does.
+    expect(Object.keys(RELEASED_WITH_SERVER).sort()).toEqual([...PUBLISH_ORDER].sort());
+    for (const v of Object.values(RELEASED_WITH_SERVER)) expect(typeof v).toBe('boolean');
+    const released = RELEASED_WITH_SERVER as Record<string, boolean>;
+    expect(RELEASE_ORDER).toEqual(PUBLISH_ORDER.filter((d: string) => released[d] === true));
+    const printed = execFileSync(process.execPath, [join(ROOT, 'scripts', 'check-npm-packages.mjs'), '--order'], { encoding: 'utf8' });
+    expect(printed.split('\n').filter((l) => l !== '')).toEqual(RELEASE_ORDER);
+  });
+
+  it('the launcher depends on the server alone, at the open-ended range, and has the frozen version', () => {
+    const pkg = JSON.parse(read(`${LAUNCHER_DIR}/package.json`));
+    expect(pkg.version).toBe(LAUNCHER_VERSION);
+    expect(pkg.dependencies).toEqual({ [JSON.parse(read('package.json')).name]: LAUNCHER_SERVER_RANGE });
+    for (const field of ['devDependencies', 'peerDependencies', 'optionalDependencies']) expect(pkg[field], field).toBeUndefined();
+  });
+});
+
+describe('the workflows do what the classification says', () => {
+  it('release.yml packs the root package and publishes that tarball — the server\'s jobs touch nothing in packages/', () => {
+    const release = read('.github/workflows/release.yml');
+    const name = JSON.parse(read('package.json')).name as string;
+    const tarball = `${name.replace(/^@/, '').replace('/', '-')}-*.tgz`;
+    expect(release).toContain(`ls -1 ${tarball}`);
+    expect(release).toMatch(/npm publish "\.\/\$TARBALL"/);
+    expect(release).not.toMatch(/working-directory:\s*packages\//);
+    // Only build-packages builds anything under packages/ (the libraries and the launcher, below).
+    const withoutPackagesJob = release.replace(/\n {2}build-packages:\n[\s\S]*?(?=\n {2}[a-z][a-z0-9-]*:\n)/, '\n');
+    expect(withoutPackagesJob).not.toMatch(/cd packages\//);
+    expect(release.match(/cd packages\/[a-z-]+/g)?.sort()).toEqual(['cd packages/langchain', 'cd packages/sdk']);
+  });
+
+  it('release.yml builds the MCPB bundle from that same tarball and attaches it to the release, not to a package registry', () => {
+    const release = read('.github/workflows/release.yml');
+    expect(release).toContain('TARBALL: ${{ needs.build-npm.outputs.tarball }}');
+    expect(release).toContain('node scripts/mcpb/pack.mjs --tarball "$TARBALL" --out iris-eval.mcpb');
+    expect(release).toContain('./release-assets/iris-eval.mcpb');
+    // One bundle, not a package of its own: nothing in the repository declares it, and the workflows publish it nowhere else.
+    expect(packages.some((p) => p.dir === 'mcpb')).toBe(false);
+    for (const f of workflows) expect(read(`.github/workflows/${f}`), f).not.toMatch(/(npm|smithery)[^\n]*publish[^\n]*\.mcpb/);
+  });
+
+  it('publish-python.yml builds and publishes the Python client from its directory', () => {
+    const py = read('.github/workflows/publish-python.yml');
+    expect(py).toContain(`python -m build --no-isolation ${PYPI_DIR}`);
+    expect(py).toContain(`${PYPI_DIR}/pyproject.toml`);
+    expect(py).toMatch(/pypa\/gh-action-pypi-publish@/);
+  });
+
+  /*
+   * 2026-09 release review: publish-python.yml published from any py-v* tag,
+   * wherever it pointed, and built with an unpinned `build` that fetched an
+   * unpinned backend. The PyPI path now matches release.yml's rules.
+   */
+  it('publish-python.yml publishes only a tag on main whose required checks passed, built with hash-pinned tools and no second download', () => {
+    const py = read('.github/workflows/publish-python.yml');
+    expect(py).toContain('git merge-base --is-ancestor "$GITHUB_SHA" origin/main');
+    expect(py).toContain('node scripts/ci/require-checks-passed.mjs "$GITHUB_SHA"');
+    expect(py).toContain('checks: read');
+    expect(py).toContain('fetch-depth: 0');
+    expect(py).toContain('python -m pip install --require-hashes --only-binary :all: -r .github/requirements/build.txt');
+    expect(py).not.toMatch(/pip install (--upgrade )?build\b/);
+    // Every requirement carries a hash, and the backend pyproject.toml names is among them.
+    const reqs = read('.github/requirements/build.txt');
+    const pins = reqs.match(/^[a-z0-9._-]+==[^\s]+/gim) ?? [];
+    expect(pins.length).toBeGreaterThan(0);
+    for (const pin of pins) {
+      const block = reqs.slice(reqs.indexOf(pin)).split(/\n(?=[a-z0-9])/i)[0];
+      expect(block, pin).toMatch(/--hash=sha256:[0-9a-f]{64}/);
+    }
+    const backend = /requires = \["([a-z0-9_-]+)/i.exec(read(`${PYPI_DIR}/pyproject.toml`))![1];
+    expect(pins.map((p) => p.split('==')[0].toLowerCase())).toEqual(expect.arrayContaining(['build', backend]));
+  });
+
+  /*
+   * The libraries and the launcher (S5 of the 2026-09 release review): their
+   * first versions would otherwise have gone out by hand, without provenance,
+   * the way iris-eval@1.0.0 did.
+   */
+  it('release.yml packs the libraries and the launcher without an identity and publishes those tarballs with provenance', () => {
+    const release = read('.github/workflows/release.yml');
+    const job = (name: string): string => {
+      const start = release.indexOf(`\n  ${name}:\n`);
+      expect(start, name).toBeGreaterThan(-1);
+      const next = release.slice(start + 1).search(/\n {2}[a-z][a-z0-9-]*:\n/);
+      return (next < 0 ? release.slice(start) : release.slice(start, start + 1 + next))
+        .split('\n')
+        .filter((l) => !/^\s*#/.test(l))
+        .join('\n');
+    };
+    const build = job('build-packages');
+    expect(build).not.toContain('id-token');
+    expect(build).toContain('node scripts/check-npm-packages.mjs');
+    expect(build).toContain('$(node scripts/check-npm-packages.mjs --order)');
+    expect(build).toContain("if: ${{ !contains(github.ref_name, '-') }}");
+    const publish = job('publish-packages');
+    expect(publish).toContain('id-token: write');
+    expect(publish).toMatch(/needs: \[build-packages, publish-npm\]/);
+    expect(publish).not.toMatch(/npm (ci|install|run)\b/);
+    expect(publish).not.toContain('actions/checkout');
+    expect(publish).toMatch(/npm publish "\.\/\$tarball" --provenance --access public --ignore-scripts/);
+    expect(publish).toContain('done < order.txt');
+    const verify = job('verify-release');
+    expect(verify).toMatch(/needs: \[[^\]]*publish-packages[^\]]*\]/);
+    expect(verify).toContain("needs.publish-packages.result == 'success' || needs.publish-packages.result == 'skipped'");
+    expect(verify).toContain('.dist.attestations.provenance.predicateType');
+    expect(verify).toContain('https://slsa.dev/provenance/v1');
+  });
+
+  it('SECURITY.md\'s scope names everything this repository publishes', () => {
+    const scope = read('SECURITY.md').split('## Scope')[1].split('\n## ')[0];
+    for (const p of packages.filter((x) => x.kind !== 'private')) expect(scope, p.manifest).toContain(`\`${p.name}\``);
+    for (const artifact of ['`ghcr.io/iris-eval/mcp-server`', '`iris-eval.mcpb`', '.github/actions/gate']) expect(scope).toContain(artifact);
+  });
+
+  it('no other workflow publishes a package to any registry', () => {
+    const publishers = workflows.filter((f) => /npm publish|pypa\/gh-action-pypi-publish|twine upload|yarn npm publish|pnpm publish/.test(read(`.github/workflows/${f}`)));
+    expect(publishers.sort()).toEqual(['publish-python.yml', 'release.yml']);
+  });
+
+  /*
+   * A private package may be built and tested in CI: that is how one earns
+   * its first publish (the JavaScript SDK's wrappers are proven end to end
+   * before anyone can install them). What CI must not do is present it as
+   * shipped. So the job that runs it says, in its own text, that it is not
+   * yet published, and nothing uploads its tarball anywhere. Publishing is
+   * held by the test above: only release.yml and publish-python.yml publish.
+   */
+  it('a job that builds or tests a private package says it is not yet published, and ships nothing', () => {
+    /** Each top-level job with the comment lines written above it: the text a reader of that job sees. */
+    const jobsOf = (text: string): Array<{ id: string; text: string }> => {
+      const lines = text.split('\n');
+      const jobs: Array<{ id: string; lines: string[] }> = [];
+      let pending: string[] = [];
+      for (const line of lines.slice(lines.findIndex((l) => /^jobs:\s*$/.test(l)) + 1)) {
+        const head = /^ {2}([\w-]+):\s*$/.exec(line);
+        if (head) {
+          jobs.push({ id: head[1], lines: [...pending, line] });
+          pending = [];
+        } else if (/^ {2}#/.test(line) || line.trim() === '') {
+          pending.push(line);
+        } else if (jobs.length > 0) {
+          jobs[jobs.length - 1].lines.push(...pending, line);
+          pending = [];
+        }
+      }
+      return jobs.map((j) => ({ id: j.id, text: j.lines.join('\n') }));
+    };
+    for (const p of packages.filter((x) => x.kind === 'private')) {
+      const runs = new RegExp(`(cd|working-directory:)\\s*${p.dir.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\b`);
+      for (const f of workflows) {
+        for (const job of jobsOf(read(`.github/workflows/${f}`)).filter((j) => runs.test(j.text))) {
+          expect(job.text, `${f} job ${job.id} runs ${p.dir} without saying it is not yet published`).toMatch(/not yet published/i);
+          expect(job.text, `${f} job ${job.id} uploads something while running ${p.dir}`).not.toMatch(/upload-artifact|npm publish/);
+        }
+      }
+    }
+  });
+});

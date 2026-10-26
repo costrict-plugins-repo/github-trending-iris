@@ -1,0 +1,15 @@
+node_modules
+.git
+coverage
+*.db
+*.db-journal
+*.db-wal
+.env
+.env.*
+dist
+docs
+examples
+scripts
+# The build runs this one (package.json build:dashboard).
+!scripts/build-dashboard.mjs
+dashboard/node_modules

@@ -1,0 +1,160 @@
+{
+  "name": "@iris-eval/mcp-server",
+  "version": "0.21.0",
+  "description": "Stop shipping agents on vibes. Score every agent output for quality, safety, and cost.",
+  "mcpName": "io.github.iris-eval/mcp-server",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./engine": {
+      "types": "./dist/engine.d.ts",
+      "default": "./dist/engine.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    },
+    "./dist/*": "./dist/*",
+    "./package.json": "./package.json",
+    "./server.json": "./server.json"
+  },
+  "bin": {
+    "iris-eval": "dist/index.js",
+    "iris-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "npm run build:dashboard && npm run build:server",
+    "build:server": "tsc -p tsconfig.build.json",
+    "build:dashboard": "node scripts/build-dashboard.mjs",
+    "prepack": "node scripts/check-pack.mjs",
+    "verify:release": "node scripts/verify-release.mjs",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "lint": "eslint --cache --cache-location node_modules/.cache/eslint/ src/ tests/ packages/sdk/src/ packages/sdk/test/ packages/langchain/src/ packages/langchain/test/",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc/src.tsbuildinfo",
+    "typecheck:tests": "tsc -p tsconfig.tests.json --incremental --tsBuildInfoFile node_modules/.cache/tsc/tests.tsbuildinfo && tsc -p tsconfig.e2e.json --incremental --tsBuildInfoFile node_modules/.cache/tsc/e2e.tsbuildinfo",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "vitest run tests/integration/",
+    "test:e2e": "playwright test",
+    "test:uat": "node tests/uat/run-uat.mjs",
+    "test:e2e:ui": "playwright test --ui",
+    "version:check": "bash scripts/check-version.sh",
+    "version:sync": "node scripts/sync-versions.mjs",
+    "claims:capture-tests": "node scripts/claims/capture-tests.mjs",
+    "claims:generate": "node scripts/claims/generate.mjs",
+    "claims:generate:live": "node scripts/claims/generate.mjs --live",
+    "claims:check": "node scripts/claims/generate.mjs --check",
+    "claims:check-hardcoded": "node scripts/claims/check-no-hardcoded.mjs",
+    "compare:verify": "node scripts/verify-compare-quotes.mjs",
+    "schema:render": "tsx scripts/render-response-schema.mts",
+    "schema:check": "tsx scripts/render-response-schema.mts --check",
+    "preflight": "node scripts/preflight.mjs",
+    "proof": "tsx proof/run.ts",
+    "proof:typecheck": "tsc -p proof/tsconfig.json",
+    "proof:review": "tsx proof/human-review.ts",
+    "llms:render": "tsx scripts/claims/render-llms.mjs",
+    "llms:check": "tsx scripts/claims/render-llms.mjs --check",
+    "changelog:render": "node website/scripts/render-changelog.mjs",
+    "changelog:check": "node website/scripts/render-changelog.mjs --check",
+    "mcp-json:render": "tsx scripts/claims/render-mcp-json.ts",
+    "mcp-json:check": "tsx scripts/claims/render-mcp-json.ts --check",
+    "cusum:render": "tsx scripts/cusum/render-thresholds.ts",
+    "cusum:check": "tsx scripts/cusum/render-thresholds.ts --check",
+    "unicode61:render": "tsx scripts/search/render-unicode61.ts",
+    "unicode61:check": "tsx scripts/search/render-unicode61.ts --check",
+    "proof:judge": "tsx proof/judge/run.ts",
+    "proof:judge:typecheck": "tsc -p proof/judge/tsconfig.json",
+    "clean": "rm -rf dist coverage",
+    "seed:demo": "tsx scripts/seed-demo-data.ts",
+    "demo": "tsx scripts/demo.ts"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "agent",
+    "ai-agent",
+    "evaluation",
+    "observability",
+    "tracing",
+    "llm",
+    "claude",
+    "agent-evaluation",
+    "ai-observability",
+    "pii-detection",
+    "cost-tracking",
+    "agent-eval",
+    "output-quality",
+    "quality-gate"
+  ],
+  "author": {
+    "name": "Iris",
+    "email": "hello@iris-eval.com",
+    "url": "https://github.com/iris-eval"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iris-eval/mcp-server.git"
+  },
+  "homepage": "https://iris-eval.com",
+  "bugs": {
+    "url": "https://github.com/iris-eval/mcp-server/issues"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "server.json"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "overrides": {
+    "brace-expansion": "^5.0.12",
+    "fast-uri": "^3.1.9",
+    "ip-address": "^10.7.4",
+    "postcss": "^8.5.25",
+    "@hono/node-server": "^2.1.0",
+    "tmp": "^0.2.6"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "ajv": "^8.17.1",
+    "body-parser": "^2.4.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.3.2",
+    "helmet": "^8.1.0",
+    "pino": "^10.3.1",
+    "safe-regex2": "^5.1.0",
+    "zod": "^4.6.7"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^12.8.0"
+  },
+  "devDependencies": {
+    "@anthropic-ai/mcpb": "2.1.2",
+    "@playwright/test": "^1.59.1",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^26.1.1",
+    "@typescript-eslint/eslint-plugin": "^8.58.0",
+    "@typescript-eslint/parser": "^8.58.0",
+    "@vitest/coverage-v8": "^5.0.3",
+    "eslint": "^10.2.0",
+    "fast-check": "^4.8.0",
+    "prettier": "^3.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.3"
+  }
+}

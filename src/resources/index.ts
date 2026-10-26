@@ -1,0 +1,154 @@
+/*
+ * The resources, registered the way the SDK wants them: fixed URIs with
+ * registerResource, parameterised ones with a ResourceTemplate (so a
+ * client's resources/templates/list shows the shape, and the SDK parses
+ * the variable instead of the handler splitting a path). A resource that
+ * does not exist is the protocol's resource-not-found error, never a 200
+ * body with an "error" key a client would have to sniff for.
+ */
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpError } from '@modelcontextprotocol/sdk/types.js';
+import type { IStorageAdapter } from '../types/query.js';
+import type { Capabilities } from '../capabilities.js';
+import { ruleProof } from '../capabilities.js';
+import { publishedProvenance, publishedRuleNames } from '../eval/accuracy.js';
+import { toEvaluationResponse } from '../eval/response.js';
+import { LOCAL_TENANT } from '../types/tenant.js';
+import { readAuditLog } from '../audit-log-reader.js';
+import { fenceEvaluation, fenceRecord, fenceValue, newFence, TRACE_OWN_FIELDS, untrustedHeader } from '../tools/untrusted.js';
+import {
+  AUDIT_RESOURCE_URI,
+  CAPABILITIES_RESOURCE_URI,
+  DASHBOARD_SUMMARY_RESOURCE_URI,
+  EVALUATION_RESOURCE_TEMPLATE,
+  PROOF_RESOURCE_URI,
+  TRACE_RESOURCE_TEMPLATE,
+} from './uris.js';
+
+/** The MCP resource-not-found code (the spec reserves -32002 for it). */
+export const RESOURCE_NOT_FOUND = -32002;
+
+function notFound(uri: string, what: string): McpError {
+  return new McpError(RESOURCE_NOT_FOUND, `Resource not found: ${uri} — no ${what} with that id is stored for this tenant`, { uri });
+}
+
+const json = (uri: string, body: unknown) => ({
+  contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(body, null, 2) }],
+});
+
+export function registerAllResources(
+  server: McpServer,
+  storage: IStorageAdapter,
+  capabilities: () => Capabilities,
+  /** The audit log the rule store writes; iris://audit reads the same file the dashboard's Audit page does. */
+  auditPath?: string,
+): void {
+  server.registerResource(
+    'capabilities',
+    CAPABILITIES_RESOURCE_URI,
+    {
+      title: 'Capabilities',
+      description:
+        'What this server can judge: the rule roster with what each rule needs and its published accuracy, the judge state with the steps that enable it, the citation verifier posture, the dashboard address, the limits, and the tools, resources and prompts registered.',
+      mimeType: 'application/json',
+    },
+    async (uri) => json(uri.href, capabilities()),
+  );
+
+  server.registerResource(
+    'proof',
+    PROOF_RESOURCE_URI,
+    {
+      title: 'Proof',
+      description:
+        'The published accuracy of every measured built-in rule (the same numbers as https://iris-eval.com/proof): precision and recall on the proof corpus with 95% intervals, the confusion counts, positive predictive value at four prevalences, and the corpus version and labelling the numbers come from.',
+      mimeType: 'application/json',
+    },
+    async (uri) => {
+      const prov = publishedProvenance();
+      const rules: Record<string, unknown> = {};
+      for (const name of publishedRuleNames()) rules[name] = ruleProof(name);
+      return json(uri.href, {
+        corpusVersion: prov.corpusVersion,
+        release: prov.release,
+        labelling: prov.labelling,
+        method:
+          'Each rule is run over its proof-corpus family; precision and recall carry Wilson 95% intervals; ppvAt is the positive predictive value at the stated prevalence, from the same counts. Reproduce with `npm run proof` in the repository.',
+        rules,
+      });
+    },
+  );
+
+  server.registerResource(
+    'dashboard-summary',
+    DASHBOARD_SUMMARY_RESOURCE_URI,
+    { title: 'Dashboard summary', description: 'Dashboard summary with key metrics and trends for the last hour', mimeType: 'application/json' },
+    async (uri) => {
+      // Agent names and the other labels in it were written by callers: fenced unless they cannot carry a sentence (tools/untrusted.ts).
+      const fence = newFence();
+      const summary = fenceValue(fence, 'summary', await storage.getDashboardSummary(LOCAL_TENANT)) as object;
+      return json(uri.href, { ...untrustedHeader(fence), ...summary });
+    },
+  );
+
+  /*
+   * The audit log, readable where the agent and its operator already are
+   * (2026-09-23): rule deploys, deletes, toggles and updates, and
+   * trace deletions, newest first. Before this only the dashboard could show
+   * it, so an agent that removed a rule or a trace left a record nobody on
+   * the MCP side could read.
+   */
+  server.registerResource(
+    'audit',
+    AUDIT_RESOURCE_URI,
+    {
+      title: 'Audit log',
+      description: 'The newest 100 audit entries, newest first: every rule deploy, delete, toggle and update, and every trace deletion, with its time and what it touched',
+      mimeType: 'application/json',
+    },
+    async (uri) => {
+      const { entries, total } = readAuditLog({ limit: 100, filePath: auditPath });
+      // Rule names and descriptions in it were written by callers.
+      const fence = newFence();
+      const mine = entries.filter((e) => (e.tenantId ?? LOCAL_TENANT) === LOCAL_TENANT).map((e) => fenceRecord(fence, e));
+      return json(uri.href, { ...untrustedHeader(fence), total, entries: mine });
+    },
+  );
+
+  server.registerResource(
+    'trace-detail',
+    new ResourceTemplate(TRACE_RESOURCE_TEMPLATE, { list: undefined }),
+    { title: 'Trace', description: 'One stored trace with its spans and every evaluation linked to it', mimeType: 'application/json' },
+    async (uri, variables) => {
+      const traceId = String(variables.trace_id ?? '');
+      const trace = await storage.getTrace(LOCAL_TENANT, traceId);
+      if (!trace) throw notFound(uri.href, 'trace');
+      const [spans, evals] = await Promise.all([
+        storage.getSpansByTraceId(LOCAL_TENANT, traceId),
+        storage.getEvalsByTraceId(LOCAL_TENANT, traceId),
+      ]);
+      // Everything the trace and its spans carry was written outside Iris; of the evaluations, only what a caller or a judge wrote (tools/untrusted.ts).
+      const fence = newFence();
+      const body = {
+        trace: fenceRecord(fence, trace, TRACE_OWN_FIELDS),
+        spans: spans.map((s) => fenceRecord(fence, s)),
+        evals: evals.map((e) => fenceEvaluation(fence, toEvaluationResponse(e, { traceId }))),
+      };
+      return json(uri.href, { ...untrustedHeader(fence), ...body });
+    },
+  );
+
+  server.registerResource(
+    'evaluation-detail',
+    new ResourceTemplate(EVALUATION_RESOURCE_TEMPLATE, { list: undefined }),
+    { title: 'Evaluation', description: 'One stored evaluation, in the same shape evaluate_output returned it: verdict, coverage, provenance and every rule result with its evidence', mimeType: 'application/json' },
+    async (uri, variables) => {
+      const id = String(variables.id ?? '');
+      const result = await storage.getEvalById(LOCAL_TENANT, id);
+      if (!result) throw notFound(uri.href, 'evaluation');
+      const fence = newFence();
+      const body = fenceEvaluation(fence, toEvaluationResponse(result, { traceId: result.trace_id }));
+      return json(uri.href, { ...untrustedHeader(fence), ...body });
+    },
+  );
+}

@@ -1,0 +1,187 @@
+{
+  "schemaVersion": 1,
+  "rule": "min_output_length",
+  "category": "completeness",
+  "family": "minlen",
+  "positiveClass": "fail",
+  "definition": "min_output_length — the output must meet a minimum character count: pass when output.length ≥ min_length, default 50 (config keys min_output_length / min_length). docs/api-reference.md §Completeness Rules. Positive = fewer than 50 characters (the rule should FAIL).",
+  "source": "LLM-authored on 2026-09-04. Held out on 2026-09-23: the 7 case(s) copied from, varied from or modelled on the 24 real transcripts in tests/fixtures/real-transcripts (minlen-023, minlen-024, minlen-025, minlen-026, minlen-027, minlen-028, minlen-029) were removed, so no number this family publishes is estimated on a transcript, and the transcript line in proof/TRANSCRIPTS.md and proof/COMPOSITE.md is measured on cases none of these rates were estimated from. 2 replacement case(s), authored the same day and marked in their notes, bring the family back to the 24-case floor the runner enforces.",
+  "labelling": "LLM-authored and LLM-labelled against the documented definition on 2026-09-04; boundary strings were length-checked by script.",
+  "labelBasis": "definition",
+  "authored": "2026-09-04",
+  "counts": {
+    "n": 24,
+    "positive": 13,
+    "negative": 11
+  },
+  "cases": [
+    {
+      "id": "minlen-001",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "",
+      "notes": "Empty output: zero characters (0 chars < 50)"
+    },
+    {
+      "id": "minlen-002",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "OK.",
+      "notes": "Bare acknowledgement (3 chars < 50)"
+    },
+    {
+      "id": "minlen-003",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "Yes.",
+      "notes": "One-word answer (4 chars < 50)"
+    },
+    {
+      "id": "minlen-004",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "42",
+      "notes": "A number and nothing else (2 chars < 50)"
+    },
+    {
+      "id": "minlen-005",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "See docs.",
+      "notes": "Pointer with no content (9 chars < 50)"
+    },
+    {
+      "id": "minlen-006",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "The port is 4748.",
+      "notes": "Correct but under the documented minimum (17 chars < 50)"
+    },
+    {
+      "id": "minlen-007",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "Done — see above.",
+      "notes": "Refers to content that is not in the output (17 chars < 50)"
+    },
+    {
+      "id": "minlen-008",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "I couldn't find that file.",
+      "notes": "Short failure report (26 chars < 50)"
+    },
+    {
+      "id": "minlen-009",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "Fixed in v0.6.0; upgrade and retry.",
+      "notes": "Terse instruction (35 chars < 50)"
+    },
+    {
+      "id": "minlen-010",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "   Yes.   ",
+      "notes": "Whitespace padding does not reach the minimum (10 chars < 50)"
+    },
+    {
+      "id": "minlen-011",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "The dashboard binds port 4748 by default; pass --",
+      "notes": "Boundary: one character under the default minimum (49 chars < 50)"
+    },
+    {
+      "id": "minlen-012",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "Iris registers nine MCP tools; see src/tools.",
+      "notes": "Just under the minimum with real content (45 chars < 50)"
+    },
+    {
+      "id": "minlen-013",
+      "rule": "min_output_length",
+      "label": "positive",
+      "output": "Restart, then run npm test again.",
+      "notes": "Terse instruction (33 chars < 50)"
+    },
+    {
+      "id": "minlen-014",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "The dashboard binds port 4748 by default; pass --p",
+      "notes": "Boundary: exactly the default minimum (50 chars ≥ 50)"
+    },
+    {
+      "id": "minlen-015",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "The dashboard binds port 4748 by default; pass --po",
+      "notes": "Boundary: one character over the default minimum (51 chars ≥ 50)"
+    },
+    {
+      "id": "minlen-016",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "                                                            ",
+      "notes": "Documented definition is a character count, so sixty spaces satisfy it; a reader would call this empty — the boundary is disclosed, the label follows the definition (60 chars ≥ 50)"
+    },
+    {
+      "id": "minlen-017",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "The dashboard listens on 127.0.0.1:4748 by default. Pass --port <n> to change it, or set IRIS_PORT.",
+      "notes": "Ordinary complete answer (99 chars ≥ 50)"
+    },
+    {
+      "id": "minlen-018",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "No — Iris sends no telemetry. There is no IRIS_TELEMETRY variable; nothing in src/ makes an outbound call unless you configure a judge key, citation fetching or an OTel endpoint.",
+      "notes": "Complete answer (178 chars ≥ 50)"
+    },
+    {
+      "id": "minlen-019",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "```\nnpm install -g @iris-eval/mcp-server\niris-mcp --self-test\n```\nThat prints PASS when the install works.",
+      "notes": "Code block plus a sentence (106 chars ≥ 50)"
+    },
+    {
+      "id": "minlen-020",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "- log_trace\n- evaluate_output\n- get_traces\n- list_rules\n- deploy_rule\n- delete_rule\n- delete_trace",
+      "notes": "A list whose characters exceed the minimum (98 chars ≥ 50)"
+    },
+    {
+      "id": "minlen-021",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "The retention sweep deletes evaluations older than retention.days as well as traces, and truncates the WAL afterwards.",
+      "notes": "Complete answer (118 chars ≥ 50)"
+    },
+    {
+      "id": "minlen-022",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "notes": "Boundary: fifty characters of filler; the definition counts characters, not content (50 chars ≥ 50)"
+    },
+    {
+      "id": "minlen-030",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "The build failed on the lint step; two files use tabs where the config requires spaces.",
+      "notes": "A complete one-sentence answer (87 chars ≥ 50). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "minlen-031",
+      "rule": "min_output_length",
+      "label": "negative",
+      "output": "Found 3 matching rows in orders where status is 'pending' and created_at is older than 30 days.",
+      "notes": "A query result stated in full (95 chars ≥ 50). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    }
+  ]
+}
