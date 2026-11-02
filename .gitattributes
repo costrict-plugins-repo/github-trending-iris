@@ -1,0 +1,58 @@
+# Proof corpus, results and report are byte-compared in CI (npm run proof -- --check):
+# keep them LF on every platform so the corpus hash and the diff are the same on Windows and Linux.
+proof/corpus/*.json text eol=lf
+proof/results.json text eol=lf
+proof/RESULTS.md text eol=lf
+
+# Rendered surfaces are byte-compared with their render (npm run llms:check, tests/claims-trust-surfaces):
+# keep templates, renderer and outputs LF on every platform, or a Windows checkout disagrees with CI.
+website/public/llms.txt text eol=lf
+website/public/llms-full.txt text eol=lf
+website/llms.template.txt text eol=lf
+website/llms-full.template.txt text eol=lf
+skills/iris-eval/SKILL.template.md text eol=lf
+skills/iris-eval/SKILL.md text eol=lf
+claude-plugin/skills/iris-eval/SKILL.md text eol=lf
+scripts/claims/render-llms.mjs text eol=lf
+src/eval/published-accuracy.ts text eol=lf
+
+# 0.10.0 additions to the same two rules: the composite corpus and its results, the conformance families,
+# the blind-sample manifest, and the rendered capability and evaluator documents with their templates.
+proof/composite/*.json text eol=lf
+proof/composite-results.json text eol=lf
+proof/COMPOSITE.md text eol=lf
+proof/corpus/custom/*.json text eol=lf
+proof/blind-sample.json text eol=lf
+docs/capabilities.template.md text eol=lf
+docs/capabilities.md text eol=lf
+docs/evaluators.template.md text eol=lf
+docs/evaluators.md text eol=lf
+
+# The outside line (npm run proof -- --outside): AgentDojo's run logs are checked byte for byte against the
+# git blob hashes AgentDojo's repository lists, so they must reach every checkout exactly as published (LF);
+# the results are byte-compared in CI like the lines above.
+proof/outside/** text eol=lf
+proof/outside-results.json text eol=lf
+proof/OUTSIDE.md text eol=lf
+
+# Git hooks run under sh: a carriage return after the shebang would stop them on any platform.
+scripts/git-hooks/* text eol=lf
+
+# Test snapshots: vitest writes them with LF and rewrites a CRLF checkout on every run, so a Windows
+# checkout without this came out of each test run with a snapshot file changed and nothing in it different.
+*.snap text eol=lf
+
+# The iris-eval launcher is packed from a checkout (release.yml does it on
+# Linux; 1.0.0 was packed by hand): its bin must start with an LF shebang on
+# every platform: a carriage return after "node" fails on macOS and Linux
+# under installers that do not rewrite it.
+packages/iris-eval/** text eol=lf
+
+# The MCPB bundle icon (mcpb/manifest.json): bytes, never a text conversion.
+mcpb/icon.png binary
+
+# SQLite files written by released versions for the migration tests: bytes, never text.
+tests/fixtures/db/*.db binary
+
+# Run by the site host with sh on Linux: a carriage return would break it.
+website/scripts/*.sh text eol=lf

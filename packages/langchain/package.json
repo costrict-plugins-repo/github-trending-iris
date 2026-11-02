@@ -1,0 +1,79 @@
+{
+  "name": "@iris-eval/langchain",
+  "version": "0.1.0",
+  "description": "A LangChain.js and LangGraph.js callback handler that sends each run to Iris as one OpenTelemetry trace and gets its verdict.",
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "test": "node scripts/build.mjs --tests"
+  },
+  "keywords": [
+    "iris",
+    "langchain",
+    "langgraph",
+    "callbacks",
+    "opentelemetry",
+    "genai",
+    "tracing",
+    "evaluation",
+    "agent-eval",
+    "llm"
+  ],
+  "author": {
+    "name": "Iris",
+    "email": "hello@iris-eval.com",
+    "url": "https://github.com/iris-eval"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iris-eval/mcp-server.git",
+    "directory": "packages/langchain"
+  },
+  "homepage": "https://iris-eval.com",
+  "bugs": {
+    "url": "https://github.com/iris-eval/mcp-server/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@iris-eval/sdk": "^0.1.0",
+    "@langchain/core": ">=0.3.0"
+  },
+  "devDependencies": {
+    "@iris-eval/sdk": "file:../sdk",
+    "@langchain/core": "^1.2.20",
+    "@langchain/langgraph": "^1.5.1",
+    "@types/node": "^22.19.0",
+    "typescript": "^6.0.3",
+    "zod": "^4.6.7"
+  }
+}

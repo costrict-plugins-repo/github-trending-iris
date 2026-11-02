@@ -1,0 +1,214 @@
+/*
+ * POST /v1/traces — OTLP/HTTP JSON in.
+ *
+ * The path is the one every OTLP exporter already posts to, so pointing a
+ * collector's `otlphttp` exporter — or an SDK's `OTEL_EXPORTER_OTLP_ENDPOINT`
+ * — at this server is the whole integration. Mounted on the dashboard
+ * port beside the REST API, behind the same key, the same DNS-rebinding
+ * guard and the same limiter; JSON only (the OTLP/HTTP protobuf encoding
+ * is answered 415 naming the JSON one).
+ *
+ * The answer is OTLP's ExportTraceServiceResponse — `{}` when every span
+ * was accepted, `partialSuccess` when some were dropped — plus an
+ * `iris-eval` block an operator can read: the Iris trace id each OTLP trace became,
+ * how many spans and steps it carries, what it lacked, and the evaluation
+ * when the trace carried an output and either `otel.evaluateOnIngest` is on
+ * or the sender asked for it (`iris.evaluate` on the resource or the root
+ * span, with an optional `iris.eval_type`).
+ * Nothing here re-exports: a trace that arrived by OTLP never goes back
+ * out to IRIS_OTEL_ENDPOINT, which may well be the collector that sent it.
+ */
+import type { Router } from 'express';
+import { traceContextFrom, withTraceContext } from '../../otel/trace-context.js';
+import type { IStorageAdapter } from '../../types/query.js';
+import type { EvalEngine } from '../../eval/engine.js';
+import type { CustomRuleStore } from '../../custom-rule-store.js';
+import type { Trace } from '../../types/trace.js';
+import { requireTenant } from '../../middleware/tenant.js';
+import { fromOtlp, otlpTraceRequestSchema } from '../../otel/ingest.js';
+import { decodeExportTraceServiceRequest, OtlpProtobufError, OtlpTooManyElementsError } from '../../otel/protobuf.js';
+import { toSteps } from '../../eval/steps.js';
+import { evaluateStoredTrace } from '../../eval/ingest.js';
+import { dormantRulesFrom } from '../../eval/dormant.js';
+import type { IngestEvalType } from '../../eval/ingest.js';
+import { logTraceInputShape } from '../../tools/log-trace.js';
+import { costFieldsOf } from '../../cost/trace-cost.js';
+import { newJudgeRequest } from '../../eval/llm-judge/budget.js';
+import { issuesText } from '../../utils/validation-errors.js';
+import { countElements, tooManyElementsBody } from '../../utils/element-count.js';
+import { DEFAULT_MAX_INPUT_ELEMENTS, defaultConfig, protobufElementCeiling } from '../../config/defaults.js';
+import { requestSizeLimitBytes } from '../../utils/size-limit.js';
+
+/**
+ * The most traces one OTLP request may store. A collector's default batch is
+ * a few thousand spans, which is far fewer traces than this. Past it, the
+ * extra traces come back as rejected spans in `partialSuccess`, the OTLP
+ * way to say "not these", rather than holding the server for the time it
+ * takes to store and evaluate an unbounded batch (2026-09-23 security review:
+ * one 1 MB request of 11,500 one-span traces held the event loop
+ * for 11 seconds).
+ */
+export const MAX_OTLP_TRACES_PER_REQUEST = 2_000;
+
+/** Evaluate-on-ingest yields to the event loop this often, so one batch cannot starve other requests. */
+const YIELD_EVERY = 50;
+
+export interface OtlpRouteOptions {
+  evalEngine?: EvalEngine;
+  customRuleStore?: CustomRuleStore;
+  /** `otel.evaluateOnIngest` from the config: score each stored trace that carries an output. */
+  evaluateOnIngest: boolean;
+  /**
+   * The element ceiling for a protobuf body, counted as it decodes: protobufElementCeiling in
+   * src/config/defaults.ts (JSON bodies are counted by the app against security.maxInputElements).
+   */
+  maxProtobufElements?: number;
+}
+
+export function registerOtlpRoutes(router: Router, storage: IStorageAdapter, options: OtlpRouteOptions): void {
+  router.post('/traces', async (req, res) => {
+    /*
+     * Two encodings, one path. JSON is parsed by the app's
+     * body parser; protobuf arrives as raw bytes and is decoded into the
+     * same OTLP/JSON object here, so the schema, the mapping and every
+     * test below this line are the JSON path. The Python exporter sends
+     * protobuf only, so until 0.16.0 no Python framework reached this door
+     * without a Collector between.
+     */
+    const type = String(req.headers['content-type'] ?? '').toLowerCase();
+    let payload: unknown;
+    if (type.includes('application/x-protobuf')) {
+      /*
+       * express.raw hands the decoder a Buffer; anything else here is a
+       * request with no body (the parser did not run) or a tampered one,
+       * and is refused as such rather than decoded as an empty message.
+       * The typeof / Array.isArray checks are the type-tampering guard
+       * CodeQL reads (js/type-confusion-through-parameter-tampering).
+       */
+      const body: unknown = req.body;
+      if (typeof body === 'string' || Array.isArray(body) || !Buffer.isBuffer(body) || body.length === 0) {
+        res.status(400).json({ error: 'An application/x-protobuf request must carry the bytes of an ExportTraceServiceRequest; the body was empty or not bytes' });
+        return;
+      }
+      // Decoded protobuf fails validation element by element as JSON does, and is denser: it is counted
+      // while it decodes (one element at least per nested message) and once decoded, before the schema reads it.
+      const max = options.maxProtobufElements ?? protobufElementCeiling(DEFAULT_MAX_INPUT_ELEMENTS, requestSizeLimitBytes(defaultConfig.security.requestSizeLimit));
+      try {
+        payload = decodeExportTraceServiceRequest(body, { maxElements: max });
+      } catch (err) {
+        if (err instanceof OtlpTooManyElementsError) {
+          res.status(413).json(tooManyElementsBody(max));
+          return;
+        }
+        const message = err instanceof OtlpProtobufError ? err.message : err instanceof Error ? err.message : String(err);
+        res.status(400).json({ error: `Not a protobuf ExportTraceServiceRequest: ${message}` });
+        return;
+      }
+      if (countElements(payload, max) > max) {
+        res.status(413).json(tooManyElementsBody(max));
+        return;
+      }
+    } else if (type.includes('application/json')) {
+      payload = req.body;
+    } else {
+      res.status(415).json({ error: 'This endpoint accepts OTLP/HTTP as JSON (Content-Type: application/json) or protobuf (Content-Type: application/x-protobuf). gRPC is not served: point a Collector\'s otlphttp exporter here.' });
+      return;
+    }
+    const parsed = otlpTraceRequestSchema.safeParse(payload);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: 'Not an OTLP ExportTraceServiceRequest: expected { resourceSpans: [{ resource, scopeSpans: [{ spans: [...] }] }] }',
+        details: parsed.error.issues.slice(0, 5).map((i) => issuesText([i], { max: 1, root: '(root)' })),
+        issueCount: parsed.error.issues.length,
+      });
+      return;
+    }
+    const tenantId = requireTenant(req);
+    const mapped = fromOtlp(parsed.data);
+    // The W3C context on the request, if a proxy or a client set one (SEP-414 names the header).
+    const headerContext = traceContextFrom(req.headers as Record<string, unknown>);
+    const accepted = mapped.traces.slice(0, MAX_OTLP_TRACES_PER_REQUEST);
+    const overflow = mapped.traces.slice(MAX_OTLP_TRACES_PER_REQUEST);
+    const overflowSpans = overflow.reduce((n, { trace }) => n + (trace.spans?.length ?? 0), 0);
+    for (const { trace } of accepted) {
+      if (headerContext) trace.metadata = withTraceContext(trace.metadata, headerContext);
+    }
+    try {
+      // One transaction: the batch is stored whole or not at all.
+      await storage.insertTraces(tenantId, accepted.map(({ trace }) => trace));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/UNIQUE constraint failed/i.test(message)) {
+        res.status(400).json({
+          error: 'Nothing was stored: a span or trace id in this request is already stored, or appears twice in the request. OTLP ids must be unique; the whole batch was rolled back.',
+        });
+        return;
+      }
+      throw err;
+    }
+    const stored: Array<Record<string, unknown>> = [];
+    let done = 0;
+    /*
+     * One request, one judge allowance: a batch of up to 2,000 traces makes
+     * at most IRIS_RELEVANCE_JUDGE_MAX_CALLS_PER_REQUEST relevance judge
+     * calls, and each trace past that is scored lexically and says why.
+     */
+    const judgeRequest = newJudgeRequest();
+    for (const { trace, otelTraceId, lacked, evaluate: requested, evalType: requestedType } of accepted) {
+      if (++done % YIELD_EVERY === 0) await new Promise((resolve) => setImmediate(resolve));
+      const entry: Record<string, unknown> = {
+        trace_id: trace.trace_id,
+        otel_trace_id: otelTraceId,
+        agent_name: trace.agent_name,
+        spans: trace.spans?.length ?? 0,
+        steps: toSteps({ spans: trace.spans }).length,
+        ...costFieldsOf(trace),
+        // The capture source's declaration as read, so an exporter's author sees whether iris.capture.* landed.
+        ...(trace.capture ? { capture: trace.capture } : {}),
+        lacked,
+      };
+      const wanted = options.evaluateOnIngest || requested;
+      /*
+       * `iris.eval_type` is checked against the same bundles the other doors
+       * accept. An unknown one is not a reason to refuse the batch — the
+       * trace is stored — but it is not silently widened to every bundle
+       * either: the entry says why nothing was scored.
+       */
+      const evalType = requestedType === undefined ? undefined : logTraceInputShape.eval_type.safeParse(requestedType);
+      if (wanted && evalType !== undefined && (!evalType.success || evalType.data === undefined)) {
+        entry.evaluation = null;
+        entry.evaluation_error = `iris.eval_type "${requestedType}" is not one of completeness, relevance, safety, cost, custom, all; the trace was stored and not scored`;
+      } else if (wanted && options.evalEngine && trace.output !== undefined) {
+        const { response } = await evaluateStoredTrace(options.evalEngine, storage, tenantId, trace as Trace & { output: string }, {
+          ...(evalType?.success && evalType.data !== undefined ? { evalType: evalType.data as IngestEvalType } : {}),
+          dormant: options.customRuleStore ? dormantRulesFrom(options.customRuleStore.quarantined(tenantId)) : undefined,
+          rulesChanged: options.customRuleStore?.changesSinceStart(tenantId),
+          judgeRequest,
+        });
+        entry.evaluation = response;
+      } else if (wanted && trace.output === undefined) {
+        entry.evaluation = null;
+      }
+      stored.push(entry);
+    }
+    const body: Record<string, unknown> = {};
+    const rejectedSpans = mapped.rejectedSpans + overflowSpans;
+    if (rejectedSpans > 0) {
+      const reasons = [...mapped.rejections];
+      if (overflow.length > 0) {
+        reasons.push(`${overflow.length} trace(s) past the ${MAX_OTLP_TRACES_PER_REQUEST}-trace limit per request were not stored; send them in a later request`);
+      }
+      body.partialSuccess = { rejectedSpans, errorMessage: reasons.join(' | ') };
+    }
+    body['iris-eval'] = {
+      stored,
+      count: stored.length,
+      evaluate_on_ingest: options.evaluateOnIngest,
+      // What the relevance judge did for this request, when one is installed: calls made, and evaluations the per-request cap kept from it.
+      ...(options.evalEngine?.relevanceJudgeInForce()
+        ? { relevance_judge: { calls: judgeRequest.calls, withheld: judgeRequest.withheld, max_calls_per_request: options.evalEngine.relevanceJudgeInForce()!.maxCallsPerRequest } }
+        : {}),
+    };
+    res.status(200).json(body);
+  });
+}

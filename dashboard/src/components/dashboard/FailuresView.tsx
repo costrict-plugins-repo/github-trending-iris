@@ -1,0 +1,138 @@
+/*
+ * FailuresView — the landing view (?view=failures, and the `/` default).
+ *
+ * Research finding: not one tool in this category lands the user on the
+ * failure — every one opens on a picker or an aggregate. The category's
+ * single stated job ("something is wrong → show me the bad output") is
+ * left to manual filtering everywhere. This view does that job directly:
+ *
+ *   - Ranked failure list from GET /failures — recent failed/flagged
+ *     moments, severity × recency (server-side; see failure-rank.ts).
+ *   - Each row: which rules failed, on which agent, the offending
+ *     output, and when. Click-through to the moment detail view.
+ *   - Seen/unseen per failure (localStorage) — a returning user sees
+ *     what is NEW since they last looked.
+ *
+ * Health/Drift/Stream stay one click away on the ViewTabs strip.
+ */
+import { useMemo } from 'react';
+import { AlertTriangle } from 'lucide-react';
+import { useFailures } from '../../api/hooks';
+import { useSeenFailures } from '../../hooks/useSeenFailures';
+import { MomentCard } from '../moments/MomentCard';
+import { IssuesList } from './IssuesList';
+import { SectionHeader } from './SectionHeader';
+import { panelId, tabId } from './ViewTabs';
+import { LoadingSpinner } from '../shared/LoadingSpinner';
+import { QueryError } from '../shared/QueryError';
+import { PageEmptyState } from '../layout/PageEmptyState';
+import { usePreferences } from '../../hooks/usePreferences';
+import { RateLimitBanner } from '../shared/RateLimitBanner';
+
+const FAILURE_LIST_LIMIT = '50';
+
+export function FailuresView() {
+  const { displayPath } = usePreferences();
+  const { data, loading, error, rateLimitedUntil, refetch } = useFailures({
+    limit: FAILURE_LIST_LIMIT,
+  });
+  const { isSeen, markSeen, markAllSeen } = useSeenFailures();
+
+  const failures = useMemo(() => data?.failures ?? [], [data]);
+  const unseenIds = useMemo(
+    () => failures.filter((f) => !isSeen(f.id)).map((f) => f.id),
+    [failures, isSeen],
+  );
+
+  return (
+    <div className="iris-stack" role="tabpanel" id={panelId('failures')} aria-labelledby={tabId('failures')}>
+      {rateLimitedUntil && <RateLimitBanner until={rateLimitedUntil} onRetry={refetch} />}
+
+      <SectionHeader
+        title="What failed"
+        question="Recent failed and flagged runs, worst and newest first. Click one to see why."
+        trailing={
+          data && failures.length > 0 ? (
+            <span className="iris-row">
+              <span>
+                {unseenIds.length > 0
+                  ? `${unseenIds.length} new since you last looked`
+                  : 'nothing new since you last looked'}
+              </span>
+              {unseenIds.length > 0 && (
+                <button
+                  type="button"
+                  className="iris-btn iris-btn--ghost iris-btn--sm iris-btn--mono"
+                  onClick={() => markAllSeen(unseenIds)}
+                >
+                  Mark all seen
+                </button>
+              )}
+            </span>
+          ) : undefined
+        }
+      />
+
+      {error && <QueryError error={error} what="failures" onRetry={refetch} />}
+
+      {loading && !data && <LoadingSpinner />}
+
+      {data && failures.length === 0 && (
+        data.total === 0 ? (
+          /*
+           * Nothing has ever run. Written at builder scale — one person,
+           * one agent, first session — not "your fleet is idle."
+           */
+          <PageEmptyState
+            icon={AlertTriangle}
+            title="Nothing has run yet"
+            body={
+              <>
+                When an agent runs through Iris, anything that fails a rule lands
+                right here — worst and newest first. See a real failure on screen
+                right now with demo mode, or the{' '}
+                <a
+                  href="https://github.com/iris-eval/mcp-server#quickstart"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  quickstart
+                </a>{' '}
+                wires up your agent in about a minute.
+                <br />
+                <span data-first-run-hints="true">
+                  Press <kbd>⌘K</kbd> (or <kbd>Ctrl K</kbd>) for the command palette — “Onboarding tour” is in it — and <kbd>?</kbd> for
+                  shortcuts. To stop the browser opening on every start, set <code>IRIS_NO_AUTO_LAUNCH=1</code> or{' '}
+                  <code>autoLaunch: false</code> in {displayPath ? <code>{displayPath}</code> : 'your preferences file'}.
+                </span>
+              </>
+            }
+            command="npx @iris-eval/mcp-server --demo"
+          />
+        ) : (
+          <PageEmptyState
+            icon={AlertTriangle}
+            title="No failures in your recent runs"
+            body={`Scanned your last ${data.scanned} runs — every fired rule passed and nothing was flagged. Health (one tab over) has the aggregates.`}
+          />
+        )
+      )}
+
+      {data && failures.length > 0 && (
+        <div className="iris-stack">
+          {failures.map((f) => (
+            <MomentCard
+              key={f.id}
+              moment={f}
+              unseen={!isSeen(f.id)}
+              onOpen={markSeen}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Fires grouped by what the rule found: ten of one pattern read as one issue. */}
+      {data && data.total > 0 && <IssuesList />}
+    </div>
+  );
+}

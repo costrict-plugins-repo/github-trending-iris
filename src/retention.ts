@@ -1,0 +1,106 @@
+/*
+ * Retention — the sweep that keeps `retention.days` true.
+ *
+ * It used to run once, at startup. A server that runs for a month never
+ * swept again, so "traces older than 30 days are deleted" held only on
+ * the day the process started. The sweep now also runs on a timer
+ * (`retention.sweepIntervalHours`, default 24, 0 disables the timer) that
+ * never keeps the process alive on its own (`unref`), and both paths are
+ * one function so they cannot drift.
+ *
+ * The server starts the boot sweep after its transport is connected and
+ * does not wait for it: the store deletes in short steps with the event
+ * loop free between them (SqliteAdapter.deleteTracesOlderThan), so a
+ * client is answered while a large sweep runs.
+ *
+ * The sweep deletes traces (spans cascade) and evaluations by their own
+ * age; an evaluation younger than the window whose trace is swept keeps
+ * its scores and loses its text (see SqliteAdapter.deleteTracesOlderThan).
+ *
+ * One thing is kept past the window: the pinned baseline run, with its
+ * evaluations. It is the `before` every later run is compared against, and
+ * the sweep used to delete it at the window like everything else. Every
+ * sweep that keeps some of it says so in the log, with the run and the
+ * counts, so the window is never quietly longer than its number. Dataset
+ * cases and labels are not traces or evaluations and were never swept.
+ */
+import type { IrisConfig } from './types/config.js';
+import type { IStorageAdapter } from './types/query.js';
+import { LOCAL_TENANT } from './types/tenant.js';
+import { pruneBackups } from './storage/backup.js';
+
+export interface RetentionLogger {
+  info(msg: string): void;
+  warn(msg: string): void;
+}
+
+export interface SweepOutcome {
+  deletedTraces: number;
+  deletedEvals: number;
+  /** Copies of the database taken before a migration and older than the window (storage/backup.ts). */
+  deletedBackups: number;
+  /** What is older than the window and was kept: the pinned baseline run's traces and evaluations. Null when there is none. */
+  kept: { runId: string; traces: number; evaluations: number } | null;
+}
+
+/**
+ * One sweep for the local tenant. Never throws — a failed sweep is logged
+ * and the server keeps serving; the next tick tries again.
+ */
+export async function runRetentionSweep(storage: IStorageAdapter, config: IrisConfig, logger: RetentionLogger): Promise<SweepOutcome | null> {
+  if (config.retention.days <= 0) return null;
+  try {
+    const deletedTraces = await storage.deleteTracesOlderThan(LOCAL_TENANT, config.retention.days);
+    /*
+     * Evaluations too (#372). Deleting a trace only NULLs trace_id on
+     * its evaluations, so every eval row — output_text verbatim,
+     * including whatever no_pii flagged — used to outlive the retention
+     * window indefinitely while the traces around it were swept.
+     */
+    const deletedEvals = await storage.deleteEvalResultsOlderThan(LOCAL_TENANT, config.retention.days);
+    if (deletedTraces + deletedEvals > 0) {
+      // Fold the WAL into the main file and truncate it, so the swept
+      // rows do not survive as readable text in iris.db-wal.
+      await storage.checkpoint();
+      logger.info(`Retention cleanup: deleted ${deletedTraces} trace(s) and ${deletedEvals} evaluation(s) older than ${config.retention.days} days`);
+    }
+    /*
+     * A copy taken before a migration holds every trace as it was then, so
+     * one older than the window holds traces the window says are gone: it
+     * goes too, even when it is the only copy (#704).
+     */
+    const deletedBackups = config.storage.path === ':memory:' ? 0 : pruneBackups(config.storage.path, { olderThan: new Date(Date.now() - config.retention.days * 86_400_000) }).length;
+    if (deletedBackups > 0) logger.info(`Retention cleanup: deleted ${deletedBackups} copy(ies) of the database taken before an upgrade, older than ${config.retention.days} days`);
+    // What was kept is a report on a sweep that already ran: a failure to count it does not undo the sweep or hide what it deleted.
+    let kept: SweepOutcome['kept'] = null;
+    try {
+      kept = await storage.keptPastRetention(LOCAL_TENANT, config.retention.days);
+    } catch (err) {
+      logger.warn(`Retention cleanup: could not count what the pinned baseline run keeps past the window: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (kept) {
+      logger.info(
+        `Retention cleanup: kept ${kept.traces} trace(s) and ${kept.evaluations} evaluation(s) older than ${config.retention.days} days: they belong to the pinned baseline run ${kept.runId}. ` +
+          'Unpin the run and the next sweep deletes them.',
+      );
+    }
+    return { deletedTraces, deletedEvals, deletedBackups, kept };
+  } catch (err) {
+    logger.warn(`Retention cleanup skipped: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * The timer. Returns the handle (already unref'd) so a caller can clear it
+ * on shutdown, or null when retention or the timer is disabled.
+ */
+export function scheduleRetentionSweep(storage: IStorageAdapter, config: IrisConfig, logger: RetentionLogger): NodeJS.Timeout | null {
+  const hours = config.retention.sweepIntervalHours;
+  if (config.retention.days <= 0 || !(hours > 0)) return null;
+  const timer = setInterval(() => {
+    void runRetentionSweep(storage, config, logger);
+  }, hours * 60 * 60 * 1000);
+  timer.unref();
+  return timer;
+}

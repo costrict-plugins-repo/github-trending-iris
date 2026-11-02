@@ -1,0 +1,293 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.iris-eval/mcp-server",
+  "description": "Stop shipping agents on vibes. Score every agent output for quality, safety, and cost.",
+  "title": "Iris",
+  "websiteUrl": "https://iris-eval.com",
+  "icons": [
+    {
+      "src": "https://iris-eval.com/iris-logo.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": [
+        "any"
+      ]
+    },
+    {
+      "src": "https://iris-eval.com/iris-logo-white-bg.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "180x180"
+      ]
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/iris-eval/mcp-server",
+    "source": "github"
+  },
+  "version": "0.21.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@iris-eval/mcp-server",
+      "version": "0.21.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "API key for HTTP authentication. Required to bind the HTTP transport or the dashboard beyond loopback (0.0.0.0, a LAN address, a container): without it the server refuses to start",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "IRIS_API_KEY"
+        },
+        {
+          "description": "Path to a file whose trimmed contents are the API key (the secret-file pattern Docker and Kubernetes mount). Set this or IRIS_API_KEY, not both; further keys and rotation are security.apiKeys in config.json",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_API_KEY_FILE"
+        },
+        {
+          "description": "Set to 1 to run a non-loopback bind with NO API key on purpose (lifts the startup refusal; the network is then your boundary)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_ALLOW_UNAUTHENTICATED"
+        },
+        {
+          "description": "SQLite database path",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_DB_PATH"
+        },
+        {
+          "description": "Which SQLite driver holds the database: native (better-sqlite3, the default) or node (Node's built-in node:sqlite, Node 22.13+). Unset: native, falling back to node when the native module cannot load",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_SQLITE_DRIVER"
+        },
+        {
+          "description": "How long one trace search may read before it answers with the matches found so far, in milliseconds (50-60000, default 1000)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_SEARCH_BUDGET_MS"
+        },
+        {
+          "description": "on (default) or off. off keeps no full-text index of the traces: writes are cheaper, and a search reads the traces within its time budget",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_SEARCH_INDEX"
+        },
+        {
+          "description": "Log level: debug, info, warn, error",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_LOG_LEVEL"
+        },
+        {
+          "description": "Directory for the database, custom rules and preferences (default ~/.iris)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_HOME"
+        },
+        {
+          "description": "Enables evaluate_with_llm_judge and verify_citations with an Anthropic model. Optional: the deterministic rules never need a key",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "IRIS_ANTHROPIC_API_KEY"
+        },
+        {
+          "description": "Enables evaluate_with_llm_judge and verify_citations with an OpenAI model. Optional: the deterministic rules never need a key",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "IRIS_OPENAI_API_KEY"
+        },
+        {
+          "description": "Hard cap on the worst-case cost of one LLM judge call (default 0.25); max_cost_usd can lower it for a call, never raise it",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_LLM_JUDGE_MAX_COST_USD_PER_EVAL"
+        },
+        {
+          "description": "A priced judge model; answers_the_ask then asks it on every evaluation with input, sending that input and output to the model's provider, and gates on its verdict (off by default)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_RELEVANCE_JUDGE_MODEL"
+        },
+        {
+          "description": "What every judge call together may spend per UTC day, per tenant, in USD (default 1): the relevance judge, evaluate_with_llm_judge and verify_citations. Past it no judge call is made",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_LLM_JUDGE_DAILY_BUDGET_USD"
+        },
+        {
+          "description": "The name of IRIS_LLM_JUDGE_DAILY_BUDGET_USD before 0.21.0. Read when the new name is unset, and it then limits every judge call",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_RELEVANCE_JUDGE_DAILY_BUDGET_USD"
+        },
+        {
+          "description": "Relevance judge calls one request may make (default 20)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_RELEVANCE_JUDGE_MAX_CALLS_PER_REQUEST"
+        },
+        {
+          "description": "on (default) replaces the PII and credentials no_pii flags before the relevance judge sends input and output to its provider; off sends them as they are",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_RELEVANCE_JUDGE_REDACT"
+        },
+        {
+          "description": "Let verify_citations fetch URLs (off by default); a tool argument can turn it off for a call, never on",
+          "isRequired": false,
+          "format": "boolean",
+          "isSecret": false,
+          "name": "IRIS_CITATION_ALLOW_FETCH"
+        },
+        {
+          "description": "Start the dashboard alongside the server (same as --dashboard)",
+          "isRequired": false,
+          "format": "boolean",
+          "isSecret": false,
+          "name": "IRIS_DASHBOARD"
+        },
+        {
+          "description": "Dashboard port (default 6920); IRIS_PORT is the MCP HTTP transport port (default 3000)",
+          "isRequired": false,
+          "format": "number",
+          "isSecret": false,
+          "name": "IRIS_DASHBOARD_PORT"
+        },
+        {
+          "description": "MCP HTTP transport port (default 3000); only used with --transport http",
+          "isRequired": false,
+          "format": "number",
+          "isSecret": false,
+          "name": "IRIS_PORT"
+        },
+        {
+          "description": "OTLP/HTTP collector URL; when set, every stored trace is also exported as OpenTelemetry spans (best-effort, asynchronous)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_OTEL_ENDPOINT"
+        },
+        {
+          "description": "Comma-separated domain allowlist for verify_citations fetches (only consulted when IRIS_CITATION_ALLOW_FETCH is on); a tool argument can narrow it, never add to it",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_CITATION_DOMAINS"
+        },
+        {
+          "description": "The most one verify_citations call may spend on judge calls, in USD (default 1); max_cost_usd_total can lower it, never raise it",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_CITATION_MAX_COST_USD_TOTAL"
+        },
+        {
+          "description": "Transport: stdio (default) or http; same as --transport",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_TRANSPORT"
+        },
+        {
+          "description": "Bind host for the HTTP transport (default 127.0.0.1); only used with --transport http",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_HOST"
+        },
+        {
+          "description": "Comma-separated Origin allowlist for the HTTP transport and dashboard CORS (default http://localhost:*)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_ALLOWED_ORIGINS"
+        },
+        {
+          "description": "The most array elements and object keys one input may hold before it is validated (default 100000): a tool call's arguments, and a dashboard or OTLP JSON request body. A tool call over it gets an error result; a body, 413. OTLP protobuf has its own ceiling, one element per 5 bytes of the request size limit",
+          "isRequired": false,
+          "format": "number",
+          "isSecret": false,
+          "name": "IRIS_MAX_INPUT_ELEMENTS"
+        },
+        {
+          "description": "The name of IRIS_MAX_INPUT_ELEMENTS before 0.21.0, read when the new name is unset",
+          "isRequired": false,
+          "format": "number",
+          "isSecret": false,
+          "name": "IRIS_MAX_TOOL_INPUT_ELEMENTS"
+        },
+        {
+          "description": "Bind host for the dashboard (default 127.0.0.1); same as --dashboard-host",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_DASHBOARD_HOST"
+        },
+        {
+          "description": "Comma-separated key=value headers sent with every OTLP export (for example an auth token for your collector)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_OTEL_HEADERS"
+        },
+        {
+          "description": "service.name resource attribute on exported spans (default iris-eval)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_OTEL_SERVICE_NAME"
+        },
+        {
+          "description": "Timeout in milliseconds for each OTLP export request",
+          "isRequired": false,
+          "format": "number",
+          "isSecret": false,
+          "name": "IRIS_OTEL_TIMEOUT_MS"
+        },
+        {
+          "description": "The receiver of the webhook that fires on a moment (docs/webhooks.md); merged over notify.webhook in config.json",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "IRIS_WEBHOOK_URL"
+        },
+        {
+          "description": "The signing key of that webhook (any string, or whsec_ + base64); the iris format refuses to run without one",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "IRIS_WEBHOOK_SECRET"
+        }
+      ]
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/iris-eval/mcp-server/releases/download/v0.21.0/iris-eval.mcpb",
+      "version": "0.21.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

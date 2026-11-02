@@ -1,0 +1,196 @@
+/*
+ * One sentence splitter, for the two rules that count or walk sentences.
+ *
+ * Both had their own, and both were wrong in the same way. `sentence_count`
+ * split on `/[.!?]+/`, so "The latency is 3.5 seconds." counted as two
+ * sentences and "Dr. Chen approved it." as two more; the 2026-09-05 audit
+ * measured the damage at 43% of that rule's family. `topic_consistency`
+ * split on a full stop followed by whitespace, which fixes the decimal only
+ * when the decimal has no space after it and never fixes the abbreviation.
+ *
+ * A sentence ends at `.`, `!` or `?` when what follows looks like the start
+ * of a new sentence and what precedes is not one of the things that ends in
+ * a full stop without ending a sentence:
+ *
+ *   - never between digits, so 3.5 and 1.2.3 stay whole;
+ *   - never after a closed list of abbreviations (Dr, Mr, Mrs, Ms, e.g,
+ *     i.e, vs, etc, No, Fig, St, Inc, Ltd, Jr, Sr, approx, cf, al);
+ *   - never after a single capital letter, which is an initial (J. Smith);
+ *   - only when the next non-space character starts a sentence: an
+ *     uppercase letter, an opening quote or bracket, or a digit.
+ *
+ * The list is closed on purpose. An open-ended abbreviation heuristic
+ * (a short token ending in a full stop) swallows real sentence ends —
+ * "It was fun. Then we left." — and this splitter is used to COUNT, where
+ * missing a break is as wrong as inventing one.
+ */
+
+/**
+ * Abbreviations that are essentially never the last word of a sentence, so
+ * the full stop after them is punctuation and not an end. Lowercase, no
+ * trailing stop.
+ */
+import { isValueBreakAt, VALUE_MARK } from './structured.js';
+
+const ALWAYS_ABBREVIATION = new Set([
+  'dr', 'mr', 'mrs', 'ms', 'prof', 'sr', 'jr', 'st', 'mt',
+  'e.g', 'i.e', 'vs', 'al', 'cf', 'approx', 'est',
+  'dept', 'univ', 'a.m', 'p.m', 'u.s', 'u.k',
+]);
+
+/**
+ * Abbreviations that are ALSO ordinary sentence endings — "shipped in Oct.
+ * The rollout held" ends a sentence; "shipped on Oct. 5" does not. What
+ * separates them is what follows: a number means the abbreviation is being
+ * used as a label, anything else means the sentence ended. Guessing either
+ * way unconditionally is wrong about half the time, and this splitter is
+ * used to COUNT, where a missed break costs exactly as much as an invented
+ * one.
+ */
+const ABBREVIATION_BEFORE_NUMBER = new Set([
+  'no', 'fig', 'eq', 'ch', 'vol', 'pp', 'etc',
+  'inc', 'ltd', 'co', 'corp',
+  'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'sept', 'oct', 'nov', 'dec',
+]);
+
+const TERMINATORS = new Set(['.', '!', '?']);
+
+/**
+ * True when, from `from` on, only whitespace comes before the next newline,
+ * so the newline just before `from` starts a blank line. The linear form of
+ * `/^\s*\n/.test(text.slice(from))`, which copied the rest of the text at
+ * every newline and so ran in quadratic time on long outputs (2026-09-23
+ * ReDoS audit).
+ */
+function blankLineFollows(text: string, from: number): boolean {
+  for (let j = from; j < text.length; j++) {
+    const c = text[j];
+    if (c === '\n') return true;
+    if (!/\s/.test(c)) return false;
+  }
+  return false;
+}
+
+/** True when the character can open a new sentence. */
+function opensSentence(ch: string): boolean {
+  if (ch === undefined) return false;
+  if (ch >= 'A' && ch <= 'Z') return true;
+  if (ch >= '0' && ch <= '9') return true;
+  return '"‘’“”\'([{*_#-—'.includes(ch);
+}
+
+const isDigit = (ch: string | undefined): boolean => ch !== undefined && ch >= '0' && ch <= '9';
+
+/*
+ * How far back the token before a full stop is read. One character more than
+ * the longest abbreviation either list holds: a longer token is never on a
+ * list and never an initial, so reading the rest of it decides nothing. Read
+ * whole, a long stretch with no space in it (`a.B` repeated) was read again at
+ * every full stop, in quadratic time.
+ */
+const TOKEN_LOOKBACK = Math.max(...[...ALWAYS_ABBREVIATION, ...ABBREVIATION_BEFORE_NUMBER].map((t) => t.length)) + 1;
+
+/** The token immediately before `at`, lowercased, without its trailing stop; at most its last TOKEN_LOOKBACK characters. */
+function precedingToken(text: string, at: number): string {
+  const floor = Math.max(0, at - TOKEN_LOOKBACK);
+  let i = at - 1;
+  while (i >= floor && !/[\s(["']/.test(text[i])) i--;
+  return text.slice(i + 1, at).toLowerCase();
+}
+
+/**
+ * Named sentencesOf, not sentencesOf: the hallucination rule in
+ * src/eval/rules/safety.ts has its own sentencesOf that also breaks on
+ * every newline, because it wants per-line units for grounding checks. The
+ * two are not the same job and unifying them would move that rule's
+ * numbers, so it is a separate measured change, not a rename.
+ *
+ * Splits `text` into sentences. Never returns an empty sentence; a text with
+ * no terminator is one sentence. Line breaks do not split on their own — a
+ * wrapped paragraph is one sentence — but a blank line does, because a new
+ * block is a new thought and a bullet list is not one long sentence.
+ */
+/**
+ * A sentence has a word or a number in it. A rule (`---`, `***`), a lone
+ * bullet and the mark between two values of a structured output
+ * (structured.ts) are layout, not sentences.
+ */
+function saysAWord(piece: string): boolean {
+  return /[\p{L}\p{N}]/u.test(piece);
+}
+
+export function sentencesOf(text: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  /*
+   * The run of terminators the current one belongs to, and what follows it.
+   * Every terminator in a run has the same run end and the same next
+   * character, so they are found once per run. Found again at each one, a
+   * long run ("!!!!…" inside a word) was quadratic.
+   */
+  let runEnd = -1;
+  let after = 0;
+  let next = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    // A blank line ends a sentence whatever came before it, and so does the mark between two values of a structured output.
+    if ((ch === '\n' && blankLineFollows(text, i + 1)) || (ch === VALUE_MARK && isValueBreakAt(text, i))) {
+      const piece = text.slice(start, i).trim();
+      if (saysAWord(piece)) out.push(piece);
+      start = i + 1;
+      continue;
+    }
+
+    if (!TERMINATORS.has(ch)) continue;
+
+    // 3.5 — a full stop between digits is a decimal point.
+    if (ch === '.' && isDigit(text[i - 1]) && isDigit(text[i + 1])) continue;
+
+    if (i > runEnd) {
+      // Run past a cluster of terminators ("What?!").
+      runEnd = i;
+      while (runEnd + 1 < text.length && TERMINATORS.has(text[runEnd + 1])) runEnd++;
+
+      // Closing quotes and brackets belong to the sentence that ends here.
+      after = runEnd + 1;
+      while (after < text.length && '"’”\')]}'.includes(text[after])) after++;
+
+      // What comes next has to look like a new sentence.
+      next = after;
+      while (next < text.length && /[ \t\r\n]/.test(text[next])) next++;
+    }
+    /*
+     * No whitespace after the stop is usually a mid-token full stop — a
+     * version (v0.10.0), a filename (package.json), a hostname
+     * (iris-eval.com/proof) — and must not break. The exception is a
+     * following CAPITAL, which is a missing space between two sentences
+     * ("...ready.Ship it") and not a token: no filename or version has one.
+     */
+    if (next === after && next < text.length && !(text[next] >= 'A' && text[next] <= 'Z')) continue;
+    if (next < text.length && !opensSentence(text[next])) continue;
+
+    // Dr. Chen — an abbreviation, not an end.
+    if (ch === '.') {
+      const token = precedingToken(text, i);
+      if (ALWAYS_ABBREVIATION.has(token)) continue;
+      // Oct. 5 is a date; "in Oct. The rollout held" is two sentences.
+      if (ABBREVIATION_BEFORE_NUMBER.has(token) && isDigit(text[next])) continue;
+      // A single capital letter is an initial: J. Smith.
+      if (token.length === 1 && /[a-z]/i.test(token)) continue;
+    }
+
+    const piece = text.slice(start, after).trim();
+    if (saysAWord(piece)) out.push(piece);
+    start = after;
+    i = after - 1;
+  }
+  const tail = text.slice(start).trim();
+  if (saysAWord(tail)) out.push(tail);
+  return out;
+}
+
+/** How many sentences the text contains. The one number `sentence_count` reports. */
+export function countSentences(text: string): number {
+  return sentencesOf(text).length;
+}

@@ -1,0 +1,211 @@
+{
+  "schemaVersion": 1,
+  "rule": "keyword_overlap",
+  "category": "relevance",
+  "family": "overlap",
+  "positiveClass": "fail",
+  "definition": "keyword_overlap — recall of the input's content terms in the output: at least 35% of the input's content terms must appear in the output (config key keyword_overlap, default 0.35). Content terms: words longer than two characters that are not stopwords or request verbs; code identifiers and paths are split into their words; inflections are folded. Definition version: docs/api-reference.md §Relevance Rules and the rule description as merged in #416 (9d9fd50) on 2026-09-04. Positive = fewer than 35% of the input's content terms present (the rule should FAIL).",
+  "source": "LLM-authored on 2026-09-04. Held out on 2026-09-23: the 9 case(s) copied from, varied from or modelled on the 24 real transcripts in tests/fixtures/real-transcripts (overlap-001, overlap-002, overlap-003, overlap-004, overlap-005, overlap-006, overlap-007, overlap-008, overlap-009) were removed, so no number this family publishes is estimated on a transcript, and the transcript line in proof/TRANSCRIPTS.md and proof/COMPOSITE.md is measured on cases none of these rates were estimated from. 3 replacement case(s), authored the same day and marked in their notes, bring the family back to the 24-case floor the runner enforces. The replacements sit far from the threshold (0% or 100% under any reasonable reading), so their labels do not depend on this file's particular stopword or sentence lists.",
+  "labelling": "LLM-authored and LLM-labelled against the documented definition on 2026-09-04. First labelled that morning against the definition then documented (20% of unique words longer than two characters); re-labelled the same day, after #416 replaced it, against the 35%-of-content-terms definition. The label is the documented formula applied independently by script whose stopword list, request-verb list and inflection folding are this file's own reading of the definition, not the rule's lists; each note states the count that decided the label. 5 case(s) fell within seven points of the threshold under that reading and were dropped as undecidable from the documentation alone: t-13 (38%); t-24 (40%); t-08 (39%); t-19 (33%); t-23 (29%).",
+  "labelBasis": "definition",
+  "authored": "2026-09-04",
+  "counts": {
+    "n": 24,
+    "positive": 11,
+    "negative": 13
+  },
+  "cases": [
+    {
+      "id": "overlap-010",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "output": "I don't know.",
+      "notes": "No terms from a long question (0/13 input content terms = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-011",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "output": "Yes.",
+      "notes": "One-word answer (0/13 input content terms = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-012",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "output": "Sourdough needs a long cold proof; fold the dough every thirty minutes for the first two hours.",
+      "notes": "Answer to a different question (0/13 input content terms = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-013",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "output": "I can't help with that request.",
+      "notes": "Refusal that reuses none of the question (0/13 input content terms = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-014",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "output": "Wie rotiere ich den Schlüssel? Über die Einstellungen; der alte bleibt kurz gültig.",
+      "notes": "On-topic answer in another language — no lexical overlap, so a miss by the documented definition (0/13 input content terms = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-015",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "output": "Restart it.",
+      "notes": "A single shared term out of many (1/13 input content terms = 8% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-016",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "output": "There is an option for that in settings; the previous one stays valid briefly.",
+      "notes": "On-topic paraphrase avoiding the question's words: a miss by the documented lexical definition (0/13 input content terms = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-017",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "output": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "notes": "Output echoes the question: 100% (13/13 input content terms = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-018",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "output": "Rotate the API key from the dashboard settings; the running server picks it up without a restart and the old key keeps working for the overlap window.",
+      "notes": "Direct answer sharing most terms (11/13 input content terms = 85% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-019",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "How do I rotate the dashboard API key without restarting the running Iris server, and does the old key keep working during the overlap window?",
+      "output": "The running server and the dashboard reload the API key on change; no restart is needed.",
+      "notes": "About half the content terms shared (6/13 input content terms = 46% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-020",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "Is it up?",
+      "output": "The server has been running for three days.",
+      "notes": "The input has no content term, so by the documented definition there is nothing to recall and the output passes (no input content terms)"
+    },
+    {
+      "id": "overlap-021",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "port?",
+      "output": "The port is 4748.",
+      "notes": "One term, present (1/1 input content terms = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-022",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "Which port does the dashboard use and can I change it?",
+      "output": "It uses port 4748; yes, you can change it with --port.",
+      "notes": "Shares port, dashboard-adjacent terms and change (2/3 input content terms = 67% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-023",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "Which port does the dashboard use and can I change it?",
+      "output": "Four seven four eight; yes, with a flag.",
+      "notes": "Correct answer spelled to avoid every term: a miss by the documented definition (0/3 input content terms = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-024",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "Summarise the release workflow jobs and their dependencies.",
+      "output": "The release workflow has six jobs: build, test, publish-npm, publish-ghcr, github-release and verify; each publish job depends on build and test, and verify depends on the three publishes.",
+      "notes": "Shares workflow, jobs, release, dependencies (3/4 input content terms = 75% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-025",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "Summarise the release workflow jobs and their dependencies.",
+      "output": "Six stages run in order; the last checks the first five.",
+      "notes": "Same content, none of the input terms (0/4 input content terms = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-026",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "List the environment variables Iris reads.",
+      "output": "Iris reads IRIS_HOME, IRIS_PORT, IRIS_DB_PATH, IRIS_ANTHROPIC_API_KEY and IRIS_OPENAI_API_KEY; the full list is in the README under Environment Variables.",
+      "notes": "Shares environment, variables, iris (4/4 input content terms = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-027",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "Does the retention sweep delete evaluations too?",
+      "output": "Yes — the retention sweep deletes evaluations older than retention.days.",
+      "notes": "High overlap (4/4 input content terms = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-028",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "Does the retention sweep delete evaluations too?",
+      "output": "Old rows go away on startup.",
+      "notes": "Correct but shares no term (0/4 input content terms = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-029",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "what is the sandbox regex budget in milliseconds",
+      "output": "The regex sandbox budget is 100 milliseconds per pattern.",
+      "notes": "Most terms shared (4/4 input content terms = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-030",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "Explain how the critical veto works in evaluate_output.",
+      "output": "A critical rule that fails forces passed to false in evaluate_output regardless of the weighted score.",
+      "notes": "Shares critical, evaluate, output, works (3/5 input content terms = 60% by this file's reading of the definition)"
+    },
+    {
+      "id": "overlap-031",
+      "rule": "keyword_overlap",
+      "label": "positive",
+      "input": "How do I rotate the webhook signing secret?",
+      "output": "Thanks for asking. The weather in Lisbon is mild this week and the trains run on time.",
+      "notes": "An unrelated reply: none of rotate, webhook, signing, secret (0/4 input content terms = 0% by this file's reading of the definition). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "overlap-032",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "Which environment variable sets the log level for the worker process?",
+      "output": "The worker process reads the log level from the LOG_LEVEL environment variable; it sets verbosity at startup.",
+      "notes": "Every content term present: environment, variable, sets, log, level, worker, process (7/7 input content terms = 100% by this file's reading of the definition). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "overlap-033",
+      "rule": "keyword_overlap",
+      "label": "negative",
+      "input": "Summarise the migration plan for the orders database.",
+      "output": "The migration plan moves the orders database to the new cluster in two steps: a copy, then a cutover.",
+      "notes": "Every content term present: migration, plan, orders, database (\"summarise\" is a request verb) (4/4 input content terms = 100% by this file's reading of the definition). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    }
+  ]
+}

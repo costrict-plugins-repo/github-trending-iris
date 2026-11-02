@@ -1,0 +1,227 @@
+import { z } from 'zod';
+import { logTraceInputShape } from '../tools/log-trace.js';
+import { isoTimestamp, addTraceRangeIssues, traceSearchText } from '../tools/get-traces.js';
+import { EXPORT_FORMATS } from '../export/format.js';
+import { CAPTURE_FIELDS } from '../types/trace.js';
+import { listKeys } from '../utils/validation-errors.js';
+
+/*
+ * Strict request-body schema for the dashboard's MUTATING routes.
+ *
+ * A bare z.object() silently STRIPS unknown keys. On a read route that is
+ * merely lenient; on a write route it is the exact defect v0.5.0 fixed at
+ * the MCP boundary (tools/strict-input.ts) and then left open on its HTTP
+ * twin: `POST /api/v1/traces {evaluate: true, eval_typ: "safety", output:
+ * "<PII>"}` dropped the misspelled key, ran the DEFAULT completeness
+ * bundle, and returned a green result with nothing saying an argument had
+ * been ignored. Same family, one transport over (#376 item 2).
+ *
+ * `reserved` names keys the server owns and a client must never send —
+ * each gets a pointed sentence appended to the rejection so the caller
+ * learns WHY (e.g. trace_id is server-minted) instead of just "unknown".
+ */
+export function strictBody<T extends z.ZodRawShape>(
+  shape: T,
+  opts?: { reserved?: Record<string, string> },
+) {
+  const validKeys = Object.keys(shape).join(', ');
+  return z.strictObject(shape, {
+    error: (issue) => {
+      if (issue.code !== 'unrecognized_keys') return undefined;
+      const reservedNotes = issue.keys
+        .filter((k) => opts?.reserved?.[k] !== undefined)
+        .map((k) => ` ${opts!.reserved![k]}`)
+        .join('');
+      return (
+        `Unknown key(s): ${listKeys(issue.keys)}. ` +
+        `Valid keys: ${validKeys}. ` +
+        'Unknown keys are rejected rather than silently dropped, so a misspelled field ' +
+        'cannot change what gets stored or evaluated — check the spelling and retry.' +
+        reservedNotes
+      );
+    },
+  });
+}
+
+/*
+ * Strict query schema for the dashboard's READ routes (#376).
+ *
+ * A bare z.object() on a query string strips an unknown parameter, so
+ * `?agent_nme=docs-qa` returned every agent's rows exactly as if the
+ * filter had applied — the same silent-strip family as the bodies, one
+ * verb over. A misspelled filter is now refused with the valid names, and
+ * the dashboard's own client sends only the keys the schemas declare.
+ */
+export function strictQuery<T extends z.ZodRawShape>(shape: T) {
+  const validKeys = Object.keys(shape).join(', ');
+  return z.strictObject(shape, {
+    error: (issue) =>
+      issue.code === 'unrecognized_keys'
+        ? `Unknown query parameter(s): ${listKeys(issue.keys)}. ` +
+          `Valid parameters: ${validKeys}. ` +
+          'Unknown parameters are rejected rather than silently ignored, so a misspelled filter ' +
+          'cannot widen what is returned — check the spelling and retry.'
+        : undefined,
+  });
+}
+
+/*
+ * POST /api/v1/traces body — the log_trace tool contract plus the
+ * HTTP-only evaluation opt-in. Built FROM logTraceInputShape rather than
+ * restating it so the two capture paths (MCP tool, HTTP ingest) cannot
+ * drift.
+ *
+ * `trace_id` is deliberately absent: the server mints it. This schema
+ * used to rely on default unknown-key stripping to discard a client-
+ * supplied one — which also discarded every misspelled field. It is now
+ * strict, and a client-supplied trace_id is REJECTED with a message that
+ * says the server owns it, rather than silently replaced.
+ */
+/*
+ * The capture source's declaration (src/eval/evidence.ts). Accepted on the
+ * doors software uses (this route and `iris-eval ingest`), never on the
+ * log_trace tool: the agent calls that one, and a record cannot vouch for
+ * itself. Strict, so a misspelled field name is refused rather than read
+ * as "complete: nothing".
+ */
+export const traceCaptureSchema = z.strictObject({
+  name: z.string().trim().min(1).max(200).describe('The capturing software, e.g. "iris-eval-capture"'),
+  version: z.string().trim().min(1).max(100).optional().describe('Its version'),
+  complete: z
+    .array(z.enum(CAPTURE_FIELDS))
+    .max(16)
+    .optional()
+    .describe('What it records in full on every trace: an empty list of tool calls then says none were made, and a trace that leaves a named field out reads as not checked'),
+});
+
+export const ingestTraceSchema = strictBody(
+  {
+    ...logTraceInputShape,
+    // evaluate and eval_type live in logTraceInputShape since 0.13.0 — the
+    // MCP tool carries them too, so the two doors cannot disagree about
+    // what "evaluate on write" means.
+    capture: traceCaptureSchema.optional().describe('The software that recorded this trace by watching the agent, and what it records in full'),
+  },
+  {
+    reserved: {
+      trace_id:
+        'trace_id is minted by the server on every ingest and cannot be supplied by the client — ' +
+        'read it from the 201 response instead.',
+    },
+  },
+).superRefine((body, ctx) => {
+  if (body.evaluate && body.output === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['output'],
+      message: '"output" is required when "evaluate" is true — the eval engine scores the output text',
+    });
+  }
+});
+
+/*
+ * GET /api/v1/traces — the HTTP twin of the get_traces tool's query. The
+ * bounds are validated by the SAME helpers the tool uses (isoTimestamp,
+ * addTraceRangeIssues), so a `since` of "yesterday", a `since` later than
+ * `until`, a score outside 0..1 or a `min_score` above `max_score` is
+ * refused here with both values named — exactly as the tool refuses it —
+ * instead of returning an empty page that reads as "no such traces".
+ */
+const traceFilterShape = {
+  agent_name: z.string().optional(),
+  framework: z.string().optional(),
+  session: z.string().min(1).max(200).optional(),
+  q: traceSearchText.optional(),
+  since: isoTimestamp.optional(),
+  until: isoTimestamp.optional(),
+  min_score: z.coerce.number().min(0).max(1).optional(),
+  max_score: z.coerce.number().min(0).max(1).optional(),
+  sort_by: z.enum(['timestamp', 'latency_ms', 'cost_usd', 'relevance']).optional(),
+  sort_order: z.enum(['asc', 'desc']).default('desc'),
+};
+
+export const traceQuerySchema = strictQuery({
+  ...traceFilterShape,
+  limit: z.coerce.number().int().min(1).max(1000).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+}).superRefine(addTraceRangeIssues);
+
+const evalFilterShape = {
+  eval_type: z.string().optional(),
+  passed: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),
+  since: z.string().optional(),
+  until: z.string().optional(),
+};
+
+export const evalQuerySchema = strictQuery({
+  ...evalFilterShape,
+  limit: z.coerce.number().int().min(1).max(1000).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
+/*
+ * The exports (#4): the list's own filters — the same shape, so an export
+ * admits exactly the rows the page shows — without the page (limit,
+ * offset), plus the format. A parameter the list would refuse is refused
+ * here too, with the same sentence.
+ */
+const exportFormat = z.enum(EXPORT_FORMATS, { error: `format must be one of: ${EXPORT_FORMATS.join(', ')}` });
+
+export const traceExportQuerySchema = strictQuery({
+  ...traceFilterShape,
+  format: exportFormat,
+}).superRefine(addTraceRangeIssues);
+
+export const evalExportQuerySchema = strictQuery({
+  ...evalFilterShape,
+  format: exportFormat,
+});
+
+export const runsQuerySchema = strictQuery({
+  limit: z.coerce.number().int().min(1).max(500).default(50),
+});
+
+export const caseQuerySchema = strictQuery({
+  run: z.string().min(1).max(200).optional(),
+});
+
+export const summaryQuerySchema = strictQuery({
+  hours: z.coerce.number().int().min(1).max(8760).default(24),
+});
+
+export const evalStatsPeriodSchema = strictQuery({
+  period: z.enum(['24h', '2d', '7d', '14d', '30d', '60d', '90d', '180d', 'all']).default('24h'),
+});
+
+/*
+ * The trend, optionally split. `cohort` is a closed enum rather than a
+ * column name: a free-text group-by would put caller text into a SQL
+ * expression, and there is exactly one grouping that means anything here.
+ */
+/*
+ * The drift comparison: this window against the one before it, optionally
+ * narrowed to a run. `run` narrows BOTH windows — comparing one run's
+ * current week against everything's previous week would be a comparison
+ * between two different populations dressed as a trend.
+ */
+export const driftSchema = strictQuery({
+  period: z.enum(['24h', '2d', '7d', '14d', '30d', '60d', '90d', '180d']).default('7d'),
+  run: z.string().min(1).max(200).optional(),
+});
+
+export const evalStatsTrendSchema = strictQuery({
+  period: z.enum(['24h', '2d', '7d', '14d', '30d', '60d', '90d', '180d', 'all']).default('24h'),
+  cohort: z.enum(['run']).optional(),
+});
+
+export const evalStatsFailuresSchema = strictQuery({
+  period: z.enum(['24h', '2d', '7d', '14d', '30d', '60d', '90d', '180d', 'all']).default('24h'),
+  limit: z.coerce.number().int().min(1).max(100).default(10),
+});
+
+export const failuresQuerySchema = strictQuery({
+  agent_name: z.string().min(1).max(200).optional(),
+  since: z.string().datetime({ offset: true }).optional(),
+  until: z.string().datetime({ offset: true }).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});

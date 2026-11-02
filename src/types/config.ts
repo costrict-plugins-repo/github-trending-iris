@@ -1,0 +1,291 @@
+import type { WebhookEventName, WebhookFormat } from '../notify/event-names.js';
+
+/**
+ * An outbound webhook on a moment. `url` is the only required
+ * key; `events` omitted means every event; the `iris` format (the default)
+ * signs every delivery and so needs `secret` or `secretFile`.
+ */
+export interface WebhookConfig {
+  url: string;
+  events?: WebhookEventName[];
+  /** The signing key. A `whsec_`-prefixed base64 secret is read the Standard Webhooks way; any other string signs as its bytes. */
+  secret?: string;
+  /** The signing key read from a file (trimmed) — the secret-file pattern. */
+  secretFile?: string;
+  /** Minutes before the same event for the same agent and subject is sent again. Default 10. */
+  cooldownMinutes?: number;
+  /** `iris` (signed JSON: id, type, timestamp, data), `slack` ({ text }) or `discord` ({ content }). Default `iris`. */
+  format?: WebhookFormat;
+  /** One attempt's limit in milliseconds. Default 10000. */
+  timeoutMs?: number;
+}
+
+/** One model priced in `config.json` under `pricing.models`, in USD per 1M tokens. */
+export interface ConfiguredModelPrice {
+  model: string;
+  inputUsdPer1M: number;
+  outputUsdPer1M: number;
+  /** Per 1M input tokens read from the prompt cache. Unset: cache reads are priced at inputUsdPer1M, and the estimate says so. */
+  cacheReadUsdPer1M?: number;
+  /** Per 1M input tokens written to the prompt cache. Unset: cache writes are priced at inputUsdPer1M, and the estimate says so. */
+  cacheWriteUsdPer1M?: number;
+  /** Per 1M input tokens written to the prompt cache with a 1-hour lifetime. Unset: such writes are priced at cacheWriteUsdPer1M, and the estimate says so. */
+  cacheWrite1hUsdPer1M?: number;
+}
+
+export interface IrisConfig {
+  storage: {
+    type: 'sqlite';
+    path: string;
+    /**
+     * `critical_spans` stores each evaluation's output text with the spans a
+     * critical detector flagged replaced by `[REDACTED:<pattern>]`, so a tool
+     * that detects leaks need not keep the leak it found. The evidence
+     * offsets still index the original text the caller saw. Default `none`.
+          *
+     * It covers the OUTPUT only. A span into a tool result — which
+     * `no_injection_compliance` reports — is never spliced here, and the
+     * stored trace keeps any injected payload it carried, deliberately: that
+     * text is the record of the attack the verdict points at. Delete the
+     * trace to erase it.
+     */
+    redact?: 'none' | 'critical_spans';
+    /**
+     * How long one trace search may read before it answers with the matches
+     * it found so far (`search.complete: false`), in milliseconds (50 to
+     * 60,000; default 1,000). A search holds every other request while it
+     * reads, so this is also the longest it can make them wait.
+     * IRIS_SEARCH_BUDGET_MS sets it from the environment.
+     */
+    searchBudgetMs?: number;
+    /**
+     * When a committed write reaches the disk. `normal` (the default since
+     * 0.20.0): at each checkpoint of the write-ahead log. A crash of Iris
+     * loses nothing and the file cannot be corrupted, but a power cut or an
+     * operating-system crash can roll back the writes since the last sync.
+     * `full`: every commit waits for the disk (about 1.5 ms more a write),
+     * and a committed write survives a power cut. SQLite's own guidance for
+     * a write-ahead log is `normal`.
+     */
+    synchronous?: 'normal' | 'full';
+    /**
+     * The full-text search index. `on` (the default): every stored trace is
+     * indexed, and a search reads the index. `off`: nothing is indexed, so a
+     * write costs what it did before the index existed, and a search reads
+     * the traces themselves within searchBudgetMs, newest first, so on a
+     * large store it can answer with part of the matches
+     * (`search.complete: false`). Turning it off erases an index the
+     * database kept; turning it on again builds a new one in the background.
+     * IRIS_SEARCH_INDEX sets it from the environment.
+     */
+    searchIndex?: 'on' | 'off';
+  };
+  server: {
+    name: string;
+    version: string;
+  };
+  transport: {
+    type: 'stdio' | 'http';
+    port: number;
+    host: string;
+  };
+  dashboard: {
+    enabled: boolean;
+    port: number;
+    /**
+     * Bind address. Defaults to loopback: the dashboard is unauthenticated
+     * by default (security.apiKey is undefined) and serves the full trace
+     * history, so binding it to every interface exposes agent inputs and
+     * outputs to the local network. Set explicitly to share it.
+     */
+    host: string;
+  };
+  eval: {
+    defaultThreshold: number;
+    ruleThresholds?: {
+      min_output_length?: number;
+      min_sentences?: number;
+      keyword_overlap?: number;
+      topic_consistency?: number;
+      cost_threshold?: number;
+      max_token_ratio?: number;
+      max_tool_repeats?: number;
+      max_target_rereads?: number;
+      max_steps?: number;
+    };
+    /**
+     * Internal, set by loadConfig: the threshold keys the config FILE
+     * supplied, so a rule can say whether its threshold is the deployment's
+     * policy or our shipped guess without comparing values. Never written by
+     * a user; a strict config validator treats it as reserved.
+     */
+    configuredThresholdKeys?: string[];
+    /**
+     * Built-in rule names promoted to CRITICAL — a failure vetoes `passed`
+     * regardless of the weighted score. Validated against the rule registry
+     * when the config loads; an unknown name is a startup error naming the
+     * valid list, never a silent no-op.
+     */
+    criticalRules?: string[];
+    /**
+     * Built-in rule names demoted from critical — they still score and still
+     * report a failure, but they stop vetoing `passed`. Same validation. A
+     * name in both lists is a config error: it does not say what you want.
+     */
+    nonCriticalRules?: string[];
+    /*
+     * The verdict's six defaults (0.10.0). Each is a RECOMMENDATION with its
+     * failure mode stated, not a settled answer; every surface that shows
+     * one says so.
+     */
+    /**
+     * How the verdict is composed: by kind — gates, vetoes, unknown, then the
+     * risk. `risk` is the only value from 0.12.0; `legacy` ran the pre-0.10.0
+     * weighted mean and was announced in 0.10.0 as lasting two minors.
+     *
+     * The key survives its only alternative on purpose: a config that still
+     * names `legacy` is refused at startup with a sentence, rather than
+     * silently switched. Tune the shipped composer with `falsePassCost`.
+     */
+    composer?: 'risk';
+    /**
+     * How many wrongly blocked builds one shipped failure is worth. The risk
+     * threshold is 1 / (1 + this), so 1 means a false pass and a false block
+     * cost the same; a continuous-integration gate that hates flakiness sets
+     * it low, a compliance gate sets it high.
+     */
+    falsePassCost?: number;
+    /**
+     * What a critical rule that was ASKED and could not answer does to the
+     * verdict — defeated by the output, or configured invalidly. Not the
+     * same as never asked, which is coverage. Today's behaviour is `pass`,
+     * which is the fail-open seam; the default is `unknown`.
+     */
+    onCriticalSkipped?: 'unknown' | 'fail' | 'pass';
+    /** Inputs every evaluation must carry; an absent one makes the verdict unknown rather than clean. */
+    requiredEvidence?: string[];
+    /**
+     * Whether a threshold IRIS ships decides the verdict, or only advises.
+     * A default is our guess about a deployment we have never seen; a
+     * threshold you set is your decision. A policy with no number in it —
+     * "the output is empty" — gates either way.
+     */
+    defaultsGate?: boolean;
+    /** Check tool-call arguments against the catalogue's schemas. See defaults.ts. */
+    validateToolArguments?: boolean;
+    /**
+     * Rules you wrote as code: ES modules whose default export
+     * is `{ name, kind, mechanism, version, needs, evaluate(ctx) }`, each
+     * pinned by the sha256 of its file. A plugin runs in-process, so a file
+     * whose hash does not match, or that lacks the contract, refuses
+     * startup naming the path. Relative paths resolve against the Iris home.
+     */
+    plugins?: Array<{ path: string; sha256: string }>;
+    /** The prior that an output is bad before any rule speaks. 0.5 matches the proof corpus, not your traffic. */
+    prior?: number;
+    /**
+     * How that prior is spread over the failure classes the detectors
+     * examine. `per-output` keeps it at the stated value for the output as a
+     * whole; `per-class` applies it to each class independently, which makes
+     * installing another detector raise the prior before that detector has
+     * looked at anything.
+     */
+    priorMode?: 'per-output' | 'per-class';
+    /**
+     * Whether the deployment SET eval.prior (loadConfig records it, as it
+     * records configuredThresholdKeys), so a verdict can say whose prior it
+     * used: `config` when this is true, `estimated` when the deployment's
+     * own labels implied one, `default` otherwise. Never written by a user;
+     * reserved like configuredThresholdKeys.
+     */
+    priorConfigured?: boolean;
+  };
+  /**
+   * Traces arriving by OTLP/HTTP at `POST /v1/traces`. They
+   * are stored with what they carry; `evaluateOnIngest` scores each one
+   * that carries an output, off by default because an OTLP feed is a
+   * firehose the operator did not necessarily mean to grade.
+   */
+  otel: {
+    evaluateOnIngest: boolean;
+  };
+  logging: {
+    level: 'debug' | 'info' | 'warn' | 'error';
+  };
+  /**
+   * The price a trace's cost is estimated at when the trace reports none
+   * (src/cost/). A reported cost is never replaced; an estimate is stored
+   * with `cost_source: "estimated"` and the prices it used.
+   */
+  pricing: {
+    /** Estimate a cost from token counts × list price when a trace reports none. Default true. */
+    estimate: boolean;
+    /**
+     * Models to price beyond the built-in table, or at another price than it
+     * lists (a negotiated rate, a deployment name, a model Iris does not
+     * price). Matched on the id the trace records, ignoring case. An entry
+     * here wins over the built-in table.
+     */
+    models: ConfiguredModelPrice[];
+    /** The date the prices in `models` were read (YYYY-MM-DD), shown beside an estimate that used them. */
+    asOf?: string;
+  };
+  /** Outbound notifications. `webhook: null` (the default) sends nothing. */
+  notify: {
+    webhook: WebhookConfig | null;
+  };
+  retention: {
+    days: number;
+    /** How often the sweep re-runs after boot, in hours; 0 disables the timer (the boot sweep still runs). Default 24. */
+    sweepIntervalHours: number;
+  };
+  security: {
+    /** The primary key, in plaintext (IRIS_API_KEY / --api-key). Its id is `primary`. */
+    apiKey?: string;
+    /**
+     * The primary key read from a file — its trimmed contents
+     * (IRIS_API_KEY_FILE). The secret-file pattern Docker and Kubernetes
+     * mount. Set this or `apiKey`, not both. See src/security/keys.ts.
+     */
+    apiKeyFile?: string;
+    /**
+     * Further keys, so a rotation has no gap: add the new one, restart,
+     * move the clients, remove the old one, restart. Each has an `id`,
+     * exactly one of `keyFile` (a file whose trimmed contents are the key)
+     * or `keyHash` (the sha256 hex of the key, so the config file holds no
+     * secret), and an optional `expiresAt` (ISO 8601) after which it stops
+     * matching at that instant.
+     */
+    apiKeys?: Array<{ id: string; keyFile?: string; keyHash?: string; expiresAt?: string }>;
+    /**
+     * Run a non-loopback bind with no API key on purpose (IRIS_ALLOW_UNAUTHENTICATED=1).
+     * Without it such a bind is refused at startup — see src/utils/bind-policy.ts.
+     */
+    allowUnauthenticated: boolean;
+    allowedOrigins: string[];
+    rateLimit: {
+      api: number;
+      mcp: number;
+      /**
+       * What the MCP endpoint's per-minute limit is counted against: the
+       * client address (default), or the API key that authenticated the
+       * request — so several agents behind one NAT each get their own
+       * budget. A request with no key falls back to its address.
+       */
+      mcpKeyBy?: 'ip' | 'apiKey';
+    };
+    requestSizeLimit: string;
+    /**
+     * The most array elements and object keys one input may hold before it
+     * is validated (IRIS_MAX_INPUT_ELEMENTS): a tool call's arguments on
+     * every transport, and a request body on the dashboard port (the API's
+     * JSON bodies, POST /v1/traces as JSON). Over it, a tool call gets an
+     * isError result and a body a 413. Protobuf on POST /v1/traces has its
+     * own ceiling, protobufElementCeiling in src/config/defaults.ts. Default 100,000:
+     * see DEFAULT_MAX_INPUT_ELEMENTS in src/config/defaults.ts for the
+     * measurements behind it. Its name before 0.21.0, maxToolInputElements,
+     * is still read from config.json and the environment.
+     */
+    maxInputElements: number;
+  };
+}

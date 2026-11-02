@@ -1,0 +1,322 @@
+/*
+ * Browser sign-in for an --api-key dashboard (#373 item 6).
+ *
+ * The Bearer middleware is right for MCP clients and capture SDKs and
+ * useless for a browser: with `--api-key` set, the dashboard UI 401'd
+ * every page load. The session layer in src/dashboard/session-auth.ts
+ * lets a browser present the key ONCE — `?key=` on any dashboard URL, or
+ * the sign-in form — and then ride an HttpOnly cookie.
+ *
+ * Every test drives the REAL dashboard server over a REAL socket so the
+ * request passes the same middleware stack production traffic does.
+ */
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import type { Server } from 'node:http';
+import { SqliteAdapter } from '../../src/storage/sqlite-adapter.js';
+import { createDashboardServer } from '../../src/dashboard/server.js';
+import { sha256Hex } from '../../src/security/keys.js';
+import type { IrisConfig } from '../../src/types/config.js';
+import { defaultConfig } from '../../src/config/defaults.js';
+import { SESSION_COOKIE } from '../../src/dashboard/session-auth.js';
+
+const mockLogger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+
+interface BootedServer {
+  storage: SqliteAdapter;
+  server: Server;
+  base: string;
+}
+
+const booted: BootedServer[] = [];
+
+afterEach(async () => {
+  vi.useRealTimers();
+  for (const b of booted.splice(0)) {
+    b.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => b.server.close(() => resolve()));
+    await b.storage.close();
+  }
+});
+
+async function bootServer(apiKey?: string): Promise<BootedServer> {
+  const storage = new SqliteAdapter(':memory:');
+  await storage.initialize();
+  const config = {
+    ...defaultConfig,
+    dashboard: { ...defaultConfig.dashboard, port: 0 },
+    security: { ...defaultConfig.security, apiKey },
+  };
+  const server = createDashboardServer(storage, config, mockLogger).start();
+  await new Promise((r) => server.once('listening', r));
+  const port = (server.address() as { port: number }).port;
+  const entry = { storage, server, base: `http://127.0.0.1:${port}` };
+  booted.push(entry);
+  return entry;
+}
+
+const KEY = 'team-dashboard-key-9f2c';
+const HTML = { accept: 'text/html,application/xhtml+xml' };
+
+/** The `name=value` pair from a Set-Cookie header, for sending back. */
+function cookiePair(res: Response): string {
+  const raw = res.headers.get('set-cookie');
+  expect(raw, 'expected a Set-Cookie header').toBeTruthy();
+  return (raw as string).split(';')[0];
+}
+
+describe('session auth — with --api-key', () => {
+  it('a browser navigation without a session gets the sign-in page, not a JSON 401', async () => {
+    const { base } = await bootServer(KEY);
+    const res = await fetch(`${base}/moments`, { headers: HTML, redirect: 'manual' });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('content-type')).toMatch(/text\/html/);
+    const body = await res.text();
+    expect(body).toContain('<form');
+    expect(body).toContain('API key');
+    expect(body).toContain('?key=');
+  });
+
+  it('API calls without a session still get the Bearer 401 JSON', async () => {
+    const { base } = await bootServer(KEY);
+    const res = await fetch(`${base}/api/v1/traces`);
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: string }).error).toMatch(/Authorization header/);
+  });
+
+  it('/api/v1/health stays open without a key or a session', async () => {
+    const { base } = await bootServer(KEY);
+    const res = await fetch(`${base}/api/v1/health`);
+    expect(res.status).toBe(200);
+  });
+
+  it('?key= exchanges the key for an HttpOnly cookie and redirects with the key stripped', async () => {
+    const { base } = await bootServer(KEY);
+    const res = await fetch(`${base}/traces?since=2026-01-01&key=${KEY}`, { headers: HTML, redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/traces?since=2026-01-01');
+
+    const setCookie = res.headers.get('set-cookie') as string;
+    expect(setCookie).toMatch(new RegExp(`^${SESSION_COOKIE}=[A-Za-z0-9_-]{40,}`));
+    expect(setCookie).toMatch(/HttpOnly/i);
+    expect(setCookie).toMatch(/SameSite=Lax/i);
+    expect(setCookie).toMatch(/Path=\//);
+    // Plain http — no Secure attribute, or the browser would drop the cookie.
+    expect(setCookie).not.toMatch(/Secure/i);
+    // The cookie is a session token, never the key itself.
+    expect(setCookie).not.toContain(KEY);
+
+    // …and that cookie now authenticates API calls without a Bearer header.
+    const cookie = cookiePair(res);
+    const api = await fetch(`${base}/api/v1/traces`, { headers: { cookie } });
+    expect(api.status).toBe(200);
+    // A page load with the cookie is no longer intercepted by the sign-in page.
+    const page = await fetch(`${base}/moments`, { headers: { ...HTML, cookie }, redirect: 'manual' });
+    expect(page.status).not.toBe(401);
+
+    // A browser that ALREADY has a session and opens a shared ?key= link is
+    // still redirected to the key-free URL — the key never lingers in the
+    // address bar just because the exchange was unnecessary.
+    const again = await fetch(`${base}/rules?key=${KEY}`, { headers: { ...HTML, cookie }, redirect: 'manual' });
+    expect(again.status).toBe(302);
+    expect(again.headers.get('location')).toBe('/rules');
+  });
+
+  it('a wrong ?key= is refused with 403, no cookie, and the key is not echoed', async () => {
+    const { base } = await bootServer(KEY);
+    const wrong = 'zzz-not-the-key-4a1b';
+    const res = await fetch(`${base}/?key=${wrong}`, { headers: HTML, redirect: 'manual' });
+    expect(res.status).toBe(403);
+    expect(res.headers.get('set-cookie')).toBeNull();
+    const body = await res.text();
+    expect(body).toContain('did not match');
+    expect(body).not.toContain(wrong);
+  });
+
+  it('a forged or expired cookie is not a session', async () => {
+    const { base } = await bootServer(KEY);
+    const res = await fetch(`${base}/api/v1/traces`, { headers: { cookie: `${SESSION_COOKIE}=forged-token` } });
+    expect(res.status).toBe(401);
+  });
+
+  it('the sign-in form exchanges the key and lands on /', async () => {
+    const { base } = await bootServer(KEY);
+    const ok = await fetch(`${base}/session`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ key: KEY }).toString(),
+      redirect: 'manual',
+    });
+    expect(ok.status).toBe(303);
+    expect(ok.headers.get('location')).toBe('/');
+    const cookie = cookiePair(ok);
+    const api = await fetch(`${base}/api/v1/rules/custom`, { headers: { cookie } });
+    // Rules routes are not wired in this boot (no store) — a 404 from the
+    // API router proves auth passed; a 401 would mean it did not.
+    expect(api.status).not.toBe(401);
+
+    const bad = await fetch(`${base}/session`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ key: 'wrong' }).toString(),
+      redirect: 'manual',
+    });
+    expect(bad.status).toBe(403);
+    expect(bad.headers.get('set-cookie')).toBeNull();
+  });
+
+  it('the sign-in form works as a BROWSER submits it: the page sets Referrer-Policy: same-origin, so the POST carries the page origin and not "null"', async () => {
+    /*
+     * The case above sends no Origin header, which is how curl submits a
+     * form and not how a browser does. Under helmet's default
+     * `Referrer-Policy: no-referrer` a browser sends `Origin: null` on a
+     * POST navigation, the DNS-rebinding guard refuses it, and the
+     * `--api-key` dashboard could only ever be entered through a `?key=`
+     * link — a hole the curl-shaped test never saw. The
+     * policy is now `same-origin`; this holds both halves of that.
+     */
+    const { base } = await bootServer(KEY);
+    const page = await fetch(`${base}/`, { headers: HTML, redirect: 'manual' });
+    expect(page.status).toBe(401);
+    expect(page.headers.get('referrer-policy')).toBe('same-origin');
+
+    const form = (origin: string) =>
+      fetch(`${base}/session`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', origin },
+        body: new URLSearchParams({ key: KEY }).toString(),
+        redirect: 'manual',
+      });
+
+    // What the browser sends under `same-origin`: the page's own origin.
+    const ok = await form(base);
+    expect(ok.status).toBe(303);
+    expect(ok.headers.get('location')).toBe('/');
+    cookiePair(ok);
+
+    // What it sent under `no-referrer`: refused by the guard, right key or not.
+    const nulled = await form('null');
+    expect(nulled.status).toBe(403);
+    expect(((await nulled.json()) as { error: string }).error).toMatch(/invalid Origin/);
+    expect(nulled.headers.get('set-cookie')).toBeNull();
+  });
+
+  it('Bearer auth is unchanged for API clients', async () => {
+    const { base } = await bootServer(KEY);
+    const res = await fetch(`${base}/api/v1/traces`, { headers: { authorization: `Bearer ${KEY}` } });
+    expect(res.status).toBe(200);
+    const wrong = await fetch(`${base}/api/v1/traces`, { headers: { authorization: 'Bearer nope' } });
+    expect(wrong.status).toBe(403);
+  });
+
+  it('throttles key-exchange attempts independently of the API limiter', async () => {
+    const { base } = await bootServer(KEY);
+    let last = 0;
+    for (let i = 0; i < 12; i++) {
+      const res = await fetch(`${base}/?key=wrong-${i}`, { headers: HTML, redirect: 'manual' });
+      last = res.status;
+      if (last === 429) break;
+    }
+    expect(last).toBe(429);
+  });
+});
+
+describe('session auth — without --api-key', () => {
+  it('leaves ?key= alone and sets no cookie', async () => {
+    const { base } = await bootServer(undefined);
+    const res = await fetch(`${base}/?key=anything`, { headers: HTML, redirect: 'manual' });
+    expect(res.status).not.toBe(302);
+    expect(res.headers.get('set-cookie')).toBeNull();
+    const api = await fetch(`${base}/api/v1/traces`);
+    expect(api.status).toBe(200);
+  });
+});
+
+/*
+ * The key ring on the dashboard: the browser sign-in and the
+ * Bearer path both match every configured key, so a rotation — add the new
+ * key, move the clients, remove the old — never locks a browser out.
+ */
+describe('session auth — every configured key signs in', () => {
+  async function bootWithKeys(security: Partial<IrisConfig['security']>): Promise<BootedServer> {
+    const storage = new SqliteAdapter(':memory:');
+    await storage.initialize();
+    const config = {
+      ...defaultConfig,
+      dashboard: { ...defaultConfig.dashboard, port: 0 },
+      security: { ...defaultConfig.security, ...security },
+    };
+    const server = createDashboardServer(storage, config, mockLogger).start();
+    await new Promise((r) => server.once('listening', r));
+    const port = (server.address() as { port: number }).port;
+    const entry = { storage, server, base: `http://127.0.0.1:${port}` };
+    booted.push(entry);
+    return entry;
+  }
+
+  const signIn = (base: string, key: string) =>
+    fetch(`${base}/session`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin: base },
+      body: new URLSearchParams({ key }).toString(),
+    });
+
+  it('the old key and the new key both sign a browser in and both pass the Bearer path; a key past its date does neither', async () => {
+    const { base } = await bootWithKeys({
+      apiKey: 'old-key',
+      apiKeys: [
+        { id: 'next', keyHash: sha256Hex('new-key') },
+        { id: 'gone', keyHash: sha256Hex('expired-key'), expiresAt: '2020-01-01T00:00:00Z' },
+      ],
+    });
+    expect((await signIn(base, 'old-key')).status).toBe(303);
+    expect((await signIn(base, 'new-key')).status).toBe(303);
+    expect((await signIn(base, 'expired-key')).status).toBe(403);
+    expect((await signIn(base, 'nope')).status).toBe(403);
+    for (const key of ['old-key', 'new-key']) {
+      expect((await fetch(`${base}/api/v1/summary`, { headers: { authorization: `Bearer ${key}` } })).status).toBe(200);
+    }
+    expect((await fetch(`${base}/api/v1/summary`, { headers: { authorization: 'Bearer expired-key' } })).status).toBe(403);
+    expect((await fetch(`${base}/api/v1/health`)).status).toBe(200);
+  });
+
+  /*
+   * A browser signed in with a key that has an expiresAt is signed out at
+   * that instant, the same instant the Bearer path refuses the key. Until
+   * 0.20.0 the session kept full access for up to 30 days after its key
+   * expired. A session from a key with no expiry is untouched.
+   */
+  it('a browser session ends when the key it was opened with expires; the cookie asks for no longer than the key lives', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const HOUR = 60 * 60 * 1000;
+    const { base } = await bootWithKeys({
+      apiKey: 'lasting-key',
+      apiKeys: [{ id: 'temp', keyHash: sha256Hex('temp-key'), expiresAt: new Date(Date.now() + HOUR).toISOString() }],
+    });
+    const page = (cookie: string) => fetch(`${base}/`, { headers: { ...HTML, cookie }, redirect: 'manual' });
+    const api = (cookie: string) => fetch(`${base}/api/v1/summary`, { headers: { cookie } });
+
+    const tempRes = await signIn(base, 'temp-key');
+    expect(tempRes.status).toBe(303);
+    const maxAge = Number(/Max-Age=(\d+)/.exec(tempRes.headers.get('set-cookie') ?? '')?.[1]);
+    expect(maxAge).toBeGreaterThan(HOUR / 1000 - 5);
+    expect(maxAge).toBeLessThanOrEqual(HOUR / 1000);
+    const temp = cookiePair(tempRes);
+
+    const lastingRes = await signIn(base, 'lasting-key');
+    expect(Number(/Max-Age=(\d+)/.exec(lastingRes.headers.get('set-cookie') ?? '')?.[1])).toBe(30 * 24 * 60 * 60);
+    const lasting = cookiePair(lastingRes);
+
+    expect((await page(temp)).status).not.toBe(401); // signed in (the test build may have no SPA to serve)
+    expect((await api(temp)).status).toBe(200);
+
+    vi.setSystemTime(Date.now() + HOUR + 1000);
+
+    expect((await page(temp)).status).toBe(401);
+    expect((await api(temp)).status).toBe(401);
+    expect((await fetch(`${base}/api/v1/summary`, { headers: { authorization: 'Bearer temp-key' } })).status).toBe(403);
+    // The key with no expiry, and its session, are unaffected.
+    expect((await page(lasting)).status).not.toBe(401);
+    expect((await api(lasting)).status).toBe(200);
+  });
+});

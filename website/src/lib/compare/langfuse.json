@@ -1,0 +1,253 @@
+{
+  "slug": "langfuse",
+  "name": "Langfuse",
+  "homepage": "https://langfuse.com",
+  "category": "Observability",
+  "tagline": "MCP-Native Agent Eval vs SDK-Based Tracing",
+  "oneLine": "Open-source AI engineering platform for debugging, analyzing and iterating on AI agent applications; part of ClickHouse since January 2026.",
+  "ogImage": "/og-compare-langfuse.png",
+  "tldrVendor": "Langfuse is an open-source AI engineering platform with native Python/JS SDKs, 100+ library/framework integrations, prompt management, and enterprise compliance (SOC 2 Type II, ISO 27001, HIPAA). If you need broad framework support, prompt versioning, or enterprise certifications today, Langfuse is the more established choice.",
+  "tldrSourceUrl": "https://langfuse.com/docs",
+  "rows": [
+    {
+      "id": "integration",
+      "vendor": "SDK imports + @observe decorators",
+      "verdict": "iris",
+      "sourceUrl": "https://langfuse.com/docs/observability/sdk/instrumentation",
+      "quote": "The observe decorator is an easy way to automatically capture inputs, outputs, timings, and errors of a wrapped function without modifying the function's internal logic.",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "self_hosting",
+      "vendor": "PostgreSQL + ClickHouse + Redis + S3 + 2 containers",
+      "verdict": "neither",
+      "sourceUrl": "https://langfuse.com/self-hosting",
+      "quote": "Clickhouse: High-performance OLAP database which stores traces, observations, and scores.",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "overhead",
+      "vendor": "Async SDK tracing in your process",
+      "verdict": "iris",
+      "sourceUrl": "https://langfuse.com/docs/observability/sdk/instrumentation",
+      "quote": "As the Langfuse SDKs are asynchronous, they buffer observations in the background.",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "eval",
+      "vendor": "LLM-as-a-Judge, Jev as a judge (a decision model), human annotation, custom scores via API/SDK, and server-side code evaluators (Python or TypeScript)",
+      "verdict": "neither",
+      "sourceUrl": "https://langfuse.com/docs/evaluation/evaluation-methods/scores-via-sdk",
+      "quote": "If you want Langfuse to run deterministic Python or TypeScript logic for you, use code evaluators",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "cost_tracking",
+      "vendor": "Usage and USD cost per LLM call; dashboards and Metrics API by model, tags, or user",
+      "verdict": "neither",
+      "sourceUrl": "https://langfuse.com/docs/observability/features/token-and-cost-tracking",
+      "quote": "Langfuse tracks the usage and cost of every LLM call in your application, so you can monitor spend across models, use cases, and over time.",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "mcp_support",
+      "vendor": "MCP server in Cloud and self-hosted Langfuse: read and write tools for prompts, traces, scores, evaluators, datasets, experiments, dashboards",
+      "verdict": "neither",
+      "sourceUrl": "https://langfuse.com/docs/api-and-data-platform/features/mcp-server",
+      "quote": "Both read and write tools are available by default.",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "license",
+      "vendor": "MIT core + commercial enterprise modules",
+      "verdict": "neither",
+      "sourceUrl": "https://github.com/langfuse/langfuse",
+      "quote": "This repository is MIT licensed, except for the `ee` folders.",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "ownership",
+      "vendor": "Acquired by ClickHouse (Jan 2026)",
+      "verdict": "iris",
+      "sourceUrl": "https://langfuse.com/blog/joining-clickhouse",
+      "quote": "ClickHouse has acquired Langfuse.",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "dashboard",
+      "vendor": "Customizable multi-dimension dashboards",
+      "verdict": "neither",
+      "sourceUrl": "https://langfuse.com/docs/metrics/features/custom-dashboards",
+      "quote": "Group by user, model, time, trace name, etc.",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "frameworks",
+      "vendor": "100+ library/framework integrations, plus native Python/JS SDKs and OpenTelemetry",
+      "verdict": "vendor",
+      "sourceUrl": "https://langfuse.com/docs",
+      "quote": "Capture traces via our native SDKs for Python/JS, 100+ library/framework integrations, OpenTelemetry, or via an LLM Gateway such as LiteLLM",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "prompt_management",
+      "vendor": "Versioned prompts with labels for environment deployment; server- and client-side prompt caching",
+      "verdict": "vendor",
+      "sourceUrl": "https://langfuse.com/docs/prompt-management/overview",
+      "quote": "Use version control and labels to manage deployments across environments",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "enterprise",
+      "vendor": "SOC 2, ISO 27001, HIPAA, SCIM",
+      "verdict": "vendor",
+      "sourceUrl": "https://langfuse.com/security",
+      "quote": "covered by SOC 2 Type II and ISO 27001 audits, and undergoes annual third-party penetration tests",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    },
+    {
+      "id": "cost_to_run",
+      "vendor": "Cloud: Hobby free (50k units a month, 30 days data access), Core $29/month, Pro $199/month, Enterprise $2,499/month; the MIT core is free to self-host",
+      "verdict": "neither",
+      "sourceUrl": "https://langfuse.com/pricing",
+      "quote": "Core ($29/month) For production projects",
+      "lastVerified": "2026-10-01",
+      "quoteVerified": true
+    }
+  ],
+  "vendorReasons": [
+    {
+      "text": "You need prompt management and versioning",
+      "sourceUrl": "https://langfuse.com/docs/prompt-management/overview"
+    },
+    {
+      "text": "You need LLM-as-Judge evaluation (semantic, not just heuristic)",
+      "sourceUrl": "https://langfuse.com/docs/evaluation/overview"
+    },
+    {
+      "text": "You need enterprise compliance today (SOC 2, HIPAA)",
+      "sourceUrl": "https://langfuse.com/security"
+    },
+    {
+      "text": "You're using non-MCP frameworks and need broad SDK support",
+      "sourceUrl": "https://langfuse.com/docs"
+    },
+    {
+      "text": "You need multi-dimension dashboard slicing (user, session, model)",
+      "sourceUrl": "https://langfuse.com/docs/metrics/features/custom-dashboards"
+    }
+  ],
+  "faq": [
+    {
+      "question": "What is the difference between Iris and Langfuse?",
+      "vendorPart": "Langfuse is an open-source AI engineering platform with native Python/JS SDKs and @observe decorators, prompt management, and 100+ library/framework integrations. Langfuse offers broader framework support and enterprise compliance (SOC 2 Type II, ISO 27001, HIPAA).",
+      "sourceUrl": "https://langfuse.com/docs"
+    },
+    {
+      "question": "Is Iris better than Langfuse for MCP agent evaluation?",
+      "vendorPart": "Langfuse captures data through its SDKs, a framework integration, OpenTelemetry, or an LLM gateway such as LiteLLM, and offers LLM-as-a-Judge and Jev as a judge, code evaluators, human annotation, and enterprise compliance.",
+      "sourceUrl": "https://langfuse.com/docs"
+    }
+  ],
+  "sources": [
+    {
+      "label": "Langfuse docs overview",
+      "url": "https://langfuse.com/docs",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse SDK instrumentation (observe decorator and wrapper)",
+      "url": "https://langfuse.com/docs/observability/sdk/instrumentation",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse self-hosting",
+      "url": "https://langfuse.com/self-hosting",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse evaluation overview",
+      "url": "https://langfuse.com/docs/evaluation/overview",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse model usage and cost",
+      "url": "https://langfuse.com/docs/observability/features/token-and-cost-tracking",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse changelog: MCP observations, metrics, scores (2026-05-29)",
+      "url": "https://langfuse.com/changelog/2026-05-29-mcp-update",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse changelog: evaluators via MCP (2026-06-10)",
+      "url": "https://langfuse.com/changelog/2026-06-10-evaluators-via-mcp",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse GitHub README",
+      "url": "https://github.com/langfuse/langfuse",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse blog: Langfuse joins ClickHouse (2026-01-16)",
+      "url": "https://langfuse.com/blog/joining-clickhouse",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse custom dashboards",
+      "url": "https://langfuse.com/docs/metrics/features/custom-dashboards",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse integrations",
+      "url": "https://langfuse.com/integrations",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse prompt management overview",
+      "url": "https://langfuse.com/docs/prompt-management/overview",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse security",
+      "url": "https://langfuse.com/security",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse pricing",
+      "url": "https://langfuse.com/pricing",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse scores via API/SDK and code evaluators",
+      "url": "https://langfuse.com/docs/evaluation/evaluation-methods/scores-via-sdk",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse Jev as a judge",
+      "url": "https://langfuse.com/docs/evaluation/evaluation-methods/jev-as-a-judge",
+      "lastVerified": "2026-10-01"
+    },
+    {
+      "label": "Langfuse MCP server docs",
+      "url": "https://langfuse.com/docs/api-and-data-platform/features/mcp-server",
+      "lastVerified": "2026-10-01"
+    }
+  ],
+  "lastVerified": "2026-10-01",
+  "quotesCheckedOn": "2026-09-22"
+}

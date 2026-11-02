@@ -1,0 +1,107 @@
+import type { Metadata } from "next";
+import { connection } from "next/server";
+import { Space_Grotesk, Manrope, JetBrains_Mono } from "next/font/google";
+import { OG_IMAGE_URL } from "@/lib/og";
+import { FEED_TITLE, FEED_URL } from "@/lib/feed";
+import { Analytics } from "@vercel/analytics/next";
+import "./globals.css";
+import { ThemeProvider } from "@/components/theme-provider";
+
+const display = Space_Grotesk({
+  variable: "--font-display",
+  subsets: ["latin"],
+  display: "swap",
+});
+
+const body = Manrope({
+  variable: "--font-body",
+  subsets: ["latin"],
+  display: "swap",
+});
+
+const mono = JetBrains_Mono({
+  variable: "--font-mono",
+  subsets: ["latin"],
+  display: "swap",
+});
+
+export const metadata: Metadata = {
+  metadataBase: new URL("https://iris-eval.com"),
+  title: "Iris — stop shipping agents on vibes",
+  description:
+    "Stop shipping agents on vibes. Score output quality, detect PII and injection attacks, enforce cost thresholds across all your agents. Open-source core, self-hosted, one command to start.",
+  icons: {
+    icon: [
+      { url: "/favicon-32x32.png", sizes: "32x32", type: "image/png" },
+      { url: "/favicon-16x16.png", sizes: "16x16", type: "image/png" },
+    ],
+    apple: "/apple-touch-icon.png",
+  },
+  openGraph: {
+    title: "Iris — stop shipping agents on vibes",
+    description:
+      "Score output quality, catch safety failures, enforce cost budgets across every MCP agent. Open-source core.",
+    url: "https://iris-eval.com",
+    siteName: "Iris",
+    type: "website",
+    images: [OG_IMAGE_URL],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Iris — stop shipping agents on vibes",
+    description:
+      "Score your agents. Catch PII leaks, hallucinations, and cost overruns before users do. Open-source MCP server.",
+    images: [OG_IMAGE_URL],
+    site: "@iris_eval",
+  },
+};
+
+export default async function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>): Promise<React.ReactElement> {
+  // Render per request, never prerender: src/proxy.ts puts a fresh script
+  // nonce in each request's Content-Security-Policy, and Next can only stamp
+  // it on the scripts of a page it renders for that request. A prerendered
+  // page would carry scripts without the nonce, which the policy blocks.
+  await connection();
+  return (
+    <html lang="en" suppressHydrationWarning>
+      <body
+        className={`${display.variable} ${body.variable} ${mono.variable} font-body antialiased`}
+      >
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{
+            __html: JSON.stringify({
+              "@context": "https://schema.org",
+              "@type": "Organization",
+              name: "Iris",
+              url: "https://iris-eval.com",
+              logo: "https://iris-eval.com/iris-logo.svg",
+              sameAs: [
+                "https://github.com/iris-eval/mcp-server",
+                "https://x.com/iris_eval",
+              ],
+            }),
+          }}
+        />
+        {/* Feed autodiscovery on every page. This is a rendered <link>, not
+            `metadata.alternates.types`, because every page here sets its own
+            `alternates` (canonical) and Next resolves a child's alternates
+            wholesale instead of merging (next/dist/lib/metadata/resolve-metadata.js,
+            case "alternates") — a layout-level types entry would reach no
+            page. React hoists a <link> into <head> wherever it renders. */}
+        <link rel="alternate" type="application/rss+xml" title={FEED_TITLE} href={FEED_URL} />
+        <ThemeProvider>{children}</ThemeProvider>
+        {/* Page views for the privacy page's "Vercel Web Analytics" line:
+            cookie-free, no personal data. The component adds its script with
+            createElement from Next's own nonce'd bundle, which the policy's
+            'strict-dynamic' trusts, and reports to /_vercel/insights on this
+            origin, which connect-src 'self' allows. */}
+        <Analytics />
+      </body>
+    </html>
+  );
+}

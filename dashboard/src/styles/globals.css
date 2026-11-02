@@ -1,0 +1,283 @@
+@import './tokens.css';
+@import './utilities.css';
+
+/*
+ * Fonts now self-hosted (tokens.css → fonts.css → public/fonts/, #334)
+ * for Space Grotesk + Manrope + JetBrains Mono — matches website + brand
+ * guide. The previous Geist load at this layer is removed because it
+ * duplicated the import.
+ */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: var(--font-body);
+  font-size: var(--text-body);
+  color: var(--text-primary);
+  background-color: var(--bg-base);
+  line-height: var(--leading-body);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: 'cv11', 'ss01'; /* Manrope tabular figure tweaks */
+  /* Digits on a fixed grid everywhere — metrics, metas, and tables align
+   * without per-component opt-in. Prose is unaffected visually; data
+   * surfaces stop wobbling. */
+  font-variant-numeric: tabular-nums;
+}
+
+/* Display tier — Space Grotesk for headings, hero metrics, page titles */
+h1, h2, h3, h4, .display {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+a {
+  color: var(--text-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--iris-300);
+}
+
+button {
+  cursor: pointer;
+  font-family: inherit;
+}
+
+input, select {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+code, pre {
+  font-family: var(--font-mono);
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--iris-500);
+  outline-offset: 2px;
+  border-radius: var(--radius-xs);
+}
+
+/*
+ * Visually-hidden container that reveals on :focus-within. Used by the
+ * decorative-SVG charts (PassRateAreaChart, StackedBarByDay) where the
+ * SVG markers are aria-hidden and the canonical keyboard / screen-reader
+ * path is a hidden <ol> of <Link>s. Default state: 1px clip-rect (still
+ * tab-reachable, AT-readable). On focus-within the container expands
+ * into a visible card so sighted keyboard users see the focus indicator
+ * and the surrounding choices, instead of focus appearing to vanish.
+ *
+ * Why a class and not inline style: pseudo-classes can't be expressed
+ * via inline style. The clip-rect default + focus-within reveal must
+ * live in CSS.
+ */
+.iris-sr-reveal {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.iris-sr-reveal:focus-within {
+  position: static;
+  width: auto;
+  height: auto;
+  margin: var(--space-3) 0 0 0;
+  padding: var(--space-3) var(--space-4);
+  overflow: visible;
+  clip: auto;
+  white-space: normal;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  border: 1px solid var(--iris-500);
+  border-radius: var(--radius-sm);
+}
+
+.iris-sr-reveal:focus-within > li {
+  list-style: none;
+  padding: var(--space-1) 0;
+}
+
+::selection { background: var(--iris-600); color: white; }
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-base);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-xs);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+html {
+  scrollbar-color: var(--border-strong) transparent;
+  scrollbar-width: thin;
+}
+
+/* === PULSE DOT — for "live" status indicators (matches website) === */
+@keyframes pulse-ring {
+  0% { transform: scale(1); opacity: 0.5; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+.pulse-dot { position: relative; }
+.pulse-dot::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: 50%;
+  background: var(--iris-500);
+  animation: pulse-ring 2s ease-out infinite;
+}
+
+/*
+ * A page whose code is still arriving (#662). Invisible for the first
+ * 250ms so a fast load does not flash; the status text is announced at
+ * once regardless, because opacity does not hide it from a screen reader.
+ */
+.iris-route-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-12) var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  opacity: 0;
+  animation: iris-route-loading-in 150ms ease-out 250ms forwards;
+}
+.iris-route-loading__bar {
+  width: 120px;
+  height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, transparent, var(--iris-500), transparent);
+  background-size: 200% 100%;
+  animation: iris-route-loading-sweep 1.2s linear infinite;
+}
+@keyframes iris-route-loading-in {
+  to { opacity: 1; }
+}
+@keyframes iris-route-loading-sweep {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+/*
+ * Reduced-motion accessibility (B8.6). When the user has set their OS
+ * preference to reduce motion, kill all animations + transitions globally.
+ * Tooltip respects this prop directly (skips the fade), but other surfaces
+ * may use CSS transitions through the tokens — disable those here.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/*
+ * Mobile baseline (B8.6). Below 768px, the dashboard is not designed for
+ * comfortable use — long DataTable rows would clip, the sidebar would
+ * eat the screen. The MobileBanner component renders an unobtrusive
+ * notice; we keep the dashboard usable (not broken) so a desktop user
+ * who briefly resizes their window doesn't lose their session.
+ *
+ * The banner sits at the bottom + is dismissable via localStorage.
+ */
+@media (max-width: 767px) {
+  /* The sidebar collapses to its icon rail at this width in the
+   * component (layout/Sidebar.tsx): its width is an inline style,
+   * so a rule here could never narrow it — the 160px rule that sat here
+   * from v0.4 was inert the whole time. */
+  /* Allow horizontal overflow gracefully rather than clipping content. */
+  main {
+    overflow-x: auto;
+  }
+}
+
+/*
+ * Print-friendly layout (B8.7). Strip dashboard chrome so a printed
+ * Decision Moment, audit log, or rules list reads like a report.
+ * Uses class-free attribute selectors so we don't need to add
+ * data-print-* hooks throughout the component tree.
+ */
+@media print {
+  /* Black-on-white for ink economy. Forced colors override the OKLCH
+   * palette so dark-mode prints don't flood the page. */
+  body {
+    background: white !important;
+    color: black !important;
+  }
+  /* Hide non-content chrome: nav, sidebar, header, banners, modals,
+   * floating bars, command palette trigger, theme toggle. */
+  aside[aria-label="Main navigation"],
+  header,
+  [role="region"][aria-label="Welcome"],
+  [role="region"][aria-label="Bulk actions"],
+  [role="status"],
+  [role="dialog"] {
+    display: none !important;
+  }
+  /* Single-column content; no fixed-height container clipping print pages. */
+  body, #root, main {
+    height: auto !important;
+    overflow: visible !important;
+  }
+  main {
+    padding: 0 !important;
+  }
+  /* Ensure tables and code blocks don't break across pages mid-row. */
+  tr, pre, code {
+    page-break-inside: avoid;
+  }
+  h1, h2, h3 {
+    page-break-after: avoid;
+  }
+  /* Keep significance badges legible — convert glyph circles to filled
+   * blocks since color-only differentiation may not survive grayscale. */
+  [aria-label*="violation"], [aria-label*="spike"], [aria-label*="collision"],
+  [aria-label*="Pass"], [aria-label*="Fail"] {
+    border: 1px solid black !important;
+  }
+  /* Underline links so they print as actionable references. */
+  a {
+    text-decoration: underline !important;
+    color: black !important;
+  }
+  /* Print the URL after each link so paper readers can follow. */
+  a[href^="http"]::after {
+    content: " (" attr(href) ")";
+    font-size: 80%;
+    color: #555;
+  }
+}

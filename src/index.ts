@@ -1,0 +1,812 @@
+#!/usr/bin/env node
+
+import type { Server } from 'node:http';
+import { parseArgs } from 'node:util';
+import { z } from 'zod';
+import { loadConfig, loadSecurityConfig, configFilePath, fixedApiKey, type CliArgs } from './config/index.js';
+import { PKG_VERSION } from './config/defaults.js';
+import { COMMAND } from './identity.js';
+import { createStorage } from './storage/index.js';
+import { storeGate, STORE_READY_WAIT_MS } from './storage/ready.js';
+import { withDemoIngestGuard } from './storage/demo-guard.js';
+import { createIrisServer } from './server.js';
+import { runRetentionSweep, scheduleRetentionSweep } from './retention.js';
+import { installWebhookNotifier } from './notify/index.js';
+import { createStdioTransport } from './transport/stdio.js';
+import { createHttpTransport } from './transport/http.js';
+import { createDashboardServer } from './dashboard/server.js';
+import { createLogger } from './utils/logger.js';
+import { loadOrInitPreferences, shouldAutoLaunchDashboard, createPreferenceStore } from './preferences.js';
+import { openBrowser } from './utils/open-browser.js';
+import { createCustomRuleStore } from './custom-rule-store.js';
+import { keepInStep } from './eval/shared-state.js';
+import { EvalEngine } from './eval/engine.js';
+import { refreshLocalLabels } from './eval/local-labels.js';
+import { LOCAL_TENANT } from './types/tenant.js';
+import { validatePortConfig } from './utils/validate-port-config.js';
+import { validateBindPolicy } from './utils/bind-policy.js';
+import { createLiveKeyRing } from './security/live-key-ring.js';
+import { registerPlugins } from './eval/plugins.js';
+import { irisHome } from './utils/iris-home.js';
+import { requestSizeLimitBytes } from './utils/size-limit.js';
+import { pruneBackups } from './storage/backup.js';
+import { announceUpgrade, fatalLine } from './cli/upgrade-notice.js';
+import {
+  seedDemoData,
+  clearDemoData,
+  demoDbPath,
+  demoPreferencesPath,
+  demoCustomRulesPath,
+  demoAuditLogPath,
+  DEMO_DAYS,
+  type SeedDemoDataSummary,
+} from './dashboard/seed-demo-data.js';
+
+const PortSchema = z
+  .string()
+  .regex(/^\d+$/, 'must be a positive integer')
+  .transform((s) => parseInt(s, 10))
+  .refine((n) => Number.isFinite(n) && n >= 1 && n <= 65535, 'must be between 1 and 65535');
+
+const CliSchema = z
+  .object({
+    transport: z.enum(['stdio', 'http']).optional(),
+    port: PortSchema.optional(),
+    config: z.string().min(1).optional(),
+    'db-path': z.string().min(1).optional(),
+    'api-key': z.string().min(1).optional(),
+    dashboard: z.boolean().optional(),
+    'dashboard-port': PortSchema.optional(),
+    'dashboard-host': z.string().min(1).optional(),
+    demo: z.boolean().optional(),
+    'demo-clear': z.boolean().optional(),
+    'self-test': z.boolean().optional(),
+    purge: z.boolean().optional(),
+    version: z.boolean().optional(),
+    help: z.boolean().optional(),
+    // ingest only
+    file: z.string().min(1).optional(),
+    evaluate: z.boolean().optional(),
+    'eval-type': z.enum(['completeness', 'relevance', 'safety', 'cost', 'custom', 'all']).optional(),
+    'fail-on': z.enum(['policy_gate', 'detector_veto', 'critical_unknown', 'required_evidence_missing', 'risk_over_loss', 'fail', 'unknown', 'any']).optional(),
+    redact: z.enum(['none', 'critical_spans']).optional(),
+    source: z.enum(['cli', 'hook']).optional(),
+    dataset: z.string().min(1).optional(),
+    'allow-empty': z.boolean().optional(),
+  })
+  .strict();
+
+/*
+ * `install` is handed off before the server's own argument parsing: it has
+ * its own flags (--list, --upgrade, --uninstall), writes a client's config and exits,
+ * and never reaches the MCP stdio path below, where stdout belongs to the
+ * JSON-RPC stream. Only as the first argument, so a server flag's value can
+ * never be read as the verb.
+ */
+if (process.argv[2] === 'install') {
+  const { runInstall } = await import('./cli/install/command.js');
+  process.exit(await runInstall(process.argv.slice(3), { stdout: process.stdout, stderr: process.stderr }));
+}
+
+/*
+ * `export` likewise: its flags are the export endpoint's query parameters,
+ * not the server's, and stdout carries the export itself.
+ */
+if (process.argv[2] === 'export') {
+  const { runExport } = await import('./cli/export.js');
+  process.exit(await runExport(process.argv.slice(3), { stdout: process.stdout, stderr: process.stderr }));
+}
+
+let parsed;
+try {
+  parsed = parseArgs({
+    options: {
+      transport: { type: 'string' },
+      port: { type: 'string' },
+      config: { type: 'string' },
+      'db-path': { type: 'string' },
+      'api-key': { type: 'string' },
+      /*
+       * No `default: false` here, unlike the other booleans. The value
+       * flows into loadConfig, and cliArgsToConfig writes the CLI layer
+       * whenever `dashboard !== undefined` — so a default made the flag's
+       * ABSENCE indistinguishable from an explicitly disabled dashboard and stamped
+       * `enabled: false` over the env and config-file layers, which merge
+       * before it. IRIS_DASHBOARD=true and `dashboard.enabled` in
+       * config.json therefore did nothing at all. Left undefined, the
+       * lower layers survive and `--dashboard` still wins when passed.
+       * The other boolean flags are read for truthiness only and never
+       * reach the merge, so their defaults are harmless.
+       */
+      dashboard: { type: 'boolean' },
+      'dashboard-port': { type: 'string' },
+      'dashboard-host': { type: 'string' },
+      demo: { type: 'boolean', default: false },
+      'demo-clear': { type: 'boolean', default: false },
+      'self-test': { type: 'boolean', default: false },
+      purge: { type: 'boolean', default: false },
+      version: { type: 'boolean', default: false },
+      help: { type: 'boolean', short: 'h', default: false },
+      // ingest only
+      file: { type: 'string' },
+      evaluate: { type: 'boolean', default: false },
+      'eval-type': { type: 'string' },
+      'fail-on': { type: 'string' },
+      redact: { type: 'string' },
+      source: { type: 'string' },
+      dataset: { type: 'string' },
+      'allow-empty': { type: 'boolean', default: false },
+    },
+    strict: true,
+    allowPositionals: true,
+  });
+} catch (err) {
+  process.stderr.write(`iris-eval: ${(err as Error).message}\nRun \`iris-eval --help\` for usage.\n`);
+  process.exit(2);
+}
+
+/*
+ * --version answers on stdout, bare, before anything else: the README's
+ * "check your version" recipe pointed at a flag that did not exist and a
+ * --help banner that printed no version (#369). Bare so `iris-eval
+ * --version` composes in scripts the way `npm --version` does.
+ */
+if (parsed.values.version) {
+  process.stdout.write(`${PKG_VERSION}\n`);
+  process.exit(0);
+}
+
+const validation = CliSchema.safeParse(parsed.values);
+if (!validation.success) {
+  const issues = validation.error.issues
+    .map((i) => `  --${i.path.join('.')}: ${i.message}`)
+    .join('\n');
+  process.stderr.write(`iris-eval: invalid argument(s):\n${issues}\nRun \`iris-eval --help\` for usage.\n`);
+  process.exit(2);
+}
+const values = validation.data;
+
+if (values.help) {
+  process.stderr.write(`
+Iris — MCP-Native Agent Eval Server v${PKG_VERSION}
+
+Usage: ${COMMAND} [options]
+       ${COMMAND} ingest [--file <path>] [--evaluate] [--eval-type <bundle>] [--fail-on <basis>] [--dataset <id|label>] [--allow-empty] [--redact <mode>] [--source cli|hook]
+       ${COMMAND} install <client> [--uninstall] | --list | --upgrade   (add Iris to an MCP client's config, or move every client to this version; install --help)
+       ${COMMAND} export traces|evaluations --format csv|jsonl [--out <file>] [filters]   (export --help for the filters)
+
+Options:
+  --transport <type>       Transport type: stdio (default) or http
+  --port <number>          HTTP transport port 1-65535 (default: 3000)
+  --config <path>          Config file path (default: ~/.iris/config.json)
+  --db-path <path>         SQLite database path (default: ~/.iris/iris.db)
+  --api-key <key>          API key for HTTP authentication
+  --dashboard              Enable web dashboard
+  --dashboard-port <port>  Dashboard port 1-65535 (default: 6920)
+  --dashboard-host <host>  Dashboard bind address (default: 127.0.0.1). The dashboard is
+                           unauthenticated unless --api-key is set — binding it beyond
+                           loopback exposes your full trace history to the network.
+  --demo                   Seed a demo database and serve the dashboard against it —
+                           see the dashboard working before wiring up your agent.
+                           Demo data lives in its own files (demo.db) and never mixes
+                           with your real traces. Serves the dashboard only (no MCP
+                           transport). Idempotent: re-running reuses the seeded data.
+  --demo-clear             Delete the demo database (and its sidecar files), then exit.
+                           Your real traces are not touched.
+  --self-test              Run the offline install diagnostic and exit: the configured IRIS_HOME
+                           is created and probed for writability, the configured database's
+                           schema is read (read-only) against this version's and its search index
+                           reported, the MCP clients pinned to a version that cannot open it are
+                           named, then storage round-trip,
+                           deterministic evals, dashboard + rebinding guard run inside an
+                           isolated temp home. Exit code 0 = healthy, 1 = a check failed.
+  --purge                  Delete EVERY stored trace, span and evaluation from the configured
+                           database, compact the file and truncate the write-ahead log so the
+                           deleted text does not linger on disk, then exit. Deployed rules, the
+                           audit log and preferences are kept, and the copies of the database
+                           taken before an upgrade are deleted too. Not reversible. Stop any running
+                           Iris server first — the file is compacted in place.
+  --version                Print the version and exit
+  -h, --help               Show this help message
+
+Ingest (the third door — a CI gate, and the path host hooks use; no server needed):
+  ${COMMAND} ingest        Read one JSON trace, or NDJSON (one per line), from stdin or --file,
+                           store each in the configured database, and print one JSON line per
+                           trace: {trace_id, status} or, with --evaluate, {trace_id, evaluation_id,
+                           passed, verdict:{state,basis,by,also?}, unjudged?}. Same schema as
+                           POST /api/v1/traces, same rules as evaluate_output. Never sweeps retention.
+  --file <path>            Read traces from this file instead of stdin
+  --evaluate               Evaluate each trace in the same call (a trace may also carry evaluate: true)
+  --eval-type <bundle>     With --evaluate: completeness | relevance | safety | cost | custom | all (default: all)
+  --fail-on <basis>        Exit 1 when any verdict matches: any (not a pass: failed, or not checked) | fail |
+                           unknown | policy_gate | detector_veto | critical_unknown |
+                           required_evidence_missing | risk_over_loss. One basis passes everything else. A verdict
+                           matches a basis when that layer decided it or would have (verdict.also), so a
+                           leak in an output that also broke a policy still trips detector_veto.
+                           Exit 0 means every trace read was judged and none matched: a rejected trace,
+                           or no trace judged at all, exits 2.
+  --dataset <id|label>     Restrict --fail-on to the case keys in this dataset (POST /api/v1/datasets promotes a
+                           run's case keys into one); every trace is still stored and evaluated, and each receipt
+                           says whether it was in the gate
+  --allow-empty            With --fail-on: exit 0 when no trace was in the gate (an empty file, or a run
+                           with none of the dataset's cases). Without it that exits 2.
+  --redact <mode>          none | critical_spans — override storage.redact for this ingest
+  --source <door>          cli (default) | hook — recorded on each trace as its capture path
+                           Exit codes: 0 stored (nothing tripped), 1 a verdict tripped --fail-on, 2 usage, nothing stored,
+                           or a --fail-on gate that did not judge every trace it read.
+
+Environment variables (CLI flags take precedence):
+  IRIS_TRANSPORT                       stdio | http
+  IRIS_HOST                            Bind address for HTTP transport (default: 127.0.0.1)
+  IRIS_PORT                            HTTP transport port (1-65535)
+  IRIS_HOME                            Directory for all per-user files: config.json, iris.db, custom-rules.json,
+                                       audit.log, preferences.json (default: ~/.iris)
+  IRIS_DB_PATH                         SQLite database path (overrides IRIS_HOME for the DB only)
+  IRIS_SQLITE_DRIVER                   native (better-sqlite3, default) | node (Node's built-in node:sqlite, 22.13+).
+                                       Unset: native, falling back to node when the native module cannot load
+  IRIS_SEARCH_BUDGET_MS                How long one trace search may read before it answers with what it found
+                                       (50-60000 ms, default 1000; storage.searchBudgetMs in config.json)
+  IRIS_SEARCH_INDEX                    on | off (default on). off keeps no full-text index: writes are cheaper,
+                                       and a search reads the traces within its budget (storage.searchIndex)
+  IRIS_LOG_LEVEL                       debug | info | warn | error
+  IRIS_DASHBOARD                       true/1/yes/on enables the web dashboard; false/0/no/off disables it (overrides config.json)
+  IRIS_DASHBOARD_PORT                  Dashboard port (1-65535, default: 6920)
+  IRIS_DASHBOARD_HOST                  Dashboard bind address (default: 127.0.0.1)
+  IRIS_WEBHOOK_URL                     The receiver of the webhook that fires on a moment (docs/webhooks.md);
+                                       merged over notify.webhook in config.json
+  IRIS_WEBHOOK_SECRET                  Its signing key (any string, or whsec_ + base64); the iris format refuses
+                                       to run without one
+  IRIS_API_KEY                         API key for HTTP authentication. Required to bind the HTTP transport or the
+                                       dashboard beyond loopback (0.0.0.0, a LAN address, a container): without it
+                                       the server refuses to start.
+  IRIS_API_KEY_FILE                    Path to a file whose trimmed contents are the API key (the secret-file pattern
+                                       Docker and Kubernetes mount). Set this or IRIS_API_KEY, not both; further keys
+                                       and rotation: security.apiKeys in config.json.
+  IRIS_ALLOW_UNAUTHENTICATED           Set to 1 to run a non-loopback bind with NO key on purpose (lifts the refusal)
+  IRIS_ALLOWED_ORIGINS                 Comma-separated origin allowlist. Dashboard: CORS headers (supports globs, e.g. http://localhost:*).
+                                       HTTP transport: exact-match Origin allowlist for DNS-rebinding protection (globs ignored;
+                                       this server's own loopback origins are always allowed).
+  IRIS_MAX_INPUT_ELEMENTS              The most array elements and object keys one input may hold before it is validated
+                                       (default: 100000): a tool call's arguments on every transport, and a request body on the
+                                       dashboard port (the API's JSON bodies and POST /v1/traces as JSON). A tool call over it
+                                       gets an error result; a body, 413. Protobuf on POST /v1/traces has its own ceiling: one
+                                       element per 5 bytes of security.requestSizeLimit, or this when higher, so an exporter's
+                                       batch within the request size is not refused for its density. Also
+                                       security.maxInputElements in config.json
+  IRIS_MAX_TOOL_INPUT_ELEMENTS         Its name before 0.21.0, read when IRIS_MAX_INPUT_ELEMENTS is unset
+  IRIS_NO_AUTO_LAUNCH                  Set to 1 to disable first-run dashboard auto-launch
+  IRIS_ANTHROPIC_API_KEY               Required by evaluate_with_llm_judge + verify_citations (provider=anthropic)
+  IRIS_OPENAI_API_KEY                  Required by evaluate_with_llm_judge + verify_citations (provider=openai)
+  IRIS_LLM_JUDGE_MAX_COST_USD_PER_EVAL Hard cost cap per LLM judge call (default: 0.25); max_cost_usd can lower it
+                                       for a call, never raise it
+  IRIS_RELEVANCE_JUDGE_MODEL           A priced model id: answers_the_ask then asks this judge on every
+                                       evaluation that carries input, and gates on its verdict (off by default).
+                                       Sends that input and output to the model's provider on your key
+  IRIS_LLM_JUDGE_DAILY_BUDGET_USD      What every judge call together may spend per UTC day, per tenant: the
+                                       relevance judge, evaluate_with_llm_judge and verify_citations, kept in the
+                                       database (default: 1). Past it no judge call is made
+  IRIS_RELEVANCE_JUDGE_DAILY_BUDGET_USD  Its name before 0.21.0, read when IRIS_LLM_JUDGE_DAILY_BUDGET_USD is unset
+  IRIS_RELEVANCE_JUDGE_MAX_CALLS_PER_REQUEST  Relevance judge calls one request may make (default: 20)
+  IRIS_RELEVANCE_JUDGE_REDACT          on (default): PII and credentials no_pii flags are replaced before the
+                                       input and output are sent to the judge; off sends them as they are
+  IRIS_CITATION_ALLOW_FETCH            Set to 1 to permit outbound HTTP in verify_citations (off by default);
+                                       a tool argument can turn it off for a call, never on
+  IRIS_CITATION_DOMAINS                Comma-separated hostname allowlist for verify_citations (suffix match);
+                                       a tool argument can narrow it, never add to it
+  IRIS_CITATION_MAX_COST_USD_TOTAL     The most one verify_citations call may spend on judge calls (default: 1);
+                                       max_cost_usd_total can lower it for a call, never raise it
+  IRIS_OTEL_ENDPOINT                   Enable best-effort OTLP/HTTP JSON trace export to this collector URL
+  IRIS_OTEL_SERVICE_NAME               service.name resource attribute for OTel export (default: iris-eval)
+  IRIS_OTEL_HEADERS                    Comma-separated k=v headers for OTel export (e.g. "authorization=Bearer abc")
+  IRIS_OTEL_TIMEOUT_MS                 Per-export timeout (default: 15000)
+  RATE_LIMIT_SALT                      (website only: salts the playground rate limit; the server never reads it)
+
+Dashboard preferences ($IRIS_HOME/preferences.json, default ~/.iris/preferences.json):
+  Edit autoLaunch: false to permanently disable first-run dashboard auto-launch.
+`);
+  process.exit(0);
+}
+
+/*
+ * The mode flags are mutually exclusive, and the check runs before any of
+ * them so a refused combination exits without touching the filesystem —
+ * `--self-test --purge` must not quietly run only the first one it sees.
+ */
+/*
+ * The verbs. `install` was handed off above, before this parse; a positional
+ * other than `ingest` is refused before anything runs, and `ingest` cannot be
+ * combined with a server mode: it opens the store, does its work and exits.
+ */
+const verb = parsed.positionals[0];
+if (verb === 'install' || verb === 'export') {
+  process.stderr.write(`${COMMAND}: ${verb} comes first and takes no server flags: ${COMMAND} ${verb} ${verb === 'install' ? '<client>' : 'traces|evaluations'}.\nRun \`${COMMAND} ${verb} --help\` for usage.\n`);
+  process.exit(2);
+}
+if (parsed.positionals.length > 1 || (verb !== undefined && verb !== 'ingest')) {
+  process.stderr.write(`${COMMAND}: unknown command "${parsed.positionals.join(' ')}". The commands are "ingest", "export" and "install".\nRun \`${COMMAND} --help\` for usage.\n`);
+  process.exit(2);
+}
+if (verb === 'ingest') {
+  const clashing = (['transport', 'dashboard', 'demo', 'demo-clear', 'self-test', 'purge', 'port', 'dashboard-port', 'dashboard-host'] as const).filter((flag) => values[flag] !== undefined && values[flag] !== false);
+  if (clashing.length > 0) {
+    process.stderr.write(`${COMMAND}: ingest cannot be combined with ${clashing.map((f) => `--${f}`).join(', ')} — it stores, evaluates and exits; it serves nothing.\nRun \`${COMMAND} --help\` for usage.\n`);
+    process.exit(2);
+  }
+  const { runIngest } = await import('./cli/ingest.js');
+  process.exit(
+    await runIngest({
+      cliArgs: { config: values.config, dbPath: values['db-path'] },
+      file: values.file,
+      evaluate: values.evaluate ?? false,
+      evalType: values['eval-type'],
+      failOn: values['fail-on'],
+      redact: values.redact,
+      source: values.source ?? 'cli',
+      dataset: values.dataset,
+      allowEmpty: values['allow-empty'] ?? false,
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+    }),
+  );
+}
+const ingestOnly = (['file', 'eval-type', 'fail-on', 'redact', 'source', 'dataset'] as const).filter((flag) => values[flag] !== undefined);
+if (ingestOnly.length > 0 || values.evaluate || values['allow-empty']) {
+  process.stderr.write(`${COMMAND}: ${[...ingestOnly.map((f) => `--${f}`), ...(values.evaluate ? ['--evaluate'] : []), ...(values['allow-empty'] ? ['--allow-empty'] : [])].join(', ')} belong to the ingest command: ${COMMAND} ingest [...].\nRun \`${COMMAND} --help\` for usage.\n`);
+  process.exit(2);
+}
+
+const modeFlags = (['demo', 'demo-clear', 'self-test', 'purge'] as const).filter((flag) => values[flag]);
+if (modeFlags.length > 1) {
+  process.stderr.write(
+    `iris-eval: ${modeFlags.map((flag) => `--${flag}`).join(' and ')} cannot be combined.\nRun \`iris-eval --help\` for usage.\n`,
+  );
+  process.exit(2);
+}
+/*
+ * `--purge --dashboard` used to run the purge and drop the dashboard flag
+ * on the floor. A flag that changes nothing is the same fault as a
+ * misspelled tool argument: the caller asked for something and got no
+ * sign it was ignored. (v0.6.0 acceptance pass.)
+ */
+if (values.purge && values.dashboard) {
+  process.stderr.write(
+    'iris-eval: --purge exits as soon as the purge finishes and cannot be combined with --dashboard (nothing would be served).\nRun `iris-eval --help` for usage.\n',
+  );
+  process.exit(2);
+}
+
+/*
+ * --self-test exits BEFORE loadConfig() runs at module scope below —
+ * deliberately. The diagnostic builds its own isolated IRIS_HOME and
+ * scrubs the IRIS_* env layer (src/self-test.ts), so the normal boot
+ * path's config (and the user's real ~/.iris) must never load first.
+ */
+if (values['self-test']) {
+  const { runSelfTest } = await import('./self-test.js');
+  process.exit(await runSelfTest());
+}
+
+if (values.demo && values['db-path']) {
+  process.stderr.write(
+    'iris-eval: --demo always serves its own database (demo.db under your iris home) and cannot be combined with --db-path.\n' +
+      'Run `iris-eval --demo` alone, or drop --demo to use your own database.\n',
+  );
+  process.exit(2);
+}
+
+if (values['demo-clear']) {
+  const { removed } = clearDemoData();
+  if (removed.length === 0) {
+    process.stderr.write(`iris-eval: no demo data found under "${irisHome()}" — nothing to remove.\n`);
+  } else {
+    for (const path of removed) {
+      process.stderr.write(`iris-eval: removed "${path}"\n`);
+    }
+    process.stderr.write('iris-eval: demo data cleared. Your real traces were not touched.\n');
+  }
+  process.exit(0);
+}
+
+const cliArgs: CliArgs = {
+  transport: values.transport,
+  port: values.port,
+  config: values.config,
+  // Demo mode serves the dashboard against the dedicated demo database —
+  // never the real store — and always with the dashboard enabled.
+  dbPath: values.demo ? demoDbPath() : values['db-path'],
+  apiKey: values['api-key'],
+  dashboard: values.demo ? true : values.dashboard,
+  dashboardPort: values['dashboard-port'],
+  dashboardHost: values['dashboard-host'],
+};
+const config = loadConfig(cliArgs);
+
+const logger = createLogger(config);
+
+/*
+ * --purge (#372): the retention sweep only ever trimmed by age, and
+ * deleting iris.db by hand left every row readable in iris.db-wal. This
+ * is the one-command answer to "remove everything Iris stored about my
+ * agents" — every trace, span and evaluation for the local tenant,
+ * followed by VACUUM + a TRUNCATE checkpoint so the text is gone from the
+ * main file and the write-ahead log alike. Rules, audit log and
+ * preferences are not storage rows and stay. Prints what it removed and
+ * exits 0; runs against the configured database, never the demo one
+ * (--demo-clear handles that).
+ */
+async function runPurge(): Promise<void> {
+  const storage = createStorage(config);
+  await storage.initialize();
+  announceUpgrade(storage.upgradeReport?.());
+  try {
+    const { traces, evalResults } = await storage.purge(LOCAL_TENANT);
+    // The copies taken before a migration hold the same traces (storage/backup.ts).
+    const backups = config.storage.path === ':memory:' ? [] : pruneBackups(config.storage.path, { keep: 0 });
+    process.stderr.write(
+      `iris-eval: purged ${traces} trace(s) and ${evalResults} evaluation(s) from "${config.storage.path}" ` +
+        `(database compacted, write-ahead log truncated${backups.length > 0 ? `; ${backups.length} copy(ies) of it taken before an upgrade deleted` : ''}). ` +
+        'Deployed rules, audit log and preferences were kept.\n',
+    );
+  } finally {
+    await storage.close();
+  }
+}
+
+if (values.purge) {
+  try {
+    await runPurge();
+    process.exit(0);
+  } catch (err) {
+    process.stderr.write(`iris-eval: purge failed: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+  }
+}
+
+async function main(): Promise<void> {
+  logger.info(`Starting Iris MCP server v${config.server.version}`);
+
+  // F-006: fail fast on HTTP+dashboard port collision. See validatePortConfig.
+  validatePortConfig(config);
+  // Every configured key, read now: an unreadable key file, a
+  // malformed hash or a duplicate id is one sentence here, before any port
+  // is bound, rather than a 403 later. The ring is live: removing a key
+  // from config.json, or deleting its key file, revokes it on the next
+  // request, with no restart (security/live-key-ring.ts).
+  const keyRing = createLiveKeyRing(config.security, {
+    load: () => loadSecurityConfig(cliArgs),
+    configPath: configFilePath(cliArgs),
+    fixedApiKey: fixedApiKey(cliArgs),
+    onReload: (event) => {
+      if (event.ok) {
+        logger.info(`API keys reloaded: ${event.ids.length} key(s) (${event.ids.join(', ') || 'none'})`);
+        for (const id of event.dropped) logger.warn(`API key "${id}" is revoked: its key file no longer exists`);
+      } else {
+        logger.error(`API keys could not be reloaded, so only a key from IRIS_API_KEY or --api-key is accepted until the files are fixed: ${event.error}`);
+      }
+    },
+  });
+  // Refuse a non-loopback bind with no API key before any port is taken. See bind-policy.
+  validateBindPolicy(config);
+
+  /*
+   * A file with migrations pending is copied and migrated after the
+   * transport connects, off the event loop (sqlite-adapter.ts,
+   * upgradeAfterStart), so a large file never keeps the client from its
+   * first answer. Every door waits for it at the gate (storage/ready.ts).
+   */
+  const store = createStorage(config, { log: (level, line) => logger[level](line), upgradeAfterStart: true });
+  await store.initialize();
+  const gate = storeGate(store);
+  const storage = gate.storage;
+  logger.info(`Storage initialized (${config.storage.type}: ${config.storage.path}; driver ${storage.driver}: ${storage.driverReason ?? 'reason not reported'})`);
+  const upgradingNow = store.readiness?.().state !== undefined && store.readiness?.().state !== 'ready';
+  if (upgradingNow) logger.info(`Upgrading the database after the start; requests wait for it, at most ${STORE_READY_WAIT_MS / 1000} s each.`);
+  void gate.ready.then(
+    () => announceUpgrade(store.upgradeReport?.()),
+    (err: unknown) => logger.error(`The database could not be made ready (${err instanceof Error ? err.message : String(err)}); every request is refused until the server is restarted.`),
+  );
+
+  // Load the custom rule store first so it can be shared between the
+  // MCP server (for deploy_rule / delete_rule / list_rules tools) and
+  // the HTTP dashboard (Make-This-A-Rule composer). A rule deployed
+  // via either surface is immediately visible from the other.
+  const customRuleStore = createCustomRuleStore();
+
+  const { mcpServer, newMcpServer, evalEngine } = createIrisServer(config, storage, customRuleStore, { warn: (line) => logger.warn(line), gate });
+
+  // The deployed rules (~/.iris/custom-rules.json), registered with the engine
+  // under their bundles, and kept in step from here on: every client's server
+  // process shares this file, so each evaluation first checks whether another
+  // process changed it, and the labels likewise (eval/shared-state.ts).
+  keepInStep(evalEngine, customRuleStore, storage, LOCAL_TENANT)();
+  const enabled = customRuleStore.enabledRules(LOCAL_TENANT);
+  if (enabled.length > 0) {
+    logger.info(
+      `Loaded ${enabled.length} deployed custom rule(s) from ${customRuleStore.pathFor(LOCAL_TENANT)}`,
+    );
+  }
+  // Plugin rules: hash-checked, then registered like a deployed
+  // custom rule. A file that cannot be verified refuses startup here, before
+  // any port is bound — the sentence names the path and the problem.
+  await registerPlugins(evalEngine, config, { log: (line) => logger.info(line) });
+
+  // The deployment's own labels, read once at boot; every label write refreshes them. No request is answered before they are read.
+  const labels = refreshLocalLabels(evalEngine, storage, LOCAL_TENANT);
+  gate.hold(labels);
+  // On a start with nothing to upgrade, a store that cannot give its labels still stops the start here, as it always has.
+  if (!upgradingNow) await labels;
+
+  // The webhook: installed on the store, so every door that
+  // writes an evaluation reaches it; never in demo mode (runDemo below).
+  const webhook = installWebhookNotifier(storage, config, logger);
+
+  const httpServers: Server[] = [];
+  let closeMcpSessions: (() => Promise<void>) | undefined;
+
+  if (config.transport.type === 'http') {
+    // One MCP server per session, so any number of clients connect (transport/http.ts).
+    const http = await createHttpTransport(newMcpServer, config, logger, { storage, customRuleStore, relevanceJudge: () => evalEngine.relevanceJudgeInForce() }, keyRing);
+    const { httpServer } = http;
+    httpServers.push(httpServer);
+    closeMcpSessions = http.closeSessions;
+    const addr = httpServer.address();
+    const portStr = typeof addr === 'object' && addr ? addr.port : config.transport.port;
+    logger.info(`HTTP transport listening on ${config.transport.host}:${portStr}`);
+  } else {
+    const transport = createStdioTransport({
+      maxMessageBytes: requestSizeLimitBytes(config.security.requestSizeLimit),
+      onRefused: (bytes, limit) =>
+        logger.warn(`Refused a ${bytes}-byte stdio message: over the ${limit}-byte limit (security.requestSizeLimit)`),
+    });
+    await mcpServer.connect(transport);
+    logger.info('Stdio transport connected');
+    if (!config.dashboard.enabled) {
+      logger.info(`Tip: run with --dashboard to open the web dashboard on port ${config.dashboard.port}`);
+    }
+  }
+
+  /*
+   * Retention: one sweep at boot and the same sweep on a timer that never
+   * holds the process open (src/retention.ts). The boot sweep starts after
+   * the transport is connected and is not awaited: it deletes in short
+   * steps with the event loop free between them, so the client's
+   * `initialize` is answered at once however much is due. It used to run
+   * before the connection opened, as one transaction, and a stdio client
+   * waited for all of it. close() waits for a sweep to stop at its next step.
+   */
+  void runRetentionSweep(storage, config, logger);
+  scheduleRetentionSweep(storage, config, logger);
+
+  /*
+   * The dashboard starts ONLY when explicitly enabled (--dashboard,
+   * IRIS_DASHBOARD=true, or dashboard.enabled in config.json). It used to
+   * also start implicitly whenever `--transport http` was chosen — which
+   * contradicted the README ("off by default"), and worse: if its default
+   * port 6920 was busy on a shared CI runner, the WHOLE process exited 1
+   * after the transport had already bound successfully. An unrequested
+   * server must never be able to kill the requested one. Users who relied
+   * on the ingest endpoint riding along get a loud pointer below instead
+   * of a silent 404.
+   */
+  if (config.dashboard.enabled) {
+    const preferenceStore = createPreferenceStore();
+    const dashboardServer = createDashboardServer(storage, config, logger, {
+      keyRing,
+      customRuleStore,
+      evalEngine,
+      preferenceStore,
+      // The server reports its mode on /health and /capabilities; the dashboard's DEMO chip reads it.
+      mode: values.demo ? 'demo' : 'real',
+      gate,
+    });
+    const server = dashboardServer.start();
+    httpServers.push(server);
+
+    // First-run auto-launch (B7): on first dashboard launch, open the
+    // dashboard in the user's default browser. Skipped in CI, when the
+    // user has previously set autoLaunch=false in ~/.iris/preferences.json,
+    // or when IRIS_NO_AUTO_LAUNCH=1 is set.
+    const prefState = loadOrInitPreferences();
+    if (prefState.isFirstRun && shouldAutoLaunchDashboard(prefState)) {
+      const url = `http://localhost:${config.dashboard.port}`;
+      logger.info(`First run detected — opening dashboard at ${url}`);
+      logger.info(
+        `(To disable auto-launch: set IRIS_NO_AUTO_LAUNCH=1 or edit ${prefState.path})`,
+      );
+      openBrowser(url);
+    } else if (prefState.isFirstRun) {
+      logger.info(
+        `First run detected — skipping auto-launch (CI/IRIS_NO_AUTO_LAUNCH set). Dashboard at http://localhost:${config.dashboard.port}`,
+      );
+    }
+  } else if (config.transport.type === 'http') {
+    // Loud, because this used to start implicitly: anyone who relied on the
+    // ingest endpoint riding along with --transport http must learn how to
+    // get it back from this line, not from a connection refused.
+    logger.info(
+      `Dashboard not started (off by default). The dashboard — and the HTTP ingest endpoint ` +
+        `POST /api/v1/traces — start on port ${config.dashboard.port} when you pass --dashboard, ` +
+        `set IRIS_DASHBOARD=true, or set dashboard.enabled=true in config.json.`,
+    );
+  }
+
+  if (!keyRing.empty) {
+    logger.info(`API key authentication enabled: ${keyRing.ids.length} key(s) (${keyRing.ids.join(', ')})`);
+    for (const id of keyRing.expired) {
+      logger.warn(`API key "${id}" is past its expiresAt and will not authenticate — remove it from security.apiKeys`);
+    }
+  } else if (config.transport.type === 'http') {
+    logger.warn('HTTP transport running without API key authentication — set IRIS_API_KEY (or IRIS_API_KEY_FILE) for production');
+  }
+
+  let shuttingDown = false;
+  const shutdown = async () => {
+    // A signal after the client closed stdin (or a second Ctrl+C) must not close the store twice.
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info('Shutting down gracefully...');
+
+    // Sessions first: an open event stream would hold its connection, and the server's close waits for every connection.
+    await closeMcpSessions?.().catch(() => undefined);
+    const closePromises = httpServers.map(
+      (server) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+
+    await Promise.race([
+      Promise.all(closePromises),
+      new Promise((resolve) => setTimeout(resolve, 10_000)),
+    ]);
+
+    await webhook?.dispose();
+    await storage.close();
+    logger.info('Shutdown complete');
+    process.exit(0);
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  /*
+   * An MCP client ends a stdio session by closing the server's stdin, and
+   * only signals it if it has not exited a moment later. With nothing else
+   * serving, the process used to drain and exit without closing the store,
+   * and a search-index build kept running for a client that had gone (1.5 s
+   * on 80,000 traces, measured). Now the end of stdin is a shutdown: the
+   * build stops at its next step and the store is closed in order.
+   * With the dashboard up, stdin ending (a server started with </dev/null)
+   * is not the end of the process, as before.
+   */
+  if (config.transport.type !== 'http' && httpServers.length === 0) {
+    process.stdin.once('end', () => void shutdown());
+  }
+}
+
+function printDemoBanner(summary: SeedDemoDataSummary, url: string): void {
+  const line = '='.repeat(60);
+  const counts = summary.alreadySeeded
+    ? `  Reusing the existing demo database (${summary.traceCount} traces, ${summary.evalCount} evaluations).`
+    : `  Seeded ${summary.traceCount} traces / ${summary.evalCount} evaluations across the last ${DEMO_DAYS} days — every verdict the engine's own.`;
+  process.stderr.write(`
+${line}
+  IRIS DEMO MODE — everything on screen is demo data
+${line}
+
+${counts}
+  Demo database: "${summary.dbPath}"
+  Your real trace database is untouched — demo data never mixes with it.
+  Trace ingest (POST /api/v1/traces) is refused in demo mode: start the
+  real server (iris-eval --dashboard) to store your own traces.
+
+  Worth clicking into:
+    - a PII leak (a synthetic SSN in an agent reply) caught by the safety rules
+    - a hidden directive in a forum post that the summarizer complied with
+    - a number the source document never said, and a cost spike
+    - two runs on the same twelve questions (Runs), compared with an interval
+    - a deployed custom rule and a paused one, with their audit rows
+    - a failed LLM-judge score, with the judge's rationale
+
+  Dashboard: ${url}
+
+  Remove the demo data with one command:
+    npx @iris-eval/mcp-server --demo-clear
+
+  Press Ctrl+C to stop.
+
+`);
+}
+
+/*
+ * Demo mode (--demo): seed the dedicated demo database (idempotent) and
+ * serve the dashboard against it. No MCP transport is started — demo mode
+ * exists to put something real on screen before an agent is wired up.
+ *
+ * Isolation: everything demo mode writes lives in demo-scoped files under
+ * irisHome() (demo.db, demo-preferences.json, demo-custom-rules.json,
+ * demo-audit.log). A rule deployed from the demo dashboard lands in the
+ * demo rule store, and --demo-clear removes all of it. The real iris.db,
+ * custom-rules.json, audit.log and preferences.json are never touched.
+ */
+async function runDemo(): Promise<void> {
+  logger.info(`Starting Iris demo mode v${config.server.version}`);
+
+  /*
+   * The store and the engine come first so the seeder judges its week of
+   * traces with the SAME rules this server will serve with:
+   * the demo's custom rules are deployed through this store and registered
+   * on this engine before anything is evaluated.
+   */
+  const customRuleStore = createCustomRuleStore({
+    pathFor: () => demoCustomRulesPath(),
+    auditPath: demoAuditLogPath(),
+  });
+  const evalEngine = new EvalEngine(config.eval.defaultThreshold, config.eval.ruleThresholds, config.eval);
+  // One structured log line per evaluation, whichever door asked.
+  evalEngine.setObserver((event) => logger.event?.('evaluation', { ...event }));
+
+  const seedSummary = await seedDemoData({ engine: evalEngine, customRuleStore });
+  if (seedSummary.alreadySeeded) {
+    logger.info(`Demo database already seeded (${seedSummary.traceCount} traces) — reusing it`);
+  } else {
+    logger.info(`Seeded demo database with ${seedSummary.traceCount} traces at ${seedSummary.dbPath}`);
+  }
+
+  /*
+   * Ingest is refused in demo mode: demo.db is disposable by design and
+   * --demo-clear deletes it wholesale, so a capture client pointed at the
+   * demo dashboard's port would have its real traces silently stored next
+   * to the fake ones and later destroyed (storage/demo-guard.ts).
+   */
+  const storage = withDemoIngestGuard(createStorage(config, { log: (level, line) => logger[level](line) }));
+  await storage.initialize();
+
+  // A fresh seed registered its own rules already; a reused database has them only in the store.
+  keepInStep(evalEngine, customRuleStore, storage, LOCAL_TENANT)();
+  await registerPlugins(evalEngine, config, { log: (line) => logger.info(line) });
+  await refreshLocalLabels(evalEngine, storage, LOCAL_TENANT);
+  const preferenceStore = createPreferenceStore(demoPreferencesPath());
+
+  const dashboardServer = createDashboardServer(storage, config, logger, {
+    customRuleStore,
+    evalEngine,
+    preferenceStore,
+    // The server reports its mode on /health and /capabilities; the dashboard's DEMO chip reads it.
+    mode: values.demo ? 'demo' : 'real',
+  });
+  const server = dashboardServer.start();
+
+  server.on('listening', () => {
+    // Use the port actually bound (supports --dashboard-port 0 in tests).
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : config.dashboard.port;
+    const url = `http://localhost:${port}`;
+    printDemoBanner(seedSummary, url);
+    const prefState = loadOrInitPreferences(demoPreferencesPath());
+    if (shouldAutoLaunchDashboard(prefState)) {
+      openBrowser(url);
+    }
+  });
+
+  const shutdown = async () => {
+    logger.info('Shutting down gracefully...');
+    await Promise.race([
+      new Promise<void>((resolve) => server.close(() => resolve())),
+      new Promise((resolve) => setTimeout(resolve, 10_000)),
+    ]);
+    await storage.close();
+    logger.info('Shutdown complete');
+    process.exit(0);
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+const run = values.demo ? runDemo : main;
+run().catch((err) => {
+  // The sentence itself, plain, before the structured record: a refused database must not reach the terminal only inside JSON.
+  process.stderr.write(fatalLine(err));
+  logger.error(`Fatal error: ${err instanceof Error ? err.message : err}`, {
+    stack: err instanceof Error ? err.stack : undefined,
+  });
+  process.exit(1);
+});

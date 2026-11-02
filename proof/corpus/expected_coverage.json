@@ -1,0 +1,211 @@
+{
+  "schemaVersion": 1,
+  "rule": "expected_coverage",
+  "category": "completeness",
+  "family": "coverage",
+  "positiveClass": "fail",
+  "definition": "expected_coverage — at least 50% of the expected text's terms (words longer than two characters, case-insensitive, unique) must appear in the output; skipped when no expected text is given. docs/api-reference.md §Completeness Rules. Positive = fewer than half the expected terms present (the rule should FAIL).",
+  "source": "LLM-authored on 2026-09-04. Held out on 2026-09-23: the 8 case(s) copied from, varied from or modelled on the 24 real transcripts in tests/fixtures/real-transcripts (coverage-001, coverage-002, coverage-003, coverage-004, coverage-005, coverage-006, coverage-007, coverage-008) were removed, so no number this family publishes is estimated on a transcript, and the transcript line in proof/TRANSCRIPTS.md and proof/COMPOSITE.md is measured on cases none of these rates were estimated from. 3 replacement case(s), authored the same day and marked in their notes, bring the family back to the 24-case floor the runner enforces.",
+  "labelling": "LLM-authored and LLM-labelled against the documented definition on 2026-09-04: the label is the documented formula applied independently by script (unique words > 2 chars, case-insensitive), and each note states the covered/total count.",
+  "labelBasis": "definition",
+  "authored": "2026-09-04",
+  "counts": {
+    "n": 24,
+    "positive": 11,
+    "negative": 13
+  },
+  "cases": [
+    {
+      "id": "coverage-009",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "The dashboard binds port 4748 by default.",
+      "expected": "The dashboard binds port 4748 by default.",
+      "notes": "Exact match (6/6 expected terms = 100%)"
+    },
+    {
+      "id": "coverage-010",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "By default the dashboard binds port 4748; pass --port to change it.",
+      "expected": "The dashboard binds port 4748 by default.",
+      "notes": "Same terms, more content (6/6 expected terms = 100%)"
+    },
+    {
+      "id": "coverage-011",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "Out of the box the web UI listens on 4748.",
+      "expected": "The dashboard binds port 4748 by default.",
+      "notes": "Semantically the same answer with different vocabulary — the documented definition is lexical, so this is a miss by definition (2/6 expected terms = 33%)"
+    },
+    {
+      "id": "coverage-012",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "Restart the server.",
+      "expected": "Restart the server, clear the cache directory, then rerun the migration script.",
+      "notes": "Only the first of three instructions (3/10 expected terms = 30%)"
+    },
+    {
+      "id": "coverage-013",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "Restart the server and clear the cache directory.",
+      "expected": "Restart the server, clear the cache directory, then rerun the migration script.",
+      "notes": "Two of three instructions: boundary at the documented 50% (6/10 expected terms = 60%)"
+    },
+    {
+      "id": "coverage-014",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "Clear the cache directory.",
+      "expected": "Restart the server, clear the cache directory, then rerun the migration script.",
+      "notes": "One of three instructions: under the documented 50% (4/10 expected terms = 40%)"
+    },
+    {
+      "id": "coverage-015",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "The retention sweep truncates the SQLite WAL at startup.",
+      "expected": "SQLite WAL retention sweep",
+      "notes": "Every expected term present (4/4 expected terms = 100%)"
+    },
+    {
+      "id": "coverage-016",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "Everything is stored locally and nothing is sent anywhere.",
+      "expected": "SQLite WAL retention sweep",
+      "notes": "None of the expected terms present (0/4 expected terms = 0%)"
+    },
+    {
+      "id": "coverage-017",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "Anything at all.",
+      "expected": "a I to",
+      "notes": "The expected text has no term longer than two characters, so by the documented definition there is nothing to cover and the output passes (no expected terms)"
+    },
+    {
+      "id": "coverage-018",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "",
+      "expected": "completeness relevance safety cost",
+      "notes": "Empty output covers nothing (0/4 expected terms = 0%)"
+    },
+    {
+      "id": "coverage-019",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "COMPLETENESS, Relevance, safety, Cost.",
+      "expected": "completeness relevance safety cost",
+      "notes": "Coverage is case-insensitive (4/4 expected terms = 100%)"
+    },
+    {
+      "id": "coverage-020",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "Use 4748.",
+      "expected": "4748 8080",
+      "notes": "One of two numeric terms: exactly the documented 50% boundary (1/2 expected terms = 50%)"
+    },
+    {
+      "id": "coverage-021",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "Use 4748.",
+      "expected": "4748 8080 9090",
+      "notes": "One of three numeric terms: under 50% (1/3 expected terms = 33%)"
+    },
+    {
+      "id": "coverage-022",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "The tools are registered in index.ts under src.",
+      "expected": "src/index.ts registers the tools",
+      "notes": "Path tokens split into words; all present (4/5 expected terms = 80%)"
+    },
+    {
+      "id": "coverage-023",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "Use the dashboard.",
+      "expected": "Deploy rules with deploy_rule and remove them with delete_rule; list_rules shows what is deployed.",
+      "notes": "Answer ignores the expected vocabulary entirely (0/12 expected terms = 0%)"
+    },
+    {
+      "id": "coverage-024",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "Each judge eval is capped at $0.25 by default.",
+      "expected": "The judge is cost-capped at $0.25 per eval by default.",
+      "notes": "Most terms shared (4/7 expected terms = 57%)"
+    },
+    {
+      "id": "coverage-025",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "Any recent runtime works.",
+      "expected": "Iris needs Node 20 or newer; Node 18 fails with ERR_MODULE_NOT_FOUND.",
+      "notes": "Vague answer that names nothing expected (0/7 expected terms = 0%)"
+    },
+    {
+      "id": "coverage-026",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "A Wilson interval stays inside zero and one and behaves at the edges, unlike the normal approximation.",
+      "expected": "Wilson intervals stay inside zero and one and behave at the edges.",
+      "notes": "Expected terms all present (7/10 expected terms = 70%)"
+    },
+    {
+      "id": "coverage-027",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "You can configure where files go.",
+      "expected": "Set IRIS_HOME to move the data directory; the default is ~/.iris.",
+      "notes": "Generic paraphrase without the expected terms (0/8 expected terms = 0%)"
+    },
+    {
+      "id": "coverage-028",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "Enable the retry with exponential backoff and log each attempt.",
+      "expected": "enable retry with exponential backoff",
+      "notes": "Every expected term present among extra words (5/5 expected terms = 100%)"
+    },
+    {
+      "id": "coverage-029",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "Retries are enabled.",
+      "expected": "enable retry with exponential backoff",
+      "notes": "Inflection and omission drop coverage under half (0/5 expected terms = 0%)"
+    },
+    {
+      "id": "coverage-030",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "The retention sweep runs every hour; it deletes traces older than the configured window.",
+      "expected": "the retention sweep runs every hour and deletes old traces",
+      "notes": "A full answer in its own words (8/10 expected terms = 80%). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "coverage-031",
+      "rule": "expected_coverage",
+      "label": "negative",
+      "output": "Change the port in the config, then restart the dashboard so it binds the new port after startup.",
+      "expected": "restart the dashboard after changing the port",
+      "notes": "Every step present, one inflection changed (5/6 expected terms = 83%). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "coverage-032",
+      "rule": "expected_coverage",
+      "label": "positive",
+      "output": "Results from the LLM evaluator are kept for a day.",
+      "expected": "the judge caches verdicts for twenty four hours",
+      "notes": "The right idea in none of the expected words (2/8 expected terms = 25%). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { useInView, useReducedMotion } from "framer-motion";
+
+export function AnimatedCounter({
+  value,
+  prefix = "",
+  suffix = "",
+  decimals,
+  duration = 1.6,
+}: {
+  value: number;
+  prefix?: string;
+  suffix?: string;
+  decimals?: number;
+  duration?: number;
+}): React.ReactElement {
+  const ref = useRef<HTMLSpanElement>(null);
+  const inView = useInView(ref, { once: true, margin: "-60px" });
+  const reduce = useReducedMotion();
+  const [display, setDisplay] = useState(0);
+
+  useEffect(() => {
+    // Reduced-motion renders the final value directly (derived below) — the
+    // rAF loop only runs for animated counting.
+    if (!inView || reduce) return;
+
+    let start: number | null = null;
+    const step = (ts: number): void => {
+      if (!start) start = ts;
+      const progress = Math.min((ts - start) / (duration * 1000), 1);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      setDisplay(eased * value);
+      if (progress < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }, [inView, value, duration, reduce]);
+
+  const shown = reduce ? value : display;
+  const formatted = decimals !== undefined
+    ? shown.toFixed(decimals)
+    : Math.round(shown).toLocaleString();
+
+  return (
+    <span ref={ref}>
+      {prefix}
+      {formatted}
+      {suffix}
+    </span>
+  );
+}

@@ -1,0 +1,277 @@
+/*
+ * The one zod object that IS the evaluation response.
+ *
+ * Three things read it: the response-shape drift-lock test (which runs the
+ * real tool handlers and validates what they return), the tools'
+ * `outputSchema` once the structured-content release lands, and — at 1.0 —
+ * the published response-schema-v1.json. Keeping them one object is what
+ * makes "the response shape is settled" checkable: a field added here is
+ * additive by construction (every object is loose — unknown keys pass), and a field
+ * removed or re-meant fails the drift-lock before it can ship.
+ *
+ * Optional everywhere a field is optional on the TypeScript type; the test
+ * asserts presence where the release promises it (every built-in result
+ * carries kind, role, saw, uncertainty), so this schema states the shape
+ * and the test states the promise.
+ */
+import { z } from 'zod';
+import { CAPTURE_FIELDS } from '../types/trace.js';
+
+export const intervalSchema = z.looseObject({ point: z.number(), lo: z.number(), hi: z.number() });
+
+const priorSchema = z.looseObject({ pi: z.number(), source: z.enum(['default', 'config', 'estimated']) });
+const corpusSchema = z.looseObject({
+    n: z.number().int(),
+    tp: z.number().int(),
+    fp: z.number().int(),
+    fn: z.number().int(),
+    tn: z.number().int(),
+    version: z.string(),
+    release: z.string(),
+    labelling: z.enum(['same-model', 'human-verified']),
+  });
+
+export const uncertaintySchema = z.discriminatedUnion('basis', [
+  // One member per basis (zod's discriminator must be unique); the fired /
+  // not-fired split is enforced by the refinement: a fire carries ppv, a
+  // quiet result carries missRate.
+  z
+    .looseObject({ basis: z.literal('published_accuracy'), fired: z.boolean(), ppv: intervalSchema.optional(), missRate: intervalSchema.optional(), prior: priorSchema, corpus: corpusSchema })
+    .refine((v) => (v.fired ? v.ppv !== undefined : v.missRate !== undefined), { message: 'a fired result carries ppv; a quiet one carries missRate' }),
+  z.looseObject({ basis: z.literal('definition'), conformance: z.looseObject({ n: z.number().int(), matched: z.number().int() }) }),
+  z.looseObject({ basis: z.literal('self_consistency'), samples: z.number().int(), voteFraction: z.number(), scoreSd: z.number() }),
+  z.looseObject({ basis: z.literal('local_labels'), precision: intervalSchema, n: z.number().int() }),
+  z.looseObject({ basis: z.literal('policy') }),
+  z.looseObject({ basis: z.literal('unmeasured'), why: z.string() }),
+]);
+
+export const evidenceSchema = z.discriminatedUnion('type', [
+  z.looseObject({ type: z.literal('span'), source: z.string(), start: z.number().int().nonnegative(), end: z.number().int().nonnegative(), label: z.string() }),
+  z.looseObject({ type: z.literal('pattern'), name: z.string(), count: z.number().int().nonnegative() }),
+  z.looseObject({ type: z.literal('toolCall'), index: z.number().int().nonnegative(), toolName: z.string(), label: z.string() }),
+  z.looseObject({ type: z.literal('citation'), url: z.string(), status: z.enum(['resolved', 'dead', 'unverifiable', 'supported', 'unsupported']) }),
+  z.looseObject({ type: z.literal('count'), stat: z.string(), unit: z.string(), value: z.number(), threshold: z.number().optional(), thresholdSource: z.enum(['default', 'config', 'call', 'rule']).optional(), costSource: z.enum(['reported', 'estimated']).optional() }),
+  // A judge's sample: what a judge-decided rule (answers_the_ask with a relevance judge) and a stored judge evaluation carry.
+  z.looseObject({ type: z.literal('sample'), score: z.number(), selfReportedPass: z.boolean().optional(), rationaleHash: z.string() }),
+]);
+/**
+ * How a trace's cost was estimated, or why it has none (src/cost/trace-cost.ts).
+ * Carried by log_trace, POST /api/v1/traces, POST /v1/traces and every read
+ * of a stored trace as `cost_estimate`.
+ */
+export const costEstimateSchema = z.union([
+  z.looseObject({
+    status: z.literal('estimated'),
+    basis: z.enum(['token_usage', 'calls']),
+    calls: z.array(
+      z.looseObject({
+        model: z.string(),
+        priced_as: z.string(),
+        prompt_tokens: z.number(),
+        completion_tokens: z.number(),
+        input_usd_per_1m: z.number(),
+        output_usd_per_1m: z.number(),
+        cache_read_tokens: z.number().optional(),
+        cache_creation_tokens: z.number().optional(),
+        cache_read_usd_per_1m: z.number().optional(),
+        cache_write_usd_per_1m: z.number().optional(),
+        cache_creation_1h_tokens: z.number().optional(),
+        cache_write_1h_usd_per_1m: z.number().optional(),
+        cost_usd: z.number(),
+        price_source: z.enum(['iris', 'config']),
+        price_as_of: z.string().nullable(),
+      }),
+    ),
+    notes: z.array(z.string()).optional(),
+  }),
+  z.looseObject({
+    status: z.literal('unpriced'),
+    reason: z.enum(['no_tokens', 'no_model', 'unknown_model', 'disabled']),
+    message: z.string(),
+    models: z.array(z.string()).optional(),
+  }),
+]);
+
+export const measuredValueSchema = z.looseObject({ stat: z.string(), unit: z.string(), value: z.number() });
+
+export const claimKindSchema = z.enum(['measurement', 'detection', 'inference', 'judgment', 'policy', 'verification']);
+export const roleSchema = z.enum(['gate', 'veto', 'risk', 'advisory']);
+export const skipClassSchema = z.enum(['not_applicable', 'defeated', 'config_invalid']);
+/*
+ * Every input a rule can read (types/eval.ts, Need). `expected_trajectory`
+ * was missing until 0.20.0: tool_sequence and step_budget read it, it was
+ * stamped into `saw`, and every evaluate_output call that sent an expected
+ * trajectory with the default bundle failed its own output schema with
+ * IRIS_INTERNAL_ERROR. A test now holds the two lists equal.
+ */
+export const needSchema = z.enum(['output', 'input', 'expected', 'expected_trajectory', 'tool_calls', 'tool_outputs', 'tools_catalogue', 'cost', 'tokens', 'citations']);
+export const questionIdSchema = z.enum(['safe_output', 'grounded', 'complete', 'relevant', 'task_completed', 'tool_use_correct', 'within_budget']);
+
+export const evalRuleResultSchema = z.looseObject({
+    ruleName: z.string(),
+    ruleId: z.string().optional(),
+    category: z.enum(['completeness', 'relevance', 'safety', 'cost', 'custom']).optional(),
+    critical: z.boolean().optional(),
+    criticalSource: z.enum(['default', 'config']).optional(),
+    state: z.enum(['pass', 'fail', 'not_checked']).optional().describe('read this, not passed: a rule that skipped is not_checked, and carries passed false'),
+    passed: z.boolean(),
+    score: z.number(),
+    message: z.string(),
+    skipped: z.boolean().optional(),
+    skipReason: z.string().optional(),
+    configInvalid: z.boolean().optional(),
+    budgetExceeded: z.boolean().optional(),
+    kind: claimKindSchema.optional(),
+    role: roleSchema.optional(),
+    question: questionIdSchema.optional(),
+    classes: z.array(z.string()).optional(),
+    ruleVersion: z.number().int().optional(),
+    saw: z.array(needSchema).optional(),
+    read: z.enum(['values', 'labelled']).optional().describe('when the output was a JSON object or array: which reading of it this rule judged, its values or its values with their field names. Evidence offsets still point into the output as sent'),
+    skipClass: skipClassSchema.optional(),
+    lacked: z.array(z.string()).optional().describe('on a rule that skipped for missing evidence: the inputs it reads that the call did not carry'),
+    asked: z.enum(['config', 'call']).optional().describe('on such a rule, when somebody had asked for it: the deployment (a threshold it set, a promotion, a deployed gating rule, an installed judge) or the call itself. The verdict is then unknown, not pass'),
+    uncertainty: uncertaintySchema.optional(),
+    evidence: z.array(evidenceSchema).optional(),
+    value: measuredValueSchema.optional(),
+    judge: z
+      .looseObject({
+        template: z.literal('relevance'),
+        provider: z.enum(['anthropic', 'openai']).nullable(),
+        model: z.string(),
+        score: z.number().optional(),
+        passThreshold: z.number().optional(),
+        passed: z.boolean().optional(),
+        selfReportedPass: z.boolean().optional(),
+        disagreement: z.boolean().optional(),
+        rationale: z.string().optional(),
+        dimensions: z.record(z.string(), z.number()).optional(),
+        costUsd: z.number().nullable(),
+        inputTokens: z.number(),
+        outputTokens: z.number(),
+        latencyMs: z.number(),
+        agentModel: z.string().optional(),
+        sameFamily: z.boolean().optional(),
+        redacted: z.record(z.string(), z.number()).optional(),
+        sentUnredacted: z.boolean().optional(),
+        withheld: z.enum(['daily_budget', 'request_cap']).optional(),
+        error: z.string().optional(),
+      })
+      .optional()
+      .describe('answers_the_ask only, when IRIS_RELEVANCE_JUDGE_MODEL installed a relevance judge: what it scored against which pass line, why, and what it cost; redacted counts what was replaced before sending; withheld (daily_budget | request_cap) when a spend limit kept the call from being made; error when it did not answer and the rule fell back to its lexical reading'),
+  });
+
+export const evalCategoryResultSchema = z.looseObject({
+    score: z.number().nullable(),
+    state: z.enum(['pass', 'fail', 'unknown']).optional().describe('the verdict, read for the rules this bundle holds: fail when a layer of the verdict rests on one of them; unknown is not checked'),
+    passed: z.boolean().nullable().describe('state is pass; null when the bundle evaluated no rule'),
+    rules_evaluated: z.number().int(),
+    rules_skipped: z.number().int(),
+    insufficient_data: z.boolean(),
+    critical_failures: z.array(z.string()).optional(),
+    critical_skipped: z.array(z.string()).optional(),
+  });
+
+export const coverageSchema = z.looseObject({
+  inputs: z.record(z.string(), z.boolean()),
+  questions: z.array(z.looseObject({ id: questionIdSchema, status: z.enum(['judged', 'unjudged', 'not_applicable']), why: z.string().optional(), evaluated: z.number().int().optional(), of: z.number().int().optional() })),
+  dormant: z.array(z.looseObject({ ruleId: z.string(), name: z.string(), reason: z.string() })).optional(),
+});
+export const verdictSchema = z.looseObject({
+  state: z.enum(['pass', 'fail', 'unknown']),
+  passed: z.boolean(),
+  basis: z.enum(['policy_gate', 'detector_veto', 'critical_unknown', 'required_evidence_missing', 'risk_over_loss', 'clean', 'no_rules']),
+  by: z.array(z.string()),
+  risk: z.looseObject({ pBad: z.number(), lo: z.number(), hi: z.number() }).nullable(),
+  confidence: z
+    .enum(['decisive', 'marginal'])
+    .optional()
+    .describe(
+      "present when the risk estimate decided the verdict. decisive: the credible interval on pBad excludes the loss threshold AND the composite corpus measured the estimate holding at that risk level, relative to this deployment's threshold; marginal otherwise, with an interpretation naming which test it did not pass. Absent on a stored row labelled under a different calibration table than this release reads.",
+    ),
+  also: z
+    .array(
+      z.looseObject({
+        basis: z.enum(['detector_veto', 'critical_unknown', 'required_evidence_missing', 'risk_over_loss']),
+        state: z.enum(['fail', 'unknown']),
+        by: z.array(z.string()),
+      }),
+    )
+    .optional()
+    .describe(
+      'every other layer that would have decided this verdict on its own, in the order the layers are asked. basis names one layer (the first that fails, else the first that could not check); anything that acts on one basis reads basis AND also. Absent when the deciding layer was the only one, and on every pass.',
+    ),
+});
+export const provenanceSchema = z.looseObject({
+  irisVersion: z.string(),
+  rulesetHash: z.string(),
+  configHash: z.string(),
+  thresholds: z.looseObject({ default: z.number(), perRule: z.record(z.string(), z.unknown()).optional() }),
+  composer: z
+    .looseObject({
+      defaultsGate: z.boolean(),
+      falsePassCost: z.number(),
+      onCriticalSkipped: z.enum(['unknown', 'fail', 'pass']),
+      prior: z.number().optional(),
+      priorSource: z.enum(['default', 'config', 'estimated']).optional(),
+      priorMode: z.enum(['per-output', 'per-class']).optional().describe('how the prior was spread over the failure classes'),
+      calibration: z.string().optional().describe('the version of the calibration table the confidence label was read from'),
+      requiredEvidence: z.array(z.string()).optional().describe('the inputs the deployment requires on every evaluation, when it requires any'),
+      rules: z.number().optional().describe('which composer rules produced the verdict: 2 from 0.20.0 (a failure outranks a layer that could not check); absent on earlier rows, which read back under rules 1'),
+    })
+    .optional(),
+  evidence: z
+    .looseObject({
+      recordedBy: z
+        .enum(['harness', 'agent', 'not_declared'])
+        .describe('who wrote what was judged: harness (software that watched the agent and declared itself as capture), agent (its own report, through log_trace or evaluate_output), not_declared'),
+      capture: z
+        .looseObject({ name: z.string(), version: z.string().optional(), complete: z.array(z.enum(CAPTURE_FIELDS)).optional() })
+        .optional()
+        .describe('the capture source and what it records in full; an empty list of tool calls from it says none were made, and a field it names that the trace left out makes the verdict not checked'),
+      carried: z.array(z.string()).describe('the inputs the call carried; the deployment\'s required evidence is met from this'),
+      toolCalls: z.number().int().nonnegative().optional().describe('how many tool calls the record carried, when it carried them'),
+    })
+    .optional()
+    .describe('what the call carried and who recorded it; absent on evaluations stored before 0.20.0'),
+  corpusVersion: z.string(),
+  judgedAt: z.string(),
+});
+
+export const interpretationSchema = z.looseObject({
+  severity: z.enum(['block', 'warn', 'note']),
+  addressee: z.enum(['agent', 'operator', 'author']),
+  rule: z.string().optional(),
+  text: z.string(),
+  configKey: z.string().optional(),
+});
+
+/** The `evaluate_output` response — the same object the engine returns plus the tool's own fields. */
+export const evaluateOutputResponseSchema = z.looseObject({
+    id: z.string().describe('the evaluation id, readable at iris://evaluations/{id}'),
+    trace_id: z.string().optional().describe('the trace this is the verdict of'),
+    reference_trace_id: z.string().optional().describe('the trace it was made beside when it is NOT that trace verdict; never with trace_id'),
+    verdict: verdictSchema.optional().describe('state, passed, basis (which layer decided), by (the rules), risk'),
+    coverage: coverageSchema.optional().describe('per question: judged, unjudged and why, or not_applicable; plus the inputs carried'),
+    provenance: provenanceSchema.optional().describe('Iris version, ruleset and config hashes, thresholds, composer facts, corpus version, time'),
+    run_id: z.string().optional().describe('the run this belongs to'),
+    interpretations: interpretationSchema.array().optional().describe('why a failed rule did not decide; unjudged questions; close calls'),
+    erased_at: z.string().optional().describe('set once the linked trace was deleted'),
+    eval_type: z.enum(['completeness', 'relevance', 'safety', 'cost', 'custom', 'all']).describe('the bundle that ran'),
+    score: z.number().describe('0..1 weighted quality over the rules that ran'),
+    passed: z.boolean().describe('the ship verdict; false when nothing was judged'),
+    rule_results: z.array(evalRuleResultSchema).describe('per rule: verdict, message, kind, role, question, saw, evidence, uncertainty'),
+    rules_evaluated: z.number().int().describe('rules that judged'),
+    rules_skipped: z.number().int().describe('rules that skipped'),
+    insufficient_data: z.boolean().describe('true when no rule could judge'),
+    critical_failures: z.array(z.string()).optional().describe('critical rules that failed and vetoed passed'),
+    critical_skipped: z.array(z.string()).optional().describe('critical rules that could not judge; treat as unknown'),
+    categories: z.record(z.string(), evalCategoryResultSchema).optional().describe('per-bundle verdicts for eval_type all'),
+    note: z.string().optional().describe('present when eval_type was omitted'),
+    rules_changed: z
+      .looseObject({ count: z.number().int().positive(), last_change_at: z.string(), since: z.string(), audit: z.literal('iris://audit') })
+      .optional()
+      .describe('present when deployed custom rules changed since the server started: count, last change, iris://audit; never alters the verdict'),
+  });
+
+export type EvaluateOutputResponse = z.infer<typeof evaluateOutputResponseSchema>;

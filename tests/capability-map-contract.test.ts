@@ -1,0 +1,244 @@
+/*
+ * The public capability map is drift-locked to the release it ships in.
+ *
+ * Every `has` / `partial` cell names evidence, and every evidence name
+ * resolves to a registered rule, tool, resource, route, proof row or judge
+ * template; every registered rule, tool, template and resource appears in
+ * at least one such cell (a capability nobody can find on the map is a
+ * documentation gap); the sixty ids are the ten questions by the six
+ * subjects; every map question maps to the questions registry; no cell
+ * names a private path or a review lens id; and for every cell's `needs`,
+ * the real engine skips the cell's rules when the named input is absent —
+ * `has` must never read as "judged this" when the input lacked what the
+ * cell needs.
+ */
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import map from '../capability-map.json' with { type: 'json' };
+import { rulesByType } from '../src/eval/rules/index.js';
+import { QUESTIONS } from '../src/eval/questions.js';
+import { publishedRuleNames } from '../src/eval/accuracy.js';
+import { TOOL_NAMES } from '../src/tools/index.js';
+import { RESOURCE_URIS } from '../src/resources/uris.js';
+import { EvalEngine } from '../src/eval/engine.js';
+import { defaultConfig } from '../src/config/defaults.js';
+import type { Need } from '../src/types/eval.js';
+
+const root = resolve(__dirname, '..');
+const claims = JSON.parse(readFileSync(join(root, '.claims.json'), 'utf8')) as {
+  llmJudgeTemplates: { names: string[] };
+  capabilityMap: { cells: unknown[]; counts: Record<string, number>; total: number };
+};
+
+type Cell = (typeof map.cells)[number];
+const cells: Cell[] = map.cells;
+const answering = cells.filter((c) => c.status === 'has' || c.status === 'partial');
+
+const RULES = new Set(Object.values(rulesByType).flat().map((r) => r.name));
+const RULE_BY_NAME = new Map(Object.values(rulesByType).flat().map((r) => [r.name, r]));
+const TEMPLATES = new Set(claims.llmJudgeTemplates.names);
+const TOOLS = new Set<string>(TOOL_NAMES);
+const RESOURCES = new Set<string>(RESOURCE_URIS);
+const PROOF = new Set(publishedRuleNames());
+
+function registeredRoutes(): Set<string> {
+  const routes = new Set<string>();
+  const dir = join(root, 'src', 'dashboard', 'routes');
+  for (const f of readdirSync(dir).filter((f) => f.endsWith('.ts'))) {
+    for (const m of readFileSync(join(dir, f), 'utf8').matchAll(/router\.(?:get|post|patch|put|delete)\(\s*'([^']+)'/g)) routes.add(`/api/v1${m[1]}`);
+  }
+  return routes;
+}
+const ROUTES = registeredRoutes();
+
+/** Tools that answer no evaluation question: they manage the store, not the verdict. */
+const LIFECYCLE_TOOLS = new Set(['delete_trace', 'delete_rule']);
+
+describe('capability map — shape', () => {
+  it('sixty cells: ten questions by six subjects, ids in the Q{n}xS{m} form, one of four statuses', () => {
+    expect(map.questions.length).toBe(10);
+    expect(map.subjects.length).toBe(6);
+    expect(cells.length).toBe(60);
+    const ids = new Set(cells.map((c) => c.id));
+    for (const q of map.questions) for (const s of map.subjects) expect(ids.has(`${q.id}x${s.id}`), `${q.id}x${s.id}`).toBe(true);
+    for (const c of cells) {
+      expect(['has', 'partial', 'gap', 'n/a'], c.id).toContain(c.status);
+      expect(c.summary.length, c.id).toBeGreaterThan(20);
+      expect(c.question, c.id).toBe(c.id.split('x')[0]);
+      expect(c.subject, c.id).toBe(c.id.split('x')[1]);
+    }
+  });
+
+  it('every map question maps to the questions registry', () => {
+    // A Set of strings: the map's registryId is read from JSON, and the question is whether it is one of these.
+    const registry = new Set<string>(QUESTIONS.map((q) => q.id));
+    for (const q of map.questions) expect(registry.has(q.registryId), q.id).toBe(true);
+  });
+
+  it('the truthbase carries the map verbatim with its counts', () => {
+    expect(claims.capabilityMap.cells).toEqual(cells);
+    expect(claims.capabilityMap.total).toBe(60);
+    const counts: Record<string, number> = { has: 0, partial: 0, gap: 0, 'n/a': 0 };
+    for (const c of cells) counts[c.status] += 1;
+    expect(claims.capabilityMap.counts).toEqual(counts);
+  });
+
+  it('no cell names a private path or a review lens id', () => {
+    for (const c of cells) {
+      const text = `${c.summary} ${JSON.stringify(c.evidence)}`;
+      expect(text, c.id).not.toMatch(/\bL\d-\d\d\b/);
+      expect(text, c.id).not.toMatch(/strategy\/|sandbox\/|consulting\/|systems\//);
+      expect(text, c.id).not.toMatch(/\bsrc\/[a-z]/);
+    }
+  });
+});
+
+describe('capability map — evidence', () => {
+  it('every has or partial cell names at least one piece of evidence, and every name resolves', () => {
+    for (const c of answering) {
+      expect(c.evidence.length, `${c.id} (${c.status}) names no evidence`).toBeGreaterThan(0);
+      for (const e of c.evidence) {
+        const ok =
+          (e.kind === 'rule' && RULES.has(e.name)) ||
+          (e.kind === 'tool' && TOOLS.has(e.name)) ||
+          (e.kind === 'resource' && RESOURCES.has(e.name)) ||
+          (e.kind === 'route' && ROUTES.has(e.name)) ||
+          (e.kind === 'proof' && PROOF.has(e.name)) ||
+          (e.kind === 'template' && TEMPLATES.has(e.name));
+        expect(ok, `${c.id}: ${e.kind} "${e.name}" is not registered`).toBe(true);
+      }
+    }
+    for (const c of cells.filter((c) => c.status === 'gap' || c.status === 'n/a')) {
+      expect(c.evidence, `${c.id} (${c.status}) must name no evidence`).toEqual([]);
+    }
+  });
+
+  it('a gap or n/a cell names no registered tool, rule, route or resource — what ships answers a cell, so the cell cites it', () => {
+    /*
+     * The S4 column said "no grouping over repeated runs" in nine cells for a
+     * release after compare_traces shipped exactly that, and Q10xS5 said
+     * intervals "appear nowhere on the dashboard" after the change banner
+     * rendered one: a `gap` cell was never re-read against what shipped. A
+     * cell that names something registered is not a gap; it is partial with
+     * that evidence.
+     */
+    const registered = [...TOOLS, ...RULES, ...ROUTES, ...RESOURCES];
+    for (const c of cells.filter((c) => c.status === 'gap' || c.status === 'n/a')) {
+      for (const name of registered) {
+        expect(c.summary.includes(name), `${c.id} (${c.status}) names "${name}"`).toBe(false);
+      }
+    }
+  });
+
+  it('every registered rule, evaluating tool, judge template and resource appears in a has or partial cell', () => {
+    const seen = { rule: new Set<string>(), tool: new Set<string>(), template: new Set<string>(), resource: new Set<string>() };
+    for (const c of answering) for (const e of c.evidence) if (e.kind in seen) seen[e.kind as keyof typeof seen].add(e.name);
+    expect([...RULES].filter((r) => !seen.rule.has(r))).toEqual([]);
+    expect([...TOOLS].filter((t) => !LIFECYCLE_TOOLS.has(t) && !seen.tool.has(t))).toEqual([]);
+    expect([...TEMPLATES].filter((t) => !seen.template.has(t))).toEqual([]);
+    expect([...RESOURCES].filter((r) => !seen.resource.has(r))).toEqual([]);
+  });
+});
+
+describe('capability map — needs are real', () => {
+  const engine = new EvalEngine(defaultConfig.eval.defaultThreshold, defaultConfig.eval.ruleThresholds);
+  const FULL = {
+    output: 'The retention sweep runs at boot and deletes traces older than the configured window. Nothing else changes.',
+    input: 'Explain what the retention sweep does and when it runs.',
+    expected: 'retention sweep boot window',
+    toolCalls: [{ tool_name: 'grep', input: { pattern: 'sweep' }, output: 'retention.ts: sweep()' }],
+    tools: [{ name: 'grep', inputSchema: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] } }],
+    costUsd: 0.01,
+    tokenUsage: { prompt_tokens: 100, completion_tokens: 20 },
+    expectedTrajectory: { tool_calls: [{ tool_name: 'grep' }] },
+  };
+  const NEED_TO_CONTEXT: Record<string, keyof typeof FULL> = { input: 'input', expected: 'expected', expected_trajectory: 'expectedTrajectory', tool_calls: 'toolCalls', tools_catalogue: 'tools', cost: 'costUsd', tokens: 'tokenUsage' };
+
+  /*
+   * `tool_outputs` is not a context KEY — it is a property of the tool calls
+   * (the stamp adds it when some call carries an output), so withholding
+   * it means supplying the calls with their outputs stripped rather than
+   * deleting a field. Without this branch the contract could only check
+   * needs that happen to map one-to-one onto a context field, which would
+   * quietly exempt exactly the need a grounding rule declares.
+   */
+  const withhold = (need: string): Record<string, unknown> => {
+    const ctx = { ...FULL } as Record<string, unknown>;
+    if (need === 'tool_outputs') {
+      ctx.toolCalls = FULL.toolCalls.map(({ output: _output, ...rest }) => rest);
+      return ctx;
+    }
+    delete ctx[NEED_TO_CONTEXT[need]];
+    return ctx;
+  };
+
+  it('for every cell need beyond output, each cited rule that declares that need skips when the engine is called without it', async () => {
+    let checked = 0;
+    // One evaluation per withheld input, however many cells name it: the
+    // result depends only on the input withheld, and evaluating it again
+    // for every cell cost 1.3 s here and over 5 s on a loaded machine.
+    const byNeed = new Map<string, Awaited<ReturnType<typeof engine.evaluateAll>>>();
+    for (const c of answering) {
+      const rules = c.evidence.filter((e) => e.kind === 'rule').map((e) => RULE_BY_NAME.get(e.name)!);
+      for (const need of c.needs.filter((n) => n !== 'output')) {
+        expect(need === 'tool_outputs' || NEED_TO_CONTEXT[need] !== undefined, `${c.id}: need "${need}" is not an input the engine takes`).toBe(true);
+        if (!byNeed.has(need)) byNeed.set(need, await engine.evaluateAll(withhold(need) as typeof FULL));
+        const result = byNeed.get(need)!;
+        for (const rule of rules.filter((r) => (r.needs as readonly Need[]).includes(need as Need))) {
+          const row = result.rule_results.find((x) => x.ruleName === rule.name);
+          // Either the rule skipped, or it ran on less and its `saw` says it
+          // never had the input — a result must never claim an input it lacked.
+          const honest = row?.skipped === true || (Array.isArray(row?.saw) && !row!.saw!.includes(need as Need));
+          expect(honest, `${c.id}: ${rule.name} ran without ${need} and did not say so`).toBe(true);
+          checked += 1;
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(5);
+  });
+
+  it('a cell whose needs name an input the cited rules never read is mis-cut', () => {
+    for (const c of answering) {
+      const rules = c.evidence.filter((e) => e.kind === 'rule').map((e) => RULE_BY_NAME.get(e.name)!);
+      if (rules.length === 0) continue;
+      const declared = new Set(rules.flatMap((r) => [...(r.needs ?? [])]));
+      for (const need of c.needs) expect(declared.has(need as Need), `${c.id}: no cited rule reads "${need}"`).toBe(true);
+    }
+  });
+});
+
+/*
+ * Six multi-run cells said "a per-question filter is not shipped" for five
+ * releases after compare_traces took `question`, and the one cell that did
+ * name the filter said an HTTP route takes it too, which it does not. A
+ * cell is re-read against the tool's own schema here.
+ */
+describe('capability map — the per-question filter', () => {
+  const tool = readFileSync(join(root, 'src', 'tools', 'compare-traces.ts'), 'utf8');
+  const filtered = [...(/question: z\s*\.enum\(\[([^\]]+)\]\)/.exec(tool)?.[1] ?? '').matchAll(/'([a-z_]+)'/g)].map((m) => m[1]);
+  const registryId = new Map<string, string>(map.questions.map((q) => [q.id, q.registryId]));
+
+  it('compare_traces takes `question` over the questions a rule answers', () => {
+    expect(filtered.sort()).toEqual(QUESTIONS.filter((q) => q.answeredBy === 'rule').map((q) => q.id as string).sort());
+  });
+
+  it('no cell says the filter is not shipped, and every multi-run cell of a question it covers names it', () => {
+    for (const c of cells) expect(c.summary, c.id).not.toMatch(/per-question filter is not shipped/);
+    const multiRun = cells.filter((c) => c.subject === 'S4' && c.evidence.some((e) => e.kind === 'tool' && e.name === 'compare_traces'));
+    expect(multiRun.length).toBeGreaterThan(5);
+    for (const c of multiRun) {
+      const id = registryId.get(c.question)!;
+      if (filtered.includes(id)) expect(c.summary, c.id).toContain(`\`question: ${id}\``);
+    }
+  });
+
+  it('a cell says the cases route takes `question` only if the route parses it', () => {
+    const validation = readFileSync(join(root, 'src', 'dashboard', 'validation.ts'), 'utf8');
+    const start = validation.indexOf('export const caseQuerySchema');
+    const caseQuery = validation.slice(start, validation.indexOf('});', start));
+    expect(start).toBeGreaterThan(-1);
+    const routeTakesQuestion = /\bquestion\b/.test(caseQuery);
+    for (const c of cells) if (/cases\/:key\)? takes? `question/.test(c.summary)) expect(routeTakesQuestion, c.id).toBe(true);
+  });
+});

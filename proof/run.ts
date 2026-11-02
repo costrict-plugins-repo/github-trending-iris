@@ -1,0 +1,943 @@
+/*
+ * npm run proof — measures every built-in rule on its labelled family and
+ * writes the numbers the README, docs and website cite in place of
+ * "measured against a labeled corpus".
+ *
+ * What it does:
+ *   1. Loads every proof/corpus/<rule>.json, validates it, and hashes the
+ *      set (corpusVersion) so a result can be tied to exactly the cases
+ *      that produced it.
+ *   2. For each family, calls the REAL rule's evaluate — imported from the
+ *      registry in src/eval/rules/index.ts, the same object the engine
+ *      runs — on each case with the context the case declares (input,
+ *      expected, costUsd, tokenUsage, customConfig …). Placeholders are
+ *      materialised deterministically from the case id first.
+ *   3. Per rule: confusion matrix, precision, recall, F1, Wilson 95%
+ *      intervals for precision and recall, and a seeded bootstrap interval
+ *      for F1. A skipped result (the rule declined to judge: missing
+ *      context, output too brief) is a non-prediction and is counted as
+ *      "did not fail" — the reader sees the skip count beside the row.
+ *   4. Writes proof/results.json (sorted keys, LF, 4 decimal places) and
+ *      proof/RESULTS.md.
+ *
+ * `--check` regenerates both to a temporary directory and exits 1 if
+ * either differs from the committed file (generation time and commit hash
+ * excluded), so CI proves the committed numbers are the ones this code
+ * produces. No network, no LLM, no key, no randomness beyond the fixed
+ * bootstrap seed.
+ */
+
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { resolve, dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { execSync } from 'node:child_process';
+
+import { rulesByType } from '../src/eval/rules/index.js';
+import type { EvalContext, EvalRule, EvalType } from '../src/types/eval.js';
+import { loadCorpus, validateCorpusFile, PII_ENTITIES, type CorpusFile, type LabelBasis } from './lib/corpus.js';
+import { materialiseCase } from './lib/materialise.js';
+import { summarise, F1_CI_METHOD, type Observation, type RuleSummary } from './lib/metrics.js';
+import { CREDIBLE_METHOD } from './lib/intervals.js';
+import { contextFor } from './lib/context.js';
+import { TRANSCRIPTS_MD, TRANSCRIPT_RESULTS_JSON, measureTranscripts, renderTranscriptMarkdown, type TranscriptResults } from './lib/transcripts.js';
+import { INVARIANTS_MD, INVARIANT_RESULTS_JSON, measureInvariants, renderInvariantsMarkdown, type InvariantResults } from './lib/invariants.js';
+import { OUTSIDE_MD, OUTSIDE_RESULTS_JSON, measureOutside, renderOutsideMarkdown, type OutsideResults } from './lib/outside.js';
+import { measureTransforms, type TransformResults } from './lib/transforms.js';
+import { loadCustomCorpus, validateCustomCorpusFile, measureCustom, type CustomRow } from './lib/custom-corpus.js';
+import { wilson } from './judge/lib/wilson.js';
+import { measureLatency, type LatencyResults } from './lib/latency.js';
+import { EvalEngine, evaluateRuleAsRead } from '../src/eval/engine.js';
+import { defaultConfig } from '../src/config/defaults.js';
+
+export { contextFor };
+import { measureComposite, renderCompositeMarkdown, renderPublishedCalibration, normaliseCompositeForCheck, COMPOSITE_RESULTS_JSON, COMPOSITE_MD, PUBLISHED_CALIBRATION_TS, type CompositeResults } from './lib/composite-report.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+export const repoRoot = resolve(here, '..');
+
+export const RESULTS_JSON = 'proof/results.json';
+export const RESULTS_MD = 'proof/RESULTS.md';
+/*
+ * The third output (0.9.0): the same per-rule numbers as a generated
+ * TypeScript module the SHIPPED server imports (src/eval/accuracy.ts), so a
+ * verdict can carry the published precision and recall of each rule that
+ * spoke. It has to be a compiled module under src/: the npm package ships
+ * dist/ only, and a runtime read of proof/results.json finds nothing in an
+ * installed copy. It carries the corpus version and the release, never a
+ * commit hash or a timestamp, so `--check` compares it byte for byte.
+ */
+export const PUBLISHED_ACCURACY_TS = 'src/eval/published-accuracy.ts';
+
+/** A family that skips more than this is measuring something other than what it claims. */
+export const MAX_FAMILY_SKIP_SHARE = 0.2;
+
+export interface RuleRow extends RuleSummary {
+  name: string;
+  category: EvalType;
+  family: string;
+  falsePositives: string[];
+  falseNegatives: string[];
+  definition: string;
+  labelling: string;
+  labelBasis: LabelBasis;
+}
+
+export interface EntityRow {
+  entity: string;
+  /** Positive cases whose author named this entity. */
+  present: number;
+  /** Of those, cases the rule failed for any reason. */
+  caught: number;
+  /** Of those, cases where the rule's evidence named this entity — recall is this over present. */
+  named: number;
+  recall: number | null;
+  ci95: [number, number] | null;
+}
+
+export interface ProofResults {
+  schemaVersion: 2;
+  corpusVersion: string;
+  /** sha256 over proof/corpus/custom/*.json — the conformance families. */
+  customCorpusVersion: string;
+  generatedAt: string;
+  commit: string;
+  /** package.json version the numbers were generated for — the public surfaces cite this, because a squash-merge erases branch commits. */
+  version: string;
+  method: { ci: 'wilson-95'; f1Ci: string; credible: string; ppvAt: string; positiveClass: 'fail'; skipped: string };
+  rules: Array<{
+    name: string;
+    category: EvalType;
+    /** What the family's labels are (proof/lib/corpus.ts): a reader's judgement, or the rule's own definition applied independently. */
+    labelBasis: LabelBasis;
+    n: number;
+    positives: number;
+    negatives: number;
+    skipped: number;
+    tp: number;
+    fp: number;
+    fn: number;
+    tn: number;
+    precision: number | null;
+    recall: number | null;
+    f1: number | null;
+    ci95: RuleSummary['ci95'];
+    credible95: RuleSummary['credible95'];
+    ppvAt: Record<string, number | null>;
+  }>;
+  transforms: TransformResults;
+  /*
+   * A rule change that was measured and NOT shipped.
+   *
+   * Carried into results.json so it reaches the truthbase and the public
+   * proof page, not just RESULTS.md. A negative result that lives only in
+   * the repository is one the people deciding whether to trust this
+   * evaluator never see, and "we tried it and it was worse" is exactly the
+   * kind of thing they have no other way to learn.
+   */
+  entities: Array<{ rule: string; method: string; rows: EntityRow[] }>;
+  custom: {
+    method: string;
+    types: Array<{
+      type: string;
+      config: Record<string, unknown>;
+      n: number;
+      positives: number;
+      negatives: number;
+      skipped: number;
+      tp: number;
+      fp: number;
+      fn: number;
+      tn: number;
+      precision: number | null;
+      recall: number | null;
+      f1: number | null;
+      ci95: RuleSummary['ci95'];
+      credible95: RuleSummary['credible95'];
+    }>;
+  };
+  humanAgreement: { status: 'pending'; note: string };
+  /** How long one evaluation takes, on the machine named in it (proof/lib/latency.ts). Excluded from `--check`. */
+  latency?: LatencyResults;
+}
+
+/** PPV of a fire at a prevalence, from the family's sensitivity and specificity; null when either is undefined. */
+export function ppvFromCounts(c: { tp: number; fp: number; fn: number; tn: number }, prevalence: number): number | null {
+  if (c.tp + c.fn === 0 || c.tn + c.fp === 0) return null;
+  const sens = c.tp / (c.tp + c.fn);
+  const spec = c.tn / (c.tn + c.fp);
+  const den = sens * prevalence + (1 - spec) * (1 - prevalence);
+  return den === 0 ? null : Math.round(((sens * prevalence) / den) * 10_000) / 10_000;
+}
+export const PPV_PREVALENCES = [0.01, 0.05, 0.2, 0.5] as const;
+
+/** Label the no_pii rule emits → the entity it names. */
+const PII_LABEL_TO_ENTITY: Record<string, string> = {
+  SSN: 'ssn',
+  'Credit Card': 'credit_card',
+  IBAN: 'iban',
+  Phone: 'phone',
+  Email: 'email',
+  DOB: 'dob',
+  'Private Key Block': 'private_key',
+  'Seed Phrase': 'seed_phrase',
+  'API Key': 'api_key',
+  'AWS Access Key': 'api_key',
+  'Slack Token': 'api_key',
+  'SendGrid Key': 'api_key',
+  'GitHub Token': 'api_key',
+  'Google API Key': 'api_key',
+  'npm Token': 'api_key',
+  'DigitalOcean Token': 'api_key',
+};
+
+/** Per-entity recall for a family whose positives carry `entities`. */
+export function measureEntities(file: CorpusFile, rule: EvalRule): EntityRow[] {
+  const rows: EntityRow[] = [];
+  const positives = file.cases.filter((c) => c.label === 'positive' && c.entities && c.entities.length > 0);
+  const observed = positives.map((raw) => {
+    const c = materialiseCase(raw);
+    const r = evaluateRuleAsRead(rule, contextFor(c, file.config));
+    const fired = !r.skipped && r.passed === false;
+    const named = new Set<string>();
+    for (const e of r.evidence ?? []) {
+      const label = e.type === 'span' ? e.label : e.type === 'pattern' ? e.name : undefined;
+      const entity = label ? PII_LABEL_TO_ENTITY[label] : undefined;
+      if (entity) named.add(entity);
+    }
+    return { entities: raw.entities as string[], fired, named };
+  });
+  for (const entity of PII_ENTITIES) {
+    const present = observed.filter((o) => o.entities.includes(entity));
+    if (present.length === 0) continue;
+    const caught = present.filter((o) => o.fired).length;
+    const named = present.filter((o) => o.named.has(entity)).length;
+    const w = wilson(named, present.length);
+    rows.push({ entity, present: present.length, caught, named, recall: Math.round((named / present.length) * 10_000) / 10_000, ci95: w ? [Math.round(w.lo * 10_000) / 10_000, Math.round(w.hi * 10_000) / 10_000] : null });
+  }
+  return rows;
+}
+
+/** Every registry rule, in bundle order, keyed by name. */
+export function registryRules(): EvalRule[] {
+  return (['completeness', 'relevance', 'safety', 'cost'] as const).flatMap((t) => rulesByType[t]);
+}
+
+/**
+ * Runs one family through its rule and returns the observations, one per
+ * case. Each rule reads the output as the engine hands it over: a
+ * structured output in the reading the rule declares.
+ */
+export function observe(file: CorpusFile, rule: EvalRule): Observation[] {
+  return file.cases.map((raw) => {
+    const c = materialiseCase(raw);
+    const result = evaluateRuleAsRead(rule, contextFor(c, file.config));
+    const skipped = result.skipped === true;
+    return {
+      id: c.id,
+      actual: c.label === 'positive',
+      predicted: !skipped && result.passed === false,
+      skipped,
+    };
+  });
+}
+
+/**
+ * Every corpus case as the EvalContext the engine would receive, in a
+ * stable order — the same materialisation the per-rule runner uses, so the
+ * latency is measured over the outputs the accuracy was measured over.
+ */
+export async function corpusContexts(root: string): Promise<EvalContext[]> {
+  const { files } = await loadCorpus(root);
+  const out: EvalContext[] = [];
+  for (const file of [...files].sort((a, b) => a.rule.localeCompare(b.rule))) {
+    for (const raw of file.cases) out.push(contextFor(materialiseCase(raw), file.config));
+  }
+  return out;
+}
+
+export async function measure(root: string): Promise<{ rows: RuleRow[]; corpusVersion: string; customCorpusVersion: string; missing: string[]; transforms: TransformResults; entities: ProofResults['entities']; custom: CustomRow[] }> {
+  const { files, corpusVersion } = await loadCorpus(root);
+  const { files: customFiles, customCorpusVersion } = await loadCustomCorpus(root);
+  const rules = registryRules();
+  const registry = new Map(rules.map((r) => [r.name, r.evalType]));
+  const byName = new Map(rules.map((r) => [r.name, r]));
+
+  const issues = [
+    ...files.flatMap((f) => validateCorpusFile(f, `${f.family ?? '?'}.json`, registry)),
+    ...customFiles.flatMap((f) => validateCustomCorpusFile(f, `custom/${f.type ?? '?'}.json`)),
+  ];
+  if (issues.length > 0) {
+    throw new Error(`corpus validation failed:\n  ${issues.join('\n  ')}`);
+  }
+  const customTypes = customFiles.map((f) => f.type);
+  const dupCustom = customTypes.filter((t, i, a) => a.indexOf(t) !== i);
+  if (dupCustom.length > 0) throw new Error(`more than one conformance family for: ${[...new Set(dupCustom)].join(', ')}`);
+  const byRule = new Map(files.map((f) => [f.rule, f]));
+  const dup = files.map((f) => f.rule).filter((r, i, a) => a.indexOf(r) !== i);
+  if (dup.length > 0) throw new Error(`more than one family for: ${[...new Set(dup)].join(', ')}`);
+
+  const rows: RuleRow[] = [];
+  const missing: string[] = [];
+  for (const rule of rules) {
+    const file = byRule.get(rule.name);
+    if (!file) {
+      missing.push(rule.name);
+      continue;
+    }
+    const obs = observe(file, byName.get(rule.name) as EvalRule);
+    rows.push({
+      name: rule.name,
+      category: rule.evalType,
+      family: file.family,
+      // Carried so the skip discipline below can ask whether the header
+      // explains the skips a reader will see beside the number.
+      definition: file.definition,
+      labelling: file.labelling,
+      labelBasis: file.labelBasis,
+      ...summarise(obs, rule.name),
+      falsePositives: obs.filter((o) => !o.actual && o.predicted).map((o) => o.id),
+      falseNegatives: obs.filter((o) => o.actual && !o.predicted).map((o) => o.id),
+    });
+  }
+  const transforms = measureTransforms(files, byName);
+  const entities: ProofResults['entities'] = [];
+  const pii = byRule.get('no_pii');
+  if (pii && byName.get('no_pii')) {
+    entities.push({
+      rule: 'no_pii',
+      method: 'positives carry `entities` named by the case author; caught = the rule failed the case for any reason; named = the evidence named this entity; recall = named / present, Wilson 95% — a case caught for another reason is visible as caught − named',
+      rows: measureEntities(pii, byName.get('no_pii') as EvalRule),
+    });
+  }
+  const custom = measureCustom(customFiles);
+  return { rows, corpusVersion, customCorpusVersion, missing, transforms, entities, custom };
+}
+
+function gitCommit(root: string): string {
+  try {
+    return execSync('git rev-parse --short HEAD', { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  } catch {
+    return 'unknown';
+  }
+}
+
+export function toResults(
+  rows: RuleRow[],
+  corpusVersion: string,
+  generatedAt: string,
+  commit: string,
+  version: string,
+  extra: { customCorpusVersion: string; transforms: TransformResults; entities: ProofResults['entities']; custom: CustomRow[]; latency?: LatencyResults },
+): ProofResults {
+  return {
+    schemaVersion: 2,
+    corpusVersion,
+    customCorpusVersion: extra.customCorpusVersion,
+    generatedAt,
+    commit,
+    version,
+    method: {
+      ci: 'wilson-95',
+      f1Ci: F1_CI_METHOD,
+      credible: CREDIBLE_METHOD,
+      ppvAt: `positive predictive value of a fire at prevalences ${PPV_PREVALENCES.join(', ')}: sens·π / (sens·π + (1 − spec)(1 − π)) from this family's counts`,
+      positiveClass: 'fail',
+      skipped: 'a skipped result (the rule declined to judge) counts as not failed; the count is reported per rule',
+    },
+    rules: rows.map((r) => ({
+      name: r.name,
+      category: r.category,
+      labelBasis: r.labelBasis,
+      n: r.n,
+      positives: r.positives,
+      negatives: r.negatives,
+      skipped: r.skipped,
+      tp: r.tp,
+      fp: r.fp,
+      fn: r.fn,
+      tn: r.tn,
+      precision: r.precision,
+      recall: r.recall,
+      f1: r.f1,
+      ci95: r.ci95,
+      credible95: r.credible95,
+      ppvAt: Object.fromEntries(PPV_PREVALENCES.map((p) => [String(p), ppvFromCounts(r, p)])),
+    })),
+    transforms: extra.transforms,
+    entities: extra.entities,
+    custom: {
+      method: "each custom rule type built by createCustomRule under the family's config and run on cases labelled by its documented definition; a disagreement is a rule defect or a definition error, never an opinion",
+      types: extra.custom.map((c) => ({
+        type: c.type,
+        config: c.config,
+        n: c.n,
+        positives: c.positives,
+        negatives: c.negatives,
+        skipped: c.skipped,
+        tp: c.tp,
+        fp: c.fp,
+        fn: c.fn,
+        tn: c.tn,
+        precision: c.precision,
+        recall: c.recall,
+        f1: c.f1,
+        ci95: c.ci95,
+        credible95: c.credible95,
+      })),
+    },
+    humanAgreement: {
+      status: 'pending',
+      note: 'founder blind label of a 140-case stratified sample (twenty per judgment family); until then the labels are same-model dual annotation (see proof/README.md)',
+    },
+    ...(extra.latency ? { latency: extra.latency } : {}),
+  };
+}
+
+/** The markers around the latency section of RESULTS.md, so `--check` can ignore what the machine decides. */
+export const LATENCY_START = '<!-- latency:start -->';
+export const LATENCY_END = '<!-- latency:end -->';
+
+/** RESULTS.md without its latency section, for the byte comparison. */
+export function stripLatency(md: string): string {
+  const from = md.indexOf(LATENCY_START);
+  if (from < 0) return md;
+  const to = md.indexOf(LATENCY_END, from);
+  if (to < 0) return md.slice(0, from);
+  // The newline after the closing marker too, so a stripped file and a file
+  // rendered without the section are byte-identical rather than off by one.
+  const after = to + LATENCY_END.length;
+  return md.slice(0, from) + md.slice(md[after] === String.fromCharCode(10) ? after + 1 : after);
+}
+
+/** JSON with every object's keys sorted, two-space indent, LF, trailing newline. */
+export function stableJson(value: unknown): string {
+  const sort = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(sort);
+    if (v && typeof v === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(v as Record<string, unknown>).sort()) out[k] = sort((v as Record<string, unknown>)[k]);
+      return out;
+    }
+    return v;
+  };
+  return JSON.stringify(sort(value), null, 2) + '\n';
+}
+
+function pct(x: number | null): string {
+  return x === null ? '—' : `${(x * 100).toFixed(1)}%`;
+}
+
+function ci(i: [number, number] | null): string {
+  return i === null ? '—' : `[${(i[0] * 100).toFixed(1)}, ${(i[1] * 100).toFixed(1)}]`;
+}
+
+export function renderMarkdown(rows: RuleRow[], corpusVersion: string, generatedAt: string, commit: string, missing: string[], version: string, results?: ProofResults): string {
+  const L: string[] = [];
+  L.push('# Iris built-in rules — measured on the proof corpus');
+  L.push('');
+  L.push(`Generated ${generatedAt} for v${version} (local generating commit \`${commit}\` — branch commits are squashed on merge, so cite the version).`);
+  L.push(`Corpus version \`${corpusVersion}\` (sha256 of proof/corpus/*.json). Reproduce with \`npm run proof\`; CI runs \`npm run proof -- --check\`.`);
+  L.push('');
+  L.push('The positive class is the violation: precision = of the outputs the rule failed, the share that were real violations; recall = of the real violations, the share the rule failed. Intervals: Wilson 95% for precision and recall; a seeded percentile bootstrap for F1; beside each, a Dirichlet credible interval that does not collapse to [1, 1] at zero errors (results.json `credible95`). A skipped result (the rule declined to judge) counts as not failed and is listed under "skip". Read proof/README.md before quoting a number — the corpus is synthetic, rule-aware, and labelled by the same model that wrote it.');
+  L.push('');
+  const byBasis = (b: LabelBasis): RuleRow[] => rows.filter((r) => r.labelBasis === b);
+  const perfect = (rs: RuleRow[]): number => rs.filter((r) => r.f1 === 1).length;
+  const read = byBasis('reading');
+  const defined = byBasis('definition');
+  L.push(`**What the ${rows.length} measured rules show is two different things.** ${read.length} are measured against labels a model gave by reading the failure itself, without running the rule (a synthetic, model-labelled corpus; a human blind label is pending): those numbers measure detection (${perfect(read)} of ${read.length} score F1 1.00). ${defined.length} are checked against their own documented definition, applied independently by script or by counting: those numbers show the code implements its formula, not that the formula catches what a reader would call the failure (${perfect(defined)} of ${defined.length} score F1 1.00). The "Labels" column says which; each family's \`labelling\` statement says how.`);
+  L.push('');
+  L.push('| Rule | Bundle | Labels | n | pos | skip | TP | FP | FN | TN | Precision (95% CI) | Recall (95% CI) | F1 (95% CI) | F1 credible | PPV at 5% / 50% |');
+  L.push('|---|---|---|--:|--:|--:|--:|--:|--:|--:|---|---|---|---|---|');
+  for (const r of rows) {
+    L.push(
+      `| \`${r.name}\` | ${r.category} | ${r.labelBasis === 'reading' ? 'reader' : 'own definition'} | ${r.n} | ${r.positives} | ${r.skipped} | ${r.tp} | ${r.fp} | ${r.fn} | ${r.tn} | ${pct(r.precision)} ${ci(r.ci95.precision)} | ${pct(r.recall)} ${ci(r.ci95.recall)} | ${r.f1 === null ? '—' : r.f1.toFixed(3)} ${ci(r.ci95.f1)} | ${ci(r.credible95.f1)} | ${pct(ppvFromCounts(r, 0.05))} / ${pct(ppvFromCounts(r, 0.5))} |`,
+    );
+  }
+  if (missing.length > 0) {
+    L.push('');
+    L.push(`> ⚠ Registry rules with no family yet (unmeasured): ${missing.map((m) => `\`${m}\``).join(', ')}.`);
+  }
+  L.push('');
+  L.push('## Misses, by case id');
+  L.push('');
+  L.push('The ids the rule got wrong, so a reader can open the case and judge the miss for themselves. FP = a negative case the rule failed; FN = a positive case the rule passed or skipped.');
+  L.push('');
+  for (const r of rows) {
+    const fp = r.falsePositives.length === 0 ? 'none' : r.falsePositives.join(', ');
+    const fn = r.falseNegatives.length === 0 ? 'none' : r.falseNegatives.join(', ');
+    L.push(`- \`${r.name}\` — FP: ${fp} · FN: ${fn}`);
+  }
+  L.push('');
+  if (results) {
+    L.push('## Transforms — do the critical rules survive the evasions a leak arrives in?');
+    L.push('');
+    L.push(`${results.transforms.method}.`);
+    L.push('');
+    L.push('| Rule | positives | fired untransformed | with a span |');
+    L.push('|---|--:|--:|--:|');
+    for (const s of results.transforms.rules) L.push(`| \`${s.rule}\` | ${s.positives} | ${s.firedOriginally} | ${s.withSpan} |`);
+    L.push('');
+    L.push('| Rule | Transform | n | still caught | Recall (95% CI) | dropped |');
+    L.push('|---|---|--:|--:|---|---|');
+    for (const t of results.transforms.rows) L.push(`| \`${t.rule}\` | ${t.transform} | ${t.n} | ${t.caught} | ${t.n === 0 ? 'n/a' : `${pct(t.recall)} ${ci(t.ci95)}`} | ${t.dropped.length === 0 ? (t.n === 0 ? '—' : 'none') : t.dropped.join(', ')} |`);
+    L.push('');
+    for (const t of results.transforms.transforms) L.push(`- \`${t.id}\` — ${t.describe}`);
+    L.push('');
+    for (const e of results.entities) {
+      L.push(`## Recall by entity — \`${e.rule}\``);
+      L.push('');
+      L.push(`${e.method}.`);
+      L.push('');
+      L.push('| Entity | present | caught | named | Recall (95% CI) |');
+      L.push('|---|--:|--:|--:|---|');
+      for (const r of e.rows) L.push(`| \`${r.entity}\` | ${r.present} | ${r.caught} | ${r.named} | ${pct(r.recall)} ${ci(r.ci95)} |`);
+      L.push('');
+    }
+    L.push('## Custom rule types — conformance to their documented definitions');
+    L.push('');
+    L.push(`${results.custom.method}. Families live in proof/corpus/custom/<type>.json with the config each is measured under.`);
+    L.push('');
+    L.push('| Type | config | n | pos | skip | TP | FP | FN | TN | Precision (95% CI) | Recall (95% CI) |');
+    L.push('|---|---|--:|--:|--:|--:|--:|--:|--:|---|---|');
+    for (const c of results.custom.types) L.push(`| \`${c.type}\` | \`${JSON.stringify(c.config)}\` | ${c.n} | ${c.positives} | ${c.skipped} | ${c.tp} | ${c.fp} | ${c.fn} | ${c.tn} | ${pct(c.precision)} ${ci(c.ci95.precision)} | ${pct(c.recall)} ${ci(c.ci95.recall)} |`);
+    L.push('');
+  }
+  if (results?.latency) {
+    const l = results.latency;
+    // Between the markers so `--check` can strip it: the numbers are the
+    // machine's, and the machine differs between a laptop and CI's runner.
+    L.push(LATENCY_START);
+    L.push('## How long one evaluation takes');
+    L.push('');
+    L.push(`${l.method}. n=${l.n}; p50 ${l.p50Ms} ms, p95 ${l.p95Ms} ms on ${l.machine.cpu} (${l.machine.platform}/${l.machine.arch}, node ${l.machine.node}).`);
+    L.push('');
+    L.push('Re-measured on every `npm run proof` and excluded from `--check`: it is a property of the machine, so CI cannot hold it byte-for-byte.');
+    // The blank line belongs INSIDE the markers: stripping the section must
+    // leave exactly what a render without it produces, not one line more.
+    L.push('');
+    L.push(LATENCY_END);
+  }
+  L.push('Human agreement: pending (human blind label of a 140-case stratified sample, twenty per judgment family).');
+  L.push('');
+  return L.join('\n');
+}
+
+/**
+ * The generated module: one entry per measured rule, in registry order, plus
+ * the provenance every number must travel with. `labelling` flips to
+ * 'human-verified' when a human blind label lands (humanAgreement
+ * status), and not before.
+ */
+export function renderPublishedAccuracy(results: ProofResults): string {
+  const L: string[] = [];
+  L.push('/*');
+  L.push(' * GENERATED by `npm run proof` from proof/results.json — do not edit by hand.');
+  L.push(' * `npm run proof -- --check` fails CI when this file differs from what the');
+  L.push(' * runner produces. Read by src/eval/accuracy.ts; the numbers a verdict carries');
+  L.push(' * are the numbers on https://iris-eval.com/proof, for the release named below.');
+  L.push(' */');
+  L.push('');
+  L.push(`export const PUBLISHED_ACCURACY_CORPUS_VERSION = '${results.corpusVersion}';`);
+  L.push(`export const PUBLISHED_ACCURACY_RELEASE = '${results.version}';`);
+  L.push(`export const PUBLISHED_ACCURACY_LABELLING = '${results.humanAgreement.status === 'pending' ? 'same-model' : 'human-verified'}' as const;`);
+  L.push('');
+  L.push('export const PUBLISHED_ACCURACY = {');
+  for (const r of results.rules) {
+    const ci = (i: [number, number] | null): string => (i === null ? 'null' : `[${i[0]}, ${i[1]}]`);
+    L.push(`  ${r.name}: {`);
+    L.push(`    n: ${r.n}, tp: ${r.tp}, fp: ${r.fp}, fn: ${r.fn}, tn: ${r.tn},`);
+    L.push(`    precision: ${r.precision}, recall: ${r.recall}, f1: ${r.f1},`);
+    L.push(`    ci95: { precision: ${ci(r.ci95.precision)}, recall: ${ci(r.ci95.recall)}, f1: ${ci(r.ci95.f1)} },`);
+    L.push('  },');
+  }
+  L.push('} as const;');
+  L.push('');
+  return L.join('\n');
+}
+
+/** Strips the two fields that legitimately change on every run/commit. */
+export function normaliseForCheck(json: string, md: string): { json: string; md: string } {
+  const parsed = JSON.parse(json) as Record<string, unknown>;
+  delete parsed.generatedAt;
+  delete parsed.commit;
+  /*
+   * Latency is a property of the machine, not of the code: CI's runner and
+   * a laptop disagree by more than any threshold worth setting, so holding
+   * the committed number byte-for-byte would fail every run. What holds it
+   * honest instead: the block names the machine it came from, and the
+   * hardcoded-claim scanner refuses a latency number anywhere that
+   * disagrees with the one in the truthbase.
+   */
+  delete parsed.latency;
+  return {
+    json: stableJson(parsed),
+    md: stripLatency(md).replace(/\r\n/g, '\n').split('\n').filter((l) => !l.startsWith('Generated ')).join('\n'),
+  };
+}
+
+/**
+ * `--composite`: the verdict on the composite corpus. Writes
+ * proof/composite-results.json, proof/COMPOSITE.md and the calibration the
+ * confidence label reads (src/eval/published-calibration.ts), or with `--check`
+ * regenerates them to a temp path and fails on any difference.
+ */
+async function composite(check: boolean): Promise<void> {
+  const { results: partial, rows } = await measureComposite(repoRoot);
+  const generatedAt = new Date().toISOString();
+  const commit = gitCommit(repoRoot);
+  const version = (JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf-8')) as { version: string }).version;
+  const results: CompositeResults = { ...partial, generatedAt, commit, version };
+  const json = stableJson(results);
+  const md = renderCompositeMarkdown(results);
+  const calibrationTs = renderPublishedCalibration(results);
+  for (const [name, split] of [['test', 'test'], ['real', 'realTranscripts'], ['dev', 'dev']] as const) {
+    process.stdout.write(`  ${name.padEnd(5)} legacy acc=${pct(results.legacy[split].accuracy.rate).padStart(6)} ${ci(results.legacy[split].accuracy.ci95).padEnd(14)} risk acc=${pct(results.risk[split].accuracy.rate).padStart(6)} ${ci(results.risk[split].accuracy.ci95).padEnd(14)} n=${results.legacy[split].accuracy.n}
+`);
+  }
+  const d = results.difference.risk.test;
+  const dc = results.difference.riskPerClass.test;
+  process.stdout.write(`  difference (test): per-output ${d ? `${(d.delta * 100).toFixed(1)} points [${(d.lo * 100).toFixed(1)}, ${(d.hi * 100).toFixed(1)}]` : '—'}; per-class ${dc ? `${(dc.delta * 100).toFixed(1)} points [${(dc.lo * 100).toFixed(1)}, ${(dc.hi * 100).toFixed(1)}]` : '—'}; sweep argmax τ=${results.sweep.argmaxUtility} (shipped ${results.sweep.shippedTau}); cases=${rows.length}
+`);
+  if (check) {
+    let committedJson = '';
+    let committedMd = '';
+    try {
+      committedJson = await readFile(resolve(repoRoot, COMPOSITE_RESULTS_JSON), 'utf-8');
+      committedMd = await readFile(resolve(repoRoot, COMPOSITE_MD), 'utf-8');
+    } catch {
+      process.stderr.write(`proof --check --composite — ${COMPOSITE_RESULTS_JSON} or ${COMPOSITE_MD} is missing; run npm run proof -- --composite and commit both.
+`);
+      process.exit(1);
+    }
+    let committedTs = '';
+    try {
+      committedTs = (await readFile(resolve(repoRoot, PUBLISHED_CALIBRATION_TS), 'utf-8')).replace(/\r\n/g, '\n');
+    } catch {
+      process.stderr.write(`proof --check --composite — ${PUBLISHED_CALIBRATION_TS} is missing; run npm run proof -- --composite and commit it.
+`);
+      process.exit(1);
+    }
+    const fresh = normaliseCompositeForCheck(json, md);
+    const committed = normaliseCompositeForCheck(committedJson, committedMd);
+    const tsSame = committedTs === calibrationTs;
+    if (fresh.json === committed.json && fresh.md === committed.md && tsSame) {
+      process.stdout.write(`proof --check --composite — OK: ${COMPOSITE_RESULTS_JSON}, ${COMPOSITE_MD} and ${PUBLISHED_CALIBRATION_TS} match this code on composite ${results.compositeVersion}
+`);
+      return;
+    }
+    process.stderr.write(`proof --check --composite — FAIL: ${[fresh.json !== committed.json && COMPOSITE_RESULTS_JSON, fresh.md !== committed.md && COMPOSITE_MD, !tsSame && PUBLISHED_CALIBRATION_TS].filter(Boolean).join(' and ')} differ from what this code produces. Run npm run proof -- --composite and commit the result.
+`);
+    process.exit(1);
+  }
+  await writeFile(resolve(repoRoot, COMPOSITE_RESULTS_JSON), json);
+  await writeFile(resolve(repoRoot, COMPOSITE_MD), md);
+  await writeFile(resolve(repoRoot, PUBLISHED_CALIBRATION_TS), calibrationTs);
+  process.stdout.write(`proof — wrote ${COMPOSITE_RESULTS_JSON}, ${COMPOSITE_MD} and ${PUBLISHED_CALIBRATION_TS} (composite ${results.compositeVersion}, ${rows.length} cases)
+`);
+}
+
+/**
+ * The held-out real-transcript line, regenerated rather than typed.
+ *
+ * Same shape as `--composite`: measure, render, and on `--check` diff both
+ * artefacts against what is committed, with the generation stamps stripped
+ * so only the numbers can fail it.
+ */
+async function transcripts(check: boolean): Promise<void> {
+  const partial = await measureTranscripts(repoRoot);
+  const generatedAt = new Date().toISOString();
+  const commit = gitCommit(repoRoot);
+  const version = (JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf-8')) as { version: string }).version;
+  const results: TranscriptResults = { ...partial, generatedAt, commit, version };
+  const json = stableJson(results);
+  const md = renderTranscriptMarkdown(results);
+  const t = results.totals;
+  process.stdout.write(`  classes caught ${t.classesCaught}/${t.classesPresent} · ship ${t.shipAgrees}/${t.transcripts} · all four bundles ${t.allBundlesAgree}/${t.transcripts} · bundle verdicts ${t.bundleVerdictsAgree}/${t.bundleVerdicts}
+`);
+  if (check) {
+    let committedJson = '';
+    let committedMd = '';
+    try {
+      committedJson = await readFile(resolve(repoRoot, TRANSCRIPT_RESULTS_JSON), 'utf-8');
+      committedMd = await readFile(resolve(repoRoot, TRANSCRIPTS_MD), 'utf-8');
+    } catch {
+      process.stderr.write(`proof --check --transcripts — ${TRANSCRIPT_RESULTS_JSON} or ${TRANSCRIPTS_MD} is missing; run npm run proof -- --transcripts and commit both.
+`);
+      process.exit(1);
+    }
+    const fresh = normaliseForCheck(json, md);
+    const committed = normaliseForCheck(committedJson, committedMd);
+    if (fresh.json === committed.json && fresh.md === committed.md) {
+      process.stdout.write(`proof --check --transcripts — OK: ${TRANSCRIPT_RESULTS_JSON} and ${TRANSCRIPTS_MD} match this code on transcripts ${results.transcriptsVersion}
+`);
+      return;
+    }
+    process.stderr.write(`proof --check --transcripts — FAIL: ${[fresh.json !== committed.json && TRANSCRIPT_RESULTS_JSON, fresh.md !== committed.md && TRANSCRIPTS_MD].filter(Boolean).join(' and ')} differ from what this code produces. Run npm run proof -- --transcripts and commit the result.
+`);
+    process.exit(1);
+  }
+  await writeFile(resolve(repoRoot, TRANSCRIPT_RESULTS_JSON), json);
+  await writeFile(resolve(repoRoot, TRANSCRIPTS_MD), md);
+  process.stdout.write(`proof — wrote ${TRANSCRIPT_RESULTS_JSON} and ${TRANSCRIPTS_MD} (transcripts ${results.transcriptsVersion}, ${results.rows.length} rows)
+`);
+}
+
+/**
+ * What a verdict does when evidence is taken away and when a failure is
+ * added (lib/invariants.ts). Same shape as `--transcripts`: measure,
+ * render, and on `--check` diff both artefacts against what is committed.
+ * A violation (a pass under a contract, a verdict rescued by a failure)
+ * fails the command in either mode: those two counts are claims, and the
+ * file is not written with a claim broken.
+ */
+async function invariants(check: boolean): Promise<void> {
+  const { results: partial } = await measureInvariants(repoRoot);
+  const generatedAt = new Date().toISOString();
+  const commit = gitCommit(repoRoot);
+  const version = (JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf-8')) as { version: string }).version;
+  const results: InvariantResults = { ...partial, generatedAt, commit, version };
+  const json = stableJson(results);
+  const md = renderInvariantsMarkdown(results);
+  for (const r of results.removals) {
+    process.stdout.write(`  ${r.id.padEnd(18)} ${String(r.carried).padStart(3)} carry it · fail→pass ${r.improved.failToPass} · fail→not checked ${r.improved.failToNotChecked}
+`);
+  }
+  for (const r of results.rewritings) {
+    const moved = Object.values(r.rules).reduce((n, x) => n + x.stopped.length + x.started.length, 0);
+    process.stdout.write(`  ${r.id.padEnd(18)} ${String(r.applied).padStart(3)} rewritten · verdicts changed ${r.verdicts.failToPass.length + r.verdicts.passToFail.length + r.verdicts.other.length} · rule answers changed ${moved}${r.sameText ? '  (held at zero)' : ''}
+`);
+  }
+  process.stdout.write(`  under a contract: ${results.violations.contract} passed · rescued by an added failure: ${results.violations.rescued} · changed by spacing, wrapping or a JSON envelope: ${results.violations.rewritten}
+`);
+  process.stdout.write(`  agents that do nothing, where no tool was called: ${results.violations.degenerate} passed
+`);
+  if (results.violations.contract > 0 || results.violations.rescued > 0 || results.violations.rewritten > 0 || results.violations.degenerate > 0) {
+    const passed = results.contracts.filter((c) => c.held && c.passed.length > 0).map((c) => `${c.what}, ${c.removal}: ${c.passed.join(', ')}`);
+    const rescued = results.additions.filter((a) => a.held && a.rescued.length > 0).map((a) => `${a.what}: ${a.rescued.join(', ')}`);
+    const rewritten = results.rewritings
+      .filter((r) => r.sameText)
+      .flatMap((r) => [
+        ...[...r.verdicts.failToPass, ...r.verdicts.passToFail, ...r.verdicts.other].map((id) => `${r.what}: the verdict on ${id} changed`),
+        ...Object.entries(r.rules).map(([rule, x]) => `${r.what}: ${rule} stopped on ${x.stopped.join(', ') || 'none'}, started on ${x.started.join(', ') || 'none'}`),
+      ]);
+    const degenerate = results.degenerate.flatMap((row) => Object.entries(row.states).filter(([key, state]) => key.startsWith('no_calls:') && state === 'pass').map(([key]) => `an agent that answers ${row.what} passed (${key})`));
+    process.stderr.write(`proof --invariants — FAIL: a verdict passed with evidence left out under a contract, was rescued by an added failure, changed with the spacing, the wrapping or the JSON envelope of the same output, or passed an agent that does nothing.
+  ${[...passed, ...rescued, ...rewritten, ...degenerate].join('\n  ')}
+`);
+    process.exit(1);
+  }
+  if (check) {
+    let committedJson = '';
+    let committedMd = '';
+    try {
+      committedJson = await readFile(resolve(repoRoot, INVARIANT_RESULTS_JSON), 'utf-8');
+      committedMd = await readFile(resolve(repoRoot, INVARIANTS_MD), 'utf-8');
+    } catch {
+      process.stderr.write(`proof --check --invariants — ${INVARIANT_RESULTS_JSON} or ${INVARIANTS_MD} is missing; run npm run proof -- --invariants and commit both.
+`);
+      process.exit(1);
+    }
+    const fresh = normaliseForCheck(json, md);
+    const committed = normaliseForCheck(committedJson, committedMd);
+    if (fresh.json === committed.json && fresh.md === committed.md) {
+      process.stdout.write(`proof --check --invariants — OK: ${INVARIANT_RESULTS_JSON} and ${INVARIANTS_MD} match this code on composite ${results.compositeVersion}
+`);
+      return;
+    }
+    process.stderr.write(`proof --check --invariants — FAIL: ${[fresh.json !== committed.json && INVARIANT_RESULTS_JSON, fresh.md !== committed.md && INVARIANTS_MD].filter(Boolean).join(' and ')} differ from what this code produces. Run npm run proof -- --invariants and commit the result.
+`);
+    process.exit(1);
+  }
+  await writeFile(resolve(repoRoot, INVARIANT_RESULTS_JSON), json);
+  await writeFile(resolve(repoRoot, INVARIANTS_MD), md);
+  process.stdout.write(`proof — wrote ${INVARIANT_RESULTS_JSON} and ${INVARIANTS_MD} (composite ${results.compositeVersion}, ${results.cases} cases)
+`);
+}
+
+/**
+ * The line Iris did not write: a sample of AgentDojo's published runs,
+ * judged by the shipped engine and scored against the labels AgentDojo's
+ * environment computed (lib/outside.ts). Same shape as `--transcripts`.
+ */
+async function outside(check: boolean): Promise<void> {
+  const partial = await measureOutside(repoRoot);
+  const generatedAt = new Date().toISOString();
+  const commit = gitCommit(repoRoot);
+  const version = (JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf-8')) as { version: string }).version;
+  const results: OutsideResults = { ...partial, generatedAt, commit, version };
+  const json = stableJson(results);
+  const md = renderOutsideMarkdown(results);
+  const h = results.headline;
+  process.stdout.write(`  wrong pass ${h.wrongPass.k}/${h.wrongPass.n} (attack succeeded ${h.wrongPassBy.attackSucceeded.k}/${h.wrongPassBy.attackSucceeded.n}) · wrong fail ${h.wrongFail.k}/${h.wrongFail.n} · injection caught ${results.detectors.find((d) => d.detector === 'any injection rule')?.caught.k}/${results.sample.attackSucceeded}
+`);
+  if (check) {
+    let committedJson = '';
+    let committedMd = '';
+    try {
+      committedJson = await readFile(resolve(repoRoot, OUTSIDE_RESULTS_JSON), 'utf-8');
+      committedMd = await readFile(resolve(repoRoot, OUTSIDE_MD), 'utf-8');
+    } catch {
+      process.stderr.write(`proof --check --outside — ${OUTSIDE_RESULTS_JSON} or ${OUTSIDE_MD} is missing; run npm run proof -- --outside and commit both.
+`);
+      process.exit(1);
+    }
+    const fresh = normaliseForCheck(json, md);
+    const committed = normaliseForCheck(committedJson, committedMd);
+    if (fresh.json === committed.json && fresh.md === committed.md) {
+      process.stdout.write(`proof --check --outside — OK: ${OUTSIDE_RESULTS_JSON} and ${OUTSIDE_MD} match this code on sample ${results.outsideVersion}
+`);
+      return;
+    }
+    process.stderr.write(`proof --check --outside — FAIL: ${[fresh.json !== committed.json && OUTSIDE_RESULTS_JSON, fresh.md !== committed.md && OUTSIDE_MD].filter(Boolean).join(' and ')} differ from what this code produces. Run npm run proof -- --outside and commit the result.
+`);
+    process.exit(1);
+  }
+  await writeFile(resolve(repoRoot, OUTSIDE_RESULTS_JSON), json);
+  await writeFile(resolve(repoRoot, OUTSIDE_MD), md);
+  process.stdout.write(`proof — wrote ${OUTSIDE_RESULTS_JSON} and ${OUTSIDE_MD} (sample ${results.outsideVersion}, ${results.rows.length} runs)
+`);
+}
+
+async function main(): Promise<void> {
+  const args = new Set(process.argv.slice(2));
+  const check = args.has('--check');
+  if (args.has('--outside')) {
+    await outside(check);
+    return;
+  }
+  if (args.has('--composite')) {
+    await composite(check);
+    return;
+  }
+  if (args.has('--transcripts')) {
+    await transcripts(check);
+    return;
+  }
+  if (args.has('--invariants')) {
+    await invariants(check);
+    return;
+  }
+
+  const { rows, corpusVersion, customCorpusVersion, missing, transforms, entities, custom } = await measure(repoRoot);
+  /*
+   * How long one evaluation takes, over the same corpus the rules were
+   * measured on, through the call `evaluate_output` makes. Under `--check`
+   * it is skipped: the comparison deletes the block anyway, and there is no
+   * reason to spend a thousand evaluations proving nothing.
+   */
+  const latency = check ? undefined : await measureLatency(new EvalEngine(defaultConfig.eval.defaultThreshold, defaultConfig.eval.ruleThresholds, defaultConfig.eval), await corpusContexts(repoRoot));
+  const generatedAt = new Date().toISOString();
+  const commit = gitCommit(repoRoot);
+  const version = (JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf-8')) as { version: string }).version;
+  const results = toResults(rows, corpusVersion, generatedAt, commit, version, { customCorpusVersion, transforms, entities, custom, latency });
+  const json = stableJson(results);
+  const md = renderMarkdown(rows, corpusVersion, generatedAt, commit, missing, version, results);
+  const ts = renderPublishedAccuracy(results);
+
+  for (const r of rows) {
+    process.stdout.write(
+      `  ${r.name.padEnd(26)} n=${String(r.n).padStart(3)} skip=${String(r.skipped).padStart(2)} tp=${String(r.tp).padStart(3)} fp=${String(r.fp).padStart(3)} fn=${String(r.fn).padStart(3)} tn=${String(r.tn).padStart(3)}  P=${pct(r.precision).padStart(6)} ${ci(r.ci95.precision).padEnd(14)} R=${pct(r.recall).padStart(6)} ${ci(r.ci95.recall).padEnd(14)} F1=${r.f1 === null ? '—' : r.f1.toFixed(3)}\n`,
+    );
+  }
+  for (const t of transforms.rows) if (t.n > 0) process.stdout.write(`  transform ${t.rule.padEnd(22)} ${t.transform.padEnd(10)} n=${String(t.n).padStart(3)} caught=${String(t.caught).padStart(3)} R=${pct(t.recall).padStart(6)}\n`);
+  if (latency) process.stdout.write(`  latency  n=${latency.n} p50=${latency.p50Ms}ms p95=${latency.p95Ms}ms on ${latency.machine.platform}/${latency.machine.arch} node ${latency.machine.node}\n`);
+  for (const c of custom) process.stdout.write(`  custom ${c.type.padEnd(18)} n=${String(c.n).padStart(3)} tp=${c.tp} fp=${c.fp} fn=${c.fn} tn=${c.tn} skip=${c.skipped}\n`);
+  if (missing.length > 0) {
+    process.stderr.write(`proof — ${missing.length} registry rule(s) have no family: ${missing.join(', ')}\n`);
+    if (check) {
+      process.stderr.write('proof — every built-in rule must have a family; --check fails.\n');
+      process.exit(1);
+    }
+  }
+
+  /*
+   * THE SKIP DISCIPLINE — a fix for a flaw older than the rules that
+   * exposed it.
+   *
+   * This runner scores a SKIPPED case as *not failed*. So a skip on a
+   * NEGATIVE case is a free true negative: it inflates specificity, which
+   * inflates the published positive predictive value — which, since 0.10.0,
+   * is arithmetic inside the verdict. Every family carrying skips has been
+   * quietly overstating its precision, and nothing said so.
+   *
+   * The fix is discipline rather than arithmetic. Skip-path behaviour is
+   * proved in unit tests and never in a family; a family that skips more
+   * than a fifth of its cases is measuring something other than what it
+   * claims; and a family that does skip must SAY so in its own header, so a
+   * reader of /proof meets the caveat beside the number.
+   */
+  const skipIssues: string[] = [];
+  for (const r of rows) {
+    if (r.skipped === 0) continue;
+    const share = r.skipped / r.n;
+    if (share > MAX_FAMILY_SKIP_SHARE) {
+      skipIssues.push(`${r.name}: ${r.skipped} of ${r.n} cases skip (${(share * 100).toFixed(1)}%, max ${(MAX_FAMILY_SKIP_SHARE * 100).toFixed(0)}%) — a skip is scored as not-failed, so a skipping negative is a free true negative that inflates this rule's published precision`);
+      continue;
+    }
+    if (!`${r.definition} ${r.labelling}`.toLowerCase().includes('skip')) {
+      skipIssues.push(`${r.name}: ${r.skipped} of ${r.n} cases skip and the family header never says why`);
+    }
+  }
+  if (skipIssues.length > 0) {
+    for (const issue of skipIssues) process.stderr.write(`proof — ${issue}\n`);
+    if (check) {
+      process.stderr.write('proof — the skip discipline is not satisfied; --check fails.\n');
+      process.exit(1);
+    }
+  }
+
+
+  if (check) {
+    const dir = await mkdtemp(join(tmpdir(), 'iris-proof-'));
+    try {
+      await writeFile(join(dir, 'results.json'), json);
+      await writeFile(join(dir, 'RESULTS.md'), md);
+      const fresh = normaliseForCheck(await readFile(join(dir, 'results.json'), 'utf-8'), await readFile(join(dir, 'RESULTS.md'), 'utf-8'));
+      let committedJson = '';
+      let committedMd = '';
+      try {
+        committedJson = await readFile(resolve(repoRoot, RESULTS_JSON), 'utf-8');
+        committedMd = await readFile(resolve(repoRoot, RESULTS_MD), 'utf-8');
+      } catch {
+        process.stderr.write(`proof --check — ${RESULTS_JSON} or ${RESULTS_MD} is missing; run npm run proof and commit both.\n`);
+        process.exit(1);
+      }
+      const committed = normaliseForCheck(committedJson, committedMd);
+      let committedTs = '';
+      try {
+        committedTs = (await readFile(resolve(repoRoot, PUBLISHED_ACCURACY_TS), 'utf-8')).replace(/\r\n/g, '\n');
+      } catch {
+        process.stderr.write(`proof --check — ${PUBLISHED_ACCURACY_TS} is missing; run npm run proof and commit it.\n`);
+        process.exit(1);
+      }
+      const jsonSame = committed.json === fresh.json;
+      const mdSame = committed.md === fresh.md;
+      const tsSame = committedTs === ts;
+      if (jsonSame && mdSame && tsSame) {
+        process.stdout.write(`proof --check — OK: ${RESULTS_JSON}, ${RESULTS_MD} and ${PUBLISHED_ACCURACY_TS} match this code on corpus ${corpusVersion}\n`);
+        return;
+      }
+      process.stderr.write(
+        `proof --check — FAIL: ${[!jsonSame && RESULTS_JSON, !mdSame && RESULTS_MD, !tsSame && PUBLISHED_ACCURACY_TS].filter(Boolean).join(' and ')} differ from what this code produces. Run npm run proof and commit the result.\n`,
+      );
+      process.exit(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  await writeFile(resolve(repoRoot, RESULTS_JSON), json);
+  await writeFile(resolve(repoRoot, RESULTS_MD), md);
+  await writeFile(resolve(repoRoot, PUBLISHED_ACCURACY_TS), ts);
+  process.stdout.write(`proof — wrote ${RESULTS_JSON}, ${RESULTS_MD} and ${PUBLISHED_ACCURACY_TS} (corpus ${corpusVersion}, ${rows.length} rules)\n`);
+}
+
+const invokedDirectly = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedDirectly) {
+  main().catch((err) => {
+    process.stderr.write(`proof — fatal: ${(err as Error).stack ?? String(err)}\n`);
+    process.exit(1);
+  });
+}

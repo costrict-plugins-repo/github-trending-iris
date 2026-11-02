@@ -1,0 +1,1305 @@
+{
+  "version": 1,
+  "about": "What Iris can judge, cell by cell: ten evaluation questions against six subjects. `has` means at least one shipped, measured thing answers the question for that subject; `partial` means something answers it with a stated limit; `gap` means nothing does yet; `n/a` means the question does not apply to the subject. Every `has` or `partial` cell names its evidence — a rule, a tool, a resource, a route, a proof row or a judge template — and each name resolves to something registered in this release (tests/capability-map-contract.test.ts). `needs` lists the inputs a call must carry for the cell's rules to judge; without them those rules skip and the verdict's `coverage` says so.",
+  "questions": [
+    {
+      "id": "Q1",
+      "registryId": "safe_output",
+      "text": "is it safe"
+    },
+    {
+      "id": "Q2",
+      "registryId": "grounded",
+      "text": "is it grounded / correct"
+    },
+    {
+      "id": "Q3",
+      "registryId": "complete",
+      "text": "is it complete"
+    },
+    {
+      "id": "Q4",
+      "registryId": "relevant",
+      "text": "is it on-task"
+    },
+    {
+      "id": "Q5",
+      "registryId": "task_completed",
+      "text": "did it complete the task"
+    },
+    {
+      "id": "Q6",
+      "registryId": "tool_use_correct",
+      "text": "did it act well (tool choice, arguments, efficiency)"
+    },
+    {
+      "id": "Q7",
+      "registryId": "within_budget",
+      "text": "what did it cost"
+    },
+    {
+      "id": "Q8",
+      "registryId": "better_or_worse",
+      "text": "is it better or worse than before"
+    },
+    {
+      "id": "Q9",
+      "registryId": "where_and_why",
+      "text": "where and why does it fail"
+    },
+    {
+      "id": "Q10",
+      "registryId": "trusted",
+      "text": "can this verdict be trusted"
+    }
+  ],
+  "subjects": [
+    {
+      "id": "S1",
+      "text": "single output"
+    },
+    {
+      "id": "S2",
+      "text": "output with input / context"
+    },
+    {
+      "id": "S3",
+      "text": "trajectory (tool calls)"
+    },
+    {
+      "id": "S4",
+      "text": "multi-run of one input"
+    },
+    {
+      "id": "S5",
+      "text": "population / dataset / baseline"
+    },
+    {
+      "id": "S6",
+      "text": "the evaluator itself"
+    }
+  ],
+  "cells": [
+    {
+      "id": "Q1xS1",
+      "question": "Q1",
+      "subject": "S1",
+      "status": "has",
+      "summary": "Deterministic detectors for leaked personal data and credentials, injection-shaped output and deployment-prohibited words, each fire naming the pattern and the span; precision and recall are published per rule at https://iris-eval.com/proof, and for personal data by entity.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "no_pii"
+        },
+        {
+          "kind": "rule",
+          "name": "no_injection_patterns"
+        },
+        {
+          "kind": "rule",
+          "name": "no_blocklist_words"
+        },
+        {
+          "kind": "tool",
+          "name": "evaluate_output"
+        },
+        {
+          "kind": "tool",
+          "name": "deploy_rule"
+        },
+        {
+          "kind": "proof",
+          "name": "no_pii"
+        }
+      ],
+      "needs": [
+        "output"
+      ]
+    },
+    {
+      "id": "Q1xS2",
+      "question": "Q1",
+      "subject": "S2",
+      "status": "has",
+      "summary": "The safety detectors read the output; supplying the input changes nothing for them, so the single-output answer carries over. A keyed judge template for harm potential exists and is unmeasured.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "no_pii"
+        },
+        {
+          "kind": "rule",
+          "name": "no_injection_patterns"
+        },
+        {
+          "kind": "template",
+          "name": "safety"
+        }
+      ],
+      "needs": [
+        "output"
+      ]
+    },
+    {
+      "id": "Q1xS3",
+      "question": "Q1",
+      "subject": "S3",
+      "status": "has",
+      "summary": "A directive found in a tool result is related to what the agent did next: no_injection_compliance matches directive wording as literal phrases over a capped, normalised slice — never a regular expression, because a tool result is attacker-controlled — and fails when a later call carries terms the directive introduced and the ask never used. Merely repeating those terms is reported on a passing result, because measured on its own family that weaker signal cannot tell reporting an injection from complying with one.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "no_injection_compliance"
+        },
+        {
+          "kind": "proof",
+          "name": "no_injection_compliance"
+        }
+      ],
+      "needs": [
+        "output",
+        "tool_calls"
+      ]
+    },
+    {
+      "id": "Q1xS4",
+      "question": "Q1",
+      "subject": "S4",
+      "status": "has",
+      "summary": "Safe on nine of ten runs is readable for THIS question: compare_traces takes `question: safe_output` and counts only evaluations that judged it, an attempt passing when every rule answering it passed — a case's rate with a 95% Wilson interval, the flaky flag, and the run-level rate over cases with an exact interval, of the question rather than the composed verdict.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_traces"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/cases/:key"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q1xS5",
+      "question": "Q1",
+      "subject": "S5",
+      "status": "partial",
+      "summary": "Per-rule failure counts over a time window are served to the dashboard, with no interval and no cohort key.",
+      "evidence": [
+        {
+          "kind": "route",
+          "name": "/api/v1/eval-stats"
+        },
+        {
+          "kind": "tool",
+          "name": "get_traces"
+        },
+        {
+          "kind": "resource",
+          "name": "iris://dashboard/summary"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q1xS6",
+      "question": "Q1",
+      "subject": "S6",
+      "status": "has",
+      "summary": "The safety detectors are measured on a labelled corpus with 95% intervals, and every fire carries its positive predictive value at the stated prior. Recall is measured again with the matched text disguised — a zero-width space, a look-alike letter, full-width letters, a no-break space, a tab, a line break, a change of case — and the cases each disguise drops are named.",
+      "evidence": [
+        {
+          "kind": "proof",
+          "name": "no_pii"
+        },
+        {
+          "kind": "proof",
+          "name": "no_injection_patterns"
+        },
+        {
+          "kind": "proof",
+          "name": "no_blocklist_words"
+        },
+        {
+          "kind": "resource",
+          "name": "iris://proof"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q2xS1",
+      "question": "Q2",
+      "subject": "S1",
+      "status": "partial",
+      "summary": "Without an input only two context-free fabrication signals run, and the result says so; the grounded signals need the material the agent was given.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "no_hallucination_markers"
+        }
+      ],
+      "needs": [
+        "output"
+      ]
+    },
+    {
+      "id": "Q2xS2",
+      "question": "Q2",
+      "subject": "S2",
+      "status": "has",
+      "summary": "A deterministic detector with context-grounded contradiction signals, measured with intervals; keyed judge templates for accuracy, correctness against a reference and faithfulness to sources, plus a citation verifier, cover what patterns cannot — on a key the user supplies.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "no_hallucination_markers"
+        },
+        {
+          "kind": "proof",
+          "name": "no_hallucination_markers"
+        },
+        {
+          "kind": "tool",
+          "name": "evaluate_with_llm_judge"
+        },
+        {
+          "kind": "tool",
+          "name": "verify_citations"
+        },
+        {
+          "kind": "template",
+          "name": "accuracy"
+        },
+        {
+          "kind": "template",
+          "name": "correctness"
+        },
+        {
+          "kind": "template",
+          "name": "faithfulness"
+        }
+      ],
+      "needs": [
+        "output",
+        "input"
+      ]
+    },
+    {
+      "id": "Q2xS3",
+      "question": "Q2",
+      "subject": "S3",
+      "status": "has",
+      "summary": "Tool outputs are read as grounding material: a file, directory or URL the output cites that neither the ask nor anything the agent read mentions is evidence, with the span. Only locations are judged — a code identifier or a number belongs to the hallucination signals — and the rule declines rather than guesses when a read was truncated.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "grounded_in_reads"
+        },
+        {
+          "kind": "rule",
+          "name": "no_hallucination_markers"
+        },
+        {
+          "kind": "tool",
+          "name": "log_trace"
+        }
+      ],
+      "needs": [
+        "output",
+        "input",
+        "tool_calls",
+        "tool_outputs"
+      ]
+    },
+    {
+      "id": "Q2xS4",
+      "question": "Q2",
+      "subject": "S4",
+      "status": "gap",
+      "summary": "Consistency of claims across repeated runs of one input is not evaluated.",
+      "evidence": [],
+      "needs": []
+    },
+    {
+      "id": "Q2xS5",
+      "question": "Q2",
+      "subject": "S5",
+      "status": "gap",
+      "summary": "No cohort or baseline; only per-rule failure rates over time.",
+      "evidence": [],
+      "needs": []
+    },
+    {
+      "id": "Q2xS6",
+      "question": "Q2",
+      "subject": "S6",
+      "status": "partial",
+      "summary": "The fabrication detector is measured on its corpus; the judge templates are unmeasured until a user-supplied key runs the judge harness, and the page says pending until then.",
+      "evidence": [
+        {
+          "kind": "proof",
+          "name": "no_hallucination_markers"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q3xS1",
+      "question": "Q3",
+      "subject": "S1",
+      "status": "partial",
+      "summary": "Form is measured — length, sentence count, non-empty, stub or placeholder markers, and an answer that says nothing (a promise or a bare claim of completion in place of the work, a placeholder, an announcement with nothing after it, the ask handed back, one passage on a loop) — not whether the ask was answered.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "min_output_length"
+        },
+        {
+          "kind": "rule",
+          "name": "sentence_count"
+        },
+        {
+          "kind": "rule",
+          "name": "non_empty_output"
+        },
+        {
+          "kind": "rule",
+          "name": "no_stub_output"
+        },
+        {
+          "kind": "rule",
+          "name": "says_something"
+        }
+      ],
+      "needs": [
+        "output"
+      ]
+    },
+    {
+      "id": "Q3xS2",
+      "question": "Q3",
+      "subject": "S2",
+      "status": "partial",
+      "summary": "Coverage of an expected answer's terms is measured when one is supplied. Which of the parts an ask declares were answered is judged under the completion question, by ask_coverage; an ask written as flowing prose is not split into parts.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "expected_coverage"
+        }
+      ],
+      "needs": [
+        "output",
+        "expected"
+      ]
+    },
+    {
+      "id": "Q3xS3",
+      "question": "Q3",
+      "subject": "S3",
+      "status": "has",
+      "summary": "The trajectory against the one the caller expected: tool_sequence compares the calls made with expected_trajectory.tool_calls in a mode (strict, unordered, subset, superset, ordered_subset — the default, a two-pointer subsequence check), matching by name and, when the expectation names arguments, by exact or subset input; a policy, so it gates because the caller stated the expectation; measured with intervals. Which parts of the ASK were acted on, without an expectation to compare against, is still the judge's question.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "tool_sequence"
+        },
+        {
+          "kind": "proof",
+          "name": "tool_sequence"
+        }
+      ],
+      "needs": [
+        "tool_calls",
+        "expected_trajectory"
+      ]
+    },
+    {
+      "id": "Q3xS4",
+      "question": "Q3",
+      "subject": "S4",
+      "status": "has",
+      "summary": "Complete on most runs is readable for THIS question: compare_traces takes `question: complete` and counts only evaluations that judged it, an attempt passing when every rule answering it passed — a case's rate with a 95% Wilson interval, the flaky flag, and the run-level rate over cases with an exact interval, of the question rather than the composed verdict.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_traces"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/cases/:key"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q3xS5",
+      "question": "Q3",
+      "subject": "S5",
+      "status": "partial",
+      "summary": "Per-rule failure counts over time only.",
+      "evidence": [
+        {
+          "kind": "route",
+          "name": "/api/v1/eval-stats"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q3xS6",
+      "question": "Q3",
+      "subject": "S6",
+      "status": "has",
+      "summary": "The completeness rules are measured as conformance to their stated formula, and each result says so in its uncertainty basis rather than presenting the number as a detection rate.",
+      "evidence": [
+        {
+          "kind": "proof",
+          "name": "min_output_length"
+        },
+        {
+          "kind": "proof",
+          "name": "sentence_count"
+        },
+        {
+          "kind": "proof",
+          "name": "non_empty_output"
+        },
+        {
+          "kind": "proof",
+          "name": "no_stub_output"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q4xS1",
+      "question": "Q4",
+      "subject": "S1",
+      "status": "gap",
+      "summary": "Both relevance rules skip without the input; on a single output the question is unanswerable and the verdict's coverage says so.",
+      "evidence": [],
+      "needs": [
+        "output",
+        "input"
+      ]
+    },
+    {
+      "id": "Q4xS2",
+      "question": "Q4",
+      "subject": "S2",
+      "status": "has",
+      "summary": "Lexical by default, semantic when the deployment sets a relevance judge. keyword_overlap (the share of the input's content terms the output carries) and topic_consistency (continuity of topic across sentences) are measurements that score; answers_the_ask is the question itself. Without a judge it reads the pair lexically and advises at the shipped thresholds, because comparing words fails correct paraphrases: it fires when both measurements fail and on a bare refusal or the ask handed back, and gates once the deployment sets either measurement's threshold. With IRIS_RELEVANCE_JUDGE_MODEL and a provider key, the relevance judge template decides and the rule gates: an off-topic answer fails on policy_gate, a paraphrase, a one-word answer and a one-term ask are judged rather than skipped, and a judge that cannot answer is named while the lexical reading advises. The lexical rule is measured on 45 reader-labelled cases; the judged rule and the relevance template are measured by the keyed proof:judge run and are pending until one is published.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "keyword_overlap"
+        },
+        {
+          "kind": "rule",
+          "name": "topic_consistency"
+        },
+        {
+          "kind": "rule",
+          "name": "answers_the_ask"
+        },
+        {
+          "kind": "proof",
+          "name": "answers_the_ask"
+        },
+        {
+          "kind": "template",
+          "name": "helpfulness"
+        },
+        {
+          "kind": "template",
+          "name": "relevance"
+        }
+      ],
+      "needs": [
+        "output",
+        "input"
+      ]
+    },
+    {
+      "id": "Q4xS3",
+      "question": "Q4",
+      "subject": "S3",
+      "status": "has",
+      "summary": "The wrong tool for the ask, from the catalogue valid_tool_arguments already takes: tool_choice scores the ask's content terms against each tool's name, description and input property names (the relevance tokenizer) and fires when an uncalled tool fits the ask at least 0.5 and beats the union of the tools called by at least 0.34, naming both; judged over the whole trajectory so several tools that each serve part of the ask are not wrong; a heuristic detection, so it degrades the score and never vetoes; measured with intervals. Lexical: a tool whose description never mentions the ask's words is invisible to it.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "tool_choice"
+        },
+        {
+          "kind": "proof",
+          "name": "tool_choice"
+        }
+      ],
+      "needs": [
+        "input",
+        "tool_calls",
+        "tools_catalogue"
+      ]
+    },
+    {
+      "id": "Q4xS4",
+      "question": "Q4",
+      "subject": "S4",
+      "status": "has",
+      "summary": "On-task on most runs is readable for THIS question: compare_traces takes `question: relevant` and counts only evaluations that judged it, an attempt passing when every rule answering it passed — a case's rate with a 95% Wilson interval, the flaky flag, and the run-level rate over cases with an exact interval, of the question rather than the composed verdict.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_traces"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/cases/:key"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q4xS5",
+      "question": "Q4",
+      "subject": "S5",
+      "status": "partial",
+      "summary": "Per-rule failure counts over time only.",
+      "evidence": [
+        {
+          "kind": "route",
+          "name": "/api/v1/eval-stats"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q4xS6",
+      "question": "Q4",
+      "subject": "S6",
+      "status": "partial",
+      "summary": "The two relevance measurements are measured as conformance to their lexical formula. answers_the_ask is measured on cases labelled by reading the ask and the answer, so its row shows where the lexical reading and a reader disagree; its judged form is unmeasured until a keyed run is published.",
+      "evidence": [
+        {
+          "kind": "proof",
+          "name": "keyword_overlap"
+        },
+        {
+          "kind": "proof",
+          "name": "topic_consistency"
+        },
+        {
+          "kind": "proof",
+          "name": "answers_the_ask"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q5xS1",
+      "question": "Q5",
+      "subject": "S1",
+      "status": "partial",
+      "summary": "From the output alone, completion is a judgment: the task_completed judge template (0.15.0) reads the ask and the output — and the trajectory when the caller passes it — and scores whether the claims of completion are borne out. User-keyed; its measurement is pending until a key runs proof:judge, and the evaluators matrix says so.",
+      "evidence": [
+        {
+          "kind": "template",
+          "name": "task_completed"
+        }
+      ],
+      "needs": [
+        "output"
+      ]
+    },
+    {
+      "id": "Q5xS2",
+      "question": "Q5",
+      "subject": "S2",
+      "status": "has",
+      "summary": "An ask that declares its parts — a bullet list, a numbered or lettered enumeration, a first/second/finally sequence — is checked part by part, and an unaddressed part is named with a span into the ask itself. A multi-part ask written as flowing prose is not split: a writer who numbers their questions is declaring separate things, and a full stop declares nothing.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "ask_coverage"
+        },
+        {
+          "kind": "proof",
+          "name": "ask_coverage"
+        }
+      ],
+      "needs": [
+        "output",
+        "input"
+      ]
+    },
+    {
+      "id": "Q5xS3",
+      "question": "Q5",
+      "subject": "S3",
+      "status": "partial",
+      "summary": "A part of the ask the answer never mentions may still have been DONE: ask_coverage (v2, 0.15.0) reads the trajectory and counts a part covered when a tool call the trace shows carries its terms — the same lexical test as the answer, so the trajectory can only add coverage (the rule needs the output and the ask; it reads the trajectory when the trace carries one). Recall-only for the family; what the trajectory does not carry is still unjudged, and the judge template above is the other half.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "ask_coverage"
+        },
+        {
+          "kind": "proof",
+          "name": "ask_coverage"
+        }
+      ],
+      "needs": [
+        "output",
+        "input"
+      ]
+    },
+    {
+      "id": "Q5xS4",
+      "question": "Q5",
+      "subject": "S4",
+      "status": "has",
+      "summary": "Completes the task seven of ten runs is readable for THIS question: compare_traces takes `question: task_completed` and counts only evaluations that judged it, an attempt passing when every rule answering it passed — a case's rate with a 95% Wilson interval, the flaky flag, and the run-level rate over cases with an exact interval, of the question rather than the composed verdict (0.15.0).",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_traces"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/cases/:key"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q5xS5",
+      "question": "Q5",
+      "subject": "S5",
+      "status": "gap",
+      "summary": "No cohort or baseline for completion: nothing ships that says what an agent, a run or a period usually completes, so a drop in completion has no reference to be a drop against. Named as the one open cell of this question.",
+      "evidence": [],
+      "needs": []
+    },
+    {
+      "id": "Q5xS6",
+      "question": "Q5",
+      "subject": "S6",
+      "status": "partial",
+      "summary": "The ask-coverage reading of completion — were the parts of the ask addressed — has a published family (precision and recall per rule at https://iris-eval.com/proof); no end-to-end task-completion evaluator exists, so nothing measures completion beyond that reading.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "ask_coverage"
+        },
+        {
+          "kind": "proof",
+          "name": "ask_coverage"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q6xS1",
+      "question": "Q6",
+      "subject": "S1",
+      "status": "n/a",
+      "summary": "Acting well is a property of the trajectory, not of a single output.",
+      "evidence": [],
+      "needs": []
+    },
+    {
+      "id": "Q6xS2",
+      "question": "Q6",
+      "subject": "S2",
+      "status": "n/a",
+      "summary": "As for a single output.",
+      "evidence": [],
+      "needs": []
+    },
+    {
+      "id": "Q6xS3",
+      "question": "Q6",
+      "subject": "S3",
+      "status": "has",
+      "summary": "Three deterministic trajectory rules, each measured with intervals: a failed tool call the output never acknowledges, a repeated call with the same input, and a call whose arguments the tool’s own JSON Schema rejects and the agent never retried. Argument validity needs the tools catalogue; tool CHOICE — whether a valid call was the right one — is judged in the on-task row (Q4×S3, tool_choice).",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "no_silent_tool_failure"
+        },
+        {
+          "kind": "rule",
+          "name": "no_tool_loop"
+        },
+        {
+          "kind": "rule",
+          "name": "valid_tool_arguments"
+        },
+        {
+          "kind": "tool",
+          "name": "log_trace"
+        }
+      ],
+      "needs": [
+        "output",
+        "tool_calls",
+        "tools_catalogue"
+      ]
+    },
+    {
+      "id": "Q6xS4",
+      "question": "Q6",
+      "subject": "S4",
+      "status": "has",
+      "summary": "Acts well on most runs is readable for THIS question: compare_traces takes `question: tool_use_correct` and counts only evaluations that judged it, an attempt passing when every rule answering it passed — a case's rate with a 95% Wilson interval, the flaky flag, and the run-level rate over cases with an exact interval, of the question rather than the composed verdict.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_traces"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/cases/:key"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q6xS5",
+      "question": "Q6",
+      "subject": "S5",
+      "status": "partial",
+      "summary": "Per-rule failure counts for the two trajectory rules over time only.",
+      "evidence": [
+        {
+          "kind": "route",
+          "name": "/api/v1/eval-stats"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q6xS6",
+      "question": "Q6",
+      "subject": "S6",
+      "status": "has",
+      "summary": "Both trajectory rules are measured with intervals on their corpus families, and each fire carries its positive predictive value.",
+      "evidence": [
+        {
+          "kind": "proof",
+          "name": "no_silent_tool_failure"
+        },
+        {
+          "kind": "proof",
+          "name": "no_tool_loop"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q7xS1",
+      "question": "Q7",
+      "subject": "S1",
+      "status": "has",
+      "summary": "Trace cost and token usage are captured and judged by the cost bundle, and the evaluator's own spend — the judge's tokens and cost — is stored on the evaluation.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "log_trace"
+        },
+        {
+          "kind": "rule",
+          "name": "cost_under_threshold"
+        },
+        {
+          "kind": "resource",
+          "name": "iris://evaluations/{id}"
+        }
+      ],
+      "needs": [
+        "cost"
+      ]
+    },
+    {
+      "id": "Q7xS2",
+      "question": "Q7",
+      "subject": "S2",
+      "status": "partial",
+      "summary": "A cost ceiling and a token ratio are judged from the trace totals; the ratio measures verbosity, not efficiency, and says so.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "cost_under_threshold"
+        },
+        {
+          "kind": "rule",
+          "name": "verbosity_ratio"
+        }
+      ],
+      "needs": [
+        "cost",
+        "tokens"
+      ]
+    },
+    {
+      "id": "Q7xS3",
+      "question": "Q7",
+      "subject": "S3",
+      "status": "has",
+      "summary": "A step budget is judged from the trajectory itself: max_steps fails a task that takes more tool calls than the deployment's ceiling, advising at the shipped default and gating once a deployment sets its own; step_budget fails a task that takes more than the budget the CALLER stated for it (expected_trajectory.step_budget, or the number of expected calls) times a tolerance, and gates because the caller stated it; no_tool_loop counts the repeated work inside either. Per-call tokens and cost are carried on a call and not yet read; the trace TOTAL is judged elsewhere in this row.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "max_steps"
+        },
+        {
+          "kind": "rule",
+          "name": "step_budget"
+        },
+        {
+          "kind": "rule",
+          "name": "no_tool_loop"
+        },
+        {
+          "kind": "proof",
+          "name": "max_steps"
+        },
+        {
+          "kind": "proof",
+          "name": "step_budget"
+        }
+      ],
+      "needs": [
+        "tool_calls",
+        "expected_trajectory"
+      ]
+    },
+    {
+      "id": "Q7xS4",
+      "question": "Q7",
+      "subject": "S4",
+      "status": "partial",
+      "summary": "Within budget across repeats of one input is readable as the case's pass rate under the cost rules: compare_traces takes `question: within_budget` and counts only evaluations that judged it — a case's rate with a 95% Wilson interval and a flaky flag, and the run-level rate over cases with an exact interval. The spread of the cost itself across repeats of one input is not reported: cost_anomaly reads an agent's cost history, not a case's.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_traces"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/cases/:key"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q7xS5",
+      "question": "Q7",
+      "subject": "S5",
+      "status": "has",
+      "summary": "Aggregate cost over a time window is served to the dashboard, and a trace is judged against the agent's own cost distribution: the cost_anomaly rule and the cost-spike moment read the modified z over the agent's last 200 costed traces (median and MAD), never a fixed dollar line.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "cost_anomaly"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/eval-stats"
+        },
+        {
+          "kind": "resource",
+          "name": "iris://dashboard/summary"
+        }
+      ],
+      "needs": [
+        "cost"
+      ]
+    },
+    {
+      "id": "Q7xS6",
+      "question": "Q7",
+      "subject": "S6",
+      "status": "has",
+      "summary": "The cost rules are measured as conformance to their formula, and the evaluator's own spend is stored per evaluation.",
+      "evidence": [
+        {
+          "kind": "proof",
+          "name": "cost_under_threshold"
+        },
+        {
+          "kind": "proof",
+          "name": "verbosity_ratio"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q8xS1",
+      "question": "Q8",
+      "subject": "S1",
+      "status": "n/a",
+      "summary": "Better or worse than before needs at least two things to compare.",
+      "evidence": [],
+      "needs": []
+    },
+    {
+      "id": "Q8xS2",
+      "question": "Q8",
+      "subject": "S2",
+      "status": "n/a",
+      "summary": "As for a single output.",
+      "evidence": [],
+      "needs": []
+    },
+    {
+      "id": "Q8xS3",
+      "question": "Q8",
+      "subject": "S3",
+      "status": "partial",
+      "summary": "A trajectory regression shows as its rule failing more often between two runs, reported per rule, worst first, once traces are logged with tool calls and a run id. The trajectories themselves are not compared step by step.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_runs"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q8xS4",
+      "question": "Q8",
+      "subject": "S4",
+      "status": "has",
+      "summary": "Evaluations of the same case across runs are grouped by case key and reported as a per-case pass rate with a 95% interval; a case answered both ways is reported as flaky. The run-level rate counts each case once, with an exact interval, so ten repeats of one question are not counted as ten questions.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_traces"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q8xS5",
+      "question": "Q8",
+      "subject": "S5",
+      "status": "has",
+      "summary": "Two runs are compared on pass rate with a 95% interval on the difference; when the runs share case keys they are paired and the discordant cases are tested exactly. When the evidence cannot exclude \"no change\" it says so and reports the smallest change that many cases could have detected. Runs measuring different things are refused unless forced, naming what differs. Scores bucketed over time still feed the drift view, and a CUSUM per agent and rule watches the stream itself: a regression-alarm moment marks the evaluation at which a rule's fail rate crossed a line derived for an in-control run length of about 500, reporting and never gating. The discordant cases are listed with both evaluations and the rules that flipped, and a run can be pinned as the baseline every later run is compared against (PATCH /api/v1/runs/:id; an omitted before means the baseline).",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_runs"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/eval-stats"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/moments"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q8xS6",
+      "question": "Q8",
+      "subject": "S6",
+      "status": "has",
+      "summary": "The verdict a gate keys on is measured on a composite corpus, and a candidate composer is scored beside the shipped one with an interval on the difference and a held-out split, so a change to the composer is measured before it ships. On a deployment’s own traces the same question is answerable directly: re-scoring a run under the current rules writes the new verdicts into a new run marked as a re-evaluation, and comparing the two isolates the rules change — the executions are identical, so any difference is the evaluator.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "evaluate_runs"
+        },
+        {
+          "kind": "tool",
+          "name": "compare_runs"
+        },
+        {
+          "kind": "resource",
+          "name": "iris://proof"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q9xS1",
+      "question": "Q9",
+      "subject": "S1",
+      "status": "has",
+      "summary": "Every fired detection carries typed evidence — offsets into the raw output, never a paraphrase — and a message naming the pattern; the stored evaluation reads back the same way.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "no_pii"
+        },
+        {
+          "kind": "rule",
+          "name": "no_stub_output"
+        },
+        {
+          "kind": "resource",
+          "name": "iris://evaluations/{id}"
+        }
+      ],
+      "needs": [
+        "output"
+      ]
+    },
+    {
+      "id": "Q9xS2",
+      "question": "Q9",
+      "subject": "S2",
+      "status": "has",
+      "summary": "The grounded signals name the contradiction they found; measurements carry their value, unit and the threshold they were held to and where it came from.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "no_hallucination_markers"
+        },
+        {
+          "kind": "rule",
+          "name": "keyword_overlap"
+        }
+      ],
+      "needs": [
+        "output",
+        "input"
+      ]
+    },
+    {
+      "id": "Q9xS3",
+      "question": "Q9",
+      "subject": "S3",
+      "status": "has",
+      "summary": "A silent tool failure names the failed call by index, why it failed and what the output claimed instead; a loop names every repeated call and the threshold.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "no_silent_tool_failure"
+        },
+        {
+          "kind": "rule",
+          "name": "no_tool_loop"
+        },
+        {
+          "kind": "resource",
+          "name": "iris://traces/{trace_id}"
+        }
+      ],
+      "needs": [
+        "output",
+        "tool_calls"
+      ]
+    },
+    {
+      "id": "Q9xS4",
+      "question": "Q9",
+      "subject": "S4",
+      "status": "partial",
+      "summary": "Where it fails across repeats: a case answered both ways is reported as flaky, least reliable first. compare_traces groups every evaluation of one case across runs and reports the case's pass rate with a 95% Wilson interval and a flaky flag, and the run-level rate over cases with an exact interval — of the composed verdict, or of one evaluation question with `question`. The rate says how often a case fails, not why: the reasons are on each evaluation, and nothing gathers them across the repeats.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_traces"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/cases/:key"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q9xS5",
+      "question": "Q9",
+      "subject": "S5",
+      "status": "partial",
+      "summary": "Top failures over a window are served to the dashboard; the held-out check is 24 staged transcripts from one agent on one repository, reported without an interval; there is no sample of unstaged production traffic.",
+      "evidence": [
+        {
+          "kind": "route",
+          "name": "/api/v1/eval-stats"
+        },
+        {
+          "kind": "tool",
+          "name": "get_traces"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q9xS6",
+      "question": "Q9",
+      "subject": "S6",
+      "status": "has",
+      "summary": "Every false positive and false negative per rule is named by case id with the proof; the safety detectors that report a span are measured again under each evasion transform applied inside that span, with the cases each transform drops; the PII rule reports recall by entity, including the entities its definition does not cover; the judge templates stay unmeasured until a user-supplied key runs the judge harness.",
+      "evidence": [
+        {
+          "kind": "resource",
+          "name": "iris://proof"
+        },
+        {
+          "kind": "proof",
+          "name": "no_pii"
+        },
+        {
+          "kind": "proof",
+          "name": "no_injection_patterns"
+        },
+        {
+          "kind": "proof",
+          "name": "no_blocklist_words"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q10xS1",
+      "question": "Q10",
+      "subject": "S1",
+      "status": "has",
+      "summary": "Every rule result carries what kind of claim it is, what it saw, where in the raw text it found it, and how wrong it tends to be; the verdict names which layer decided — a configured policy, a high-precision detector, a check that could not answer, or the combined risk against the deployment's stated loss ratio — and one definition of passed covers the deterministic rules, the judge and the citation verifier alike.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "evaluate_output"
+        },
+        {
+          "kind": "tool",
+          "name": "evaluate_with_llm_judge"
+        },
+        {
+          "kind": "tool",
+          "name": "verify_citations"
+        },
+        {
+          "kind": "resource",
+          "name": "iris://proof"
+        }
+      ],
+      "needs": [
+        "output"
+      ]
+    },
+    {
+      "id": "Q10xS2",
+      "question": "Q10",
+      "subject": "S2",
+      "status": "has",
+      "summary": "The verdict names which layer decided it and which rules did the deciding, coverage says which evaluation questions were judged and which input was missing for the rest, and a critical check that was asked and could not answer makes the verdict unknown rather than clean — a state a gate can fail closed on, and a setting the deployment chooses. Every rule deploy, delete, toggle and update and every trace deletion is recorded in an audit log the agent can read, so a rule changed or evidence removed around a verdict can be found afterwards.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "evaluate_output"
+        },
+        {
+          "kind": "resource",
+          "name": "iris://capabilities"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/capabilities"
+        },
+        {
+          "kind": "tool",
+          "name": "list_rules"
+        },
+        {
+          "kind": "resource",
+          "name": "iris://audit"
+        }
+      ],
+      "needs": [
+        "output",
+        "input"
+      ]
+    },
+    {
+      "id": "Q10xS3",
+      "question": "Q10",
+      "subject": "S3",
+      "status": "partial",
+      "summary": "When tool calls are absent the trajectory rules skip and coverage names the question as unjudged; both rules are non-critical by default, so their skip never vetoes.",
+      "evidence": [
+        {
+          "kind": "rule",
+          "name": "no_silent_tool_failure"
+        },
+        {
+          "kind": "rule",
+          "name": "no_tool_loop"
+        }
+      ],
+      "needs": [
+        "output",
+        "tool_calls"
+      ]
+    },
+    {
+      "id": "Q10xS4",
+      "question": "Q10",
+      "subject": "S4",
+      "status": "has",
+      "summary": "Trust over repeats is a case's pass rate with a 95% Wilson interval and a flaky flag, and a run-level rate over cases with an exact interval, so ten repeats of one question are not ten questions; the interval is the trust statement. No composer votes over repeats — the rate is reported, not turned into one verdict — and the judge has no repeat harness.",
+      "evidence": [
+        {
+          "kind": "tool",
+          "name": "compare_traces"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/cases/:key"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q10xS5",
+      "question": "Q10",
+      "subject": "S5",
+      "status": "has",
+      "summary": "Population-level trust: two windows are compared with both denominators and a 95% interval on the difference in pass rate, shown on the dashboard's change banner; two runs are compared with a Newcombe interval on the difference (McNemar on the discordant pairs when the cases pair). An interval that straddles zero is reported as not distinguishable, with the sample that would distinguish it. The deployment's own labels on a rule's fires say how often those fires were right on its traffic, with a Wilson interval; at twenty labels that number is in force on every verdict (the risk estimate reads it in place of the published one), the prior is estimated from the rule's fire rate, and the rule whose next label narrows the most uncertainty is named.",
+      "evidence": [
+        {
+          "kind": "route",
+          "name": "/api/v1/eval-stats/drift"
+        },
+        {
+          "kind": "tool",
+          "name": "compare_runs"
+        },
+        {
+          "kind": "route",
+          "name": "/api/v1/labels"
+        }
+      ],
+      "needs": []
+    },
+    {
+      "id": "Q10xS6",
+      "question": "Q10",
+      "subject": "S6",
+      "status": "has",
+      "summary": "Precision, recall and intervals per rule are published and reproducible with one command, served to agents as a resource and on every rule result as its uncertainty; beside them, what a fire is worth at field prevalence, a credible interval that does not collapse at zero errors, the verdict’s own accuracy on a composite corpus, conformance of every custom rule type to its definition, and a matrix that asks thirteen trust questions of every evaluator and answers each cell from the proof files; the corpus is model-labelled until the blind human label lands, and every number says so.",
+      "evidence": [
+        {
+          "kind": "resource",
+          "name": "iris://proof"
+        },
+        {
+          "kind": "tool",
+          "name": "list_rules"
+        },
+        {
+          "kind": "proof",
+          "name": "no_pii"
+        }
+      ],
+      "needs": []
+    }
+  ]
+}

@@ -1,0 +1,169 @@
+/*
+ * Significance color + glyph mapping.
+ *
+ * The same palette + glyphs are used on the timeline dots and the detail
+ * surface header so the visual signal is consistent across pages. Color +
+ * glyph together (not color alone) so the encoding is colorblind-safe.
+ */
+import type { MomentSignificanceKind, MomentVerdict } from '../../api/types';
+import { TT } from '../shared/tooltipText';
+
+export interface SignificanceVisual {
+  /** OKLCH color token (one of the --accent-* tokens). */
+  color: string;
+  /** Background tint for cards/badges. */
+  bg: string;
+  /** Single-character glyph that conveys the category in monochrome. */
+  glyph: string;
+  /** Human-readable category name. */
+  name: string;
+  /** One-line description of when this kind fires. */
+  description: string;
+}
+
+const VISUALS: Record<MomentSignificanceKind, SignificanceVisual> = {
+  'safety-violation': {
+    color: 'var(--accent-error)',
+    bg: 'oklch(28% 0.10 25 / 0.20)',
+    glyph: '!',
+    name: 'Safety violation',
+    description:
+      'A safety rule failed (PII, prompt injection, blocklist, stub-output, hallucination markers). Highest priority — review before this pattern becomes load-bearing.',
+  },
+  'cost-spike': {
+    color: 'var(--accent-warning)',
+    bg: 'oklch(28% 0.10 80 / 0.20)',
+    glyph: '$',
+    name: 'Cost spike',
+    description:
+      'Trace cost is far above this agent’s own baseline: more than 3.5 robust standard deviations over the median of its recent traces, not a fixed dollar line. Investigate prompt size, token efficiency, or model-tier choice.',
+  },
+  'regression-alarm': {
+    color: 'var(--accent-warning)',
+    bg: 'oklch(28% 0.10 60 / 0.20)',
+    glyph: '↗',
+    name: 'Regression alarm',
+    description:
+      'This agent’s own stream shifted: a rule’s fail rate crossed its CUSUM line at this evaluation — about ten points over the baseline set on the agent’s earlier evaluations. Reports, never gates; the watcher resets and re-baselines from here.',
+  },
+  'first-failure': {
+    color: 'var(--accent-llm)',
+    bg: 'oklch(28% 0.12 295 / 0.20)',
+    glyph: '◇',
+    name: 'First failure',
+    description: 'First time this rule has failed for this agent recently.',
+  },
+  'novel-pattern': {
+    color: 'var(--accent-llm)',
+    bg: 'oklch(28% 0.12 295 / 0.20)',
+    glyph: '◈',
+    name: 'Novel pattern',
+    description:
+      'Failure-rule combination has not been seen for this agent before.',
+  },
+  'rule-collision': {
+    color: 'var(--accent-warning)',
+    bg: 'oklch(28% 0.10 80 / 0.20)',
+    glyph: '×',
+    name: 'Multi-category fail',
+    description:
+      'Failures span multiple eval categories — output failed in more than one dimension.',
+  },
+  'normal-fail': {
+    color: 'var(--accent-error)',
+    bg: 'oklch(28% 0.10 25 / 0.12)',
+    glyph: '×',
+    name: 'Fail',
+    description: 'A rule failed; the failure does not elevate to a higher category.',
+  },
+  'normal-pass': {
+    color: 'var(--accent-success)',
+    bg: 'oklch(28% 0.10 145 / 0.12)',
+    glyph: '✓',
+    name: 'Pass',
+    description: 'All fired rules passed.',
+  },
+  unevaluated: {
+    color: 'var(--text-muted)',
+    bg: 'oklch(28% 0.02 260 / 0.14)',
+    glyph: '?',
+    name: 'No verdict',
+    description: 'Nothing was judged: no evaluation was recorded, every rule skipped, or a critical rule could not judge. Unknown, not clean.',
+  },
+};
+
+/** Kinds that are neither failures nor worth a review: hidden from significance lists, never counted as failures. */
+export const LOW_SIGNAL_KINDS: ReadonlySet<MomentSignificanceKind> = new Set<MomentSignificanceKind>(['normal-pass', 'unevaluated']);
+
+export function getSignificanceVisual(kind: MomentSignificanceKind): SignificanceVisual {
+  return VISUALS[kind] ?? VISUALS['normal-pass'];
+}
+
+export interface VerdictVisual {
+  label: string;
+  color: string;
+  /** Plain-language meaning of the chip — the same sentence everywhere it renders. */
+  tooltip: string;
+}
+
+export interface VerdictVisualOptions {
+  /** The moment's significance kind. A safety violation outranks the pass/partial arithmetic. */
+  significanceKind?: MomentSignificanceKind;
+  /** True when a high/critical rule vetoed at least one of the moment's evaluations. */
+  vetoed?: boolean;
+  /** True when the vetoing evaluation is in the safety category. */
+  vetoedBySafety?: boolean;
+}
+
+/*
+ * The verdict chip.
+ *
+ * `verdict` is arithmetic over rule counts (all passed → pass, none passed →
+ * fail, otherwise partial). That arithmetic is honest about counts and
+ * wrong about severity: an output that leaked an SSN while every other
+ * rule passed is "partial" by the count, so the chip beside a red SAFETY
+ * VIOLATION banner used to read amber PARTIAL with a tooltip about "a mix
+ * of failures and passes" (#377 item 1). Since v0.5.0 a failing critical
+ * rule forces passed=false regardless of the score — the chip has to say
+ * so. Safety violations and vetoes therefore render in danger colour
+ * before the count-based cases are consulted.
+ */
+export function getVerdictVisual(verdict: MomentVerdict, opts: VerdictVisualOptions = {}): VerdictVisual {
+  if (opts.significanceKind === 'safety-violation' || (opts.vetoed && opts.vetoedBySafety)) {
+    return { label: 'SAFETY FAIL', color: 'var(--accent-error)', tooltip: TT.verdictSafetyFail };
+  }
+  if (opts.vetoed) {
+    return { label: 'FAIL', color: 'var(--accent-error)', tooltip: TT.verdictVetoed };
+  }
+  switch (verdict) {
+    case 'pass':
+      return { label: 'PASS', color: 'var(--accent-success)', tooltip: TT.verdictPass };
+    case 'fail':
+      return { label: 'FAIL', color: 'var(--accent-error)', tooltip: TT.verdictFail };
+    case 'partial':
+      return { label: 'PARTIAL', color: 'var(--accent-warning)', tooltip: TT.verdictPartial };
+    case 'unevaluated':
+      return { label: 'UNEVALUATED', color: 'var(--text-muted)', tooltip: TT.verdictUnevaluated };
+  }
+}
+
+export const SIGNIFICANCE_KIND_OPTIONS: Array<{
+  value: MomentSignificanceKind | '';
+  label: string;
+}> = [
+  { value: '', label: 'All significance' },
+  { value: 'safety-violation', label: 'Safety violations' },
+  { value: 'cost-spike', label: 'Cost spikes' },
+  { value: 'regression-alarm', label: 'Regression alarms' },
+  { value: 'rule-collision', label: 'Multi-category fails' },
+  { value: 'normal-fail', label: 'Other fails' },
+  { value: 'normal-pass', label: 'Passes' },
+];
+
+export const VERDICT_OPTIONS: Array<{ value: MomentVerdict | ''; label: string }> = [
+  { value: '', label: 'All verdicts' },
+  { value: 'pass', label: 'Pass' },
+  { value: 'partial', label: 'Partial' },
+  { value: 'fail', label: 'Fail' },
+  { value: 'unevaluated', label: 'Unevaluated' },
+];

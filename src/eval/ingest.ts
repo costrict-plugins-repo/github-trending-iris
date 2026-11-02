@@ -1,0 +1,123 @@
+/*
+ * Store-and-evaluate, once.
+ *
+ * Three doors take a trace in and can score it in the same breath: the
+ * log_trace tool (evaluate: true), POST /api/v1/traces (evaluate: true)
+ * and the CLI's ingest verb. Until 0.13.0 the HTTP route carried its own
+ * copy of this block and the tool had none — a caller on the MCP path had
+ * to make two calls, and the two paths could only stay identical by
+ * someone remembering. One function now: the context is built from the
+ * trace exactly as evaluate_output builds it from a stored trace, the
+ * bundle default is the same constant, the result is linked and stored,
+ * and the response is the one serializer every reader sees.
+ */
+import type { EvalEngine } from './engine.js';
+import { DEFAULT_EVAL_TYPE, DEFAULT_EVAL_TYPE_NOTE } from './engine.js';
+import type { DormantRule } from './dormant.js';
+import type { RuleChangesSinceStart } from '../custom-rule-store.js';
+import { toEvaluationResponse } from './response.js';
+import { historyBefore } from './decision-moment.js';
+import type { IStorageAdapter } from '../types/query.js';
+import type { Trace } from '../types/trace.js';
+import type { EvalResult, EvalType } from '../types/eval.js';
+import type { TenantId } from '../types/tenant.js';
+import { costContextOf } from './cost-basis.js';
+import { recordOfTrace } from './evidence.js';
+import type { JudgeRequest } from './llm-judge/budget.js';
+
+export type IngestEvalType = EvalType | 'all';
+
+export interface EvaluateStoredTraceOptions {
+  /** The bundle to run; omitted means every bundle, and the response says the default ran. */
+  evalType?: IngestEvalType;
+  /** The quarantined gating rules on this server, for coverage.dormant. */
+  dormant?: DormantRule[];
+  /** Deployed-rule changes since the server started, for rules_changed. */
+  rulesChanged?: RuleChangesSinceStart | null;
+  /**
+   * When the evaluation should be dated — ISO-8601. No door exposes this:
+   * the demo seeder evaluates a week of backdated traces
+   * through this same function and the trend, drift and health views read
+   * the evaluation's date, so an undated demo would show a week of traffic
+   * judged in one second. Omitted, the store dates the row now.
+   */
+  createdAt?: string;
+  /** The request this trace arrived in, when it carried several: the relevance judge's per-request cap counts across them. */
+  judgeRequest?: JudgeRequest;
+}
+
+export interface StoredTraceEvaluation {
+  result: EvalResult;
+  /** The same object evaluate_output returns for this trace. */
+  response: Record<string, unknown>;
+}
+
+/**
+ * The agent's own cost baseline for a stored trace: the
+ * failure log already carries each prior trace's cost, so `cost_anomaly`
+ * reads the same history the moment classifier does. The trace itself is
+ * excluded by id and by timestamp; undefined when the trace has no cost,
+ * because then the rule skips before it would read a baseline.
+ */
+export async function costHistoryFor(storage: IStorageAdapter, tenantId: TenantId, trace: Pick<Trace, 'trace_id' | 'agent_name' | 'timestamp' | 'cost_usd'>): Promise<readonly number[] | undefined> {
+  if (trace.cost_usd === undefined || trace.cost_usd === null) return undefined;
+  const log = await storage.getAgentFailureLog(tenantId, trace.agent_name);
+  return historyBefore(log, trace.trace_id, trace.timestamp).recentCosts;
+}
+
+/**
+ * Evaluate a trace that has just been stored, and store the evaluation
+ * linked to it. The trace must carry an output — the callers check that
+ * before storing anything, so a refusal never leaves a half-done write.
+ */
+export async function evaluateStoredTrace(
+  engine: EvalEngine,
+  storage: IStorageAdapter,
+  tenantId: TenantId,
+  trace: Trace & { output: string },
+  options: EvaluateStoredTraceOptions = {},
+): Promise<StoredTraceEvaluation> {
+  /*
+   * The agent's own cost baseline: the failure log already
+   * carries each prior trace's cost, so the rule reads the same history the
+   * moment classifier does. The trace just stored is excluded by id.
+   */
+  const costHistory = await costHistoryFor(storage, tenantId, trace);
+  const context = {
+    output: trace.output,
+    input: trace.input,
+    // Reported or estimated at ingest; the cost rules say which.
+    ...costContextOf(trace),
+    costHistory,
+    tokenUsage: trace.token_usage,
+    // What the agent DID, as this same request stored it. Whole-source
+    // precedence in the step layer means spans are only reached when
+    // tool_calls is absent, so forwarding both costs a reference and buys
+    // trajectory evaluation for a span-only capture.
+    toolCalls: trace.tool_calls,
+    spans: trace.spans,
+    tools: trace.tools,
+    // Who recorded it, and what its capture source records in full (src/eval/evidence.ts).
+    ...recordOfTrace(trace),
+    ...(trace.metadata ? { metadata: trace.metadata } : {}),
+    // The relevance judge charges the tenant that stored the trace, and counts this request's calls.
+    tenantId,
+    ...(options.judgeRequest ? { judgeRequest: options.judgeRequest } : {}),
+  };
+  const omitted = options.evalType === undefined;
+  const evalType = options.evalType ?? DEFAULT_EVAL_TYPE;
+  const result =
+    evalType === 'all' ? await engine.evaluateAll(context) : await engine.evaluate(evalType as EvalType, context);
+  result.trace_id = trace.trace_id;
+  if (options.createdAt !== undefined) result.created_at = options.createdAt;
+  await storage.insertEvalResult(tenantId, result);
+  return {
+    result,
+    response: toEvaluationResponse(result, {
+      traceId: trace.trace_id,
+      dormant: options.dormant,
+      rulesChanged: options.rulesChanged,
+      ...(omitted ? { note: DEFAULT_EVAL_TYPE_NOTE } : {}),
+    }),
+  };
+}
