@@ -1,0 +1,58 @@
+import type { ErrorRequestHandler } from 'express';
+import type { Logger } from '../utils/logger.js';
+import { validationErrorBody } from '../utils/validation-errors.js';
+
+export function createErrorHandler(logger: Logger): ErrorRequestHandler {
+  return (err, _req, res, _next) => {
+    // Handle Zod validation errors: at most 20 issues, and how many there were (utils/validation-errors.ts).
+    if (err?.name === 'ZodError' || err?.constructor?.name === 'ZodError') {
+      res.status(400).json(validationErrorBody('Validation error', err.issues ?? err.errors));
+      return;
+    }
+
+    /*
+     * A rule change or trace deletion refused because its audit entry could
+     * not be written (custom-rule-store.ts). Said in words, without the
+     * error's own message: that one names the audit log's path, which is
+     * for the server log and the local MCP caller, not an HTTP client.
+     */
+    if (err?.name === 'AuditWriteError') {
+      logger.error(`Request error: ${err.message}`, { status: 503 });
+      res.status(503).json({
+        error: 'The audit log could not be written, so the change was refused. Nothing was changed. The server log names the file and the cause.',
+        code: 'IRIS_STORAGE_ERROR',
+      });
+      return;
+    }
+
+    const status = err.status ?? err.statusCode ?? 500;
+
+    /*
+     * Never echo a Node system error to the client. Their messages embed
+     * absolute paths — an ENOENT from res.sendFile returned
+     *   "ENOENT: no such file or directory, stat 'C:\...\dist\dashboard\index.html'"
+     * with a 404, disclosing the install path and OS user to anyone who
+     * could reach the dashboard (CWE-209). 5xx was already masked; the leak
+     * was in the 4xx branch, where echoing err.message is otherwise useful
+     * (body-parser's "request entity too large", Zod messages, etc.).
+     *
+     * Identify system errors by the shape Node gives them — a string `code`
+     * plus `syscall` — rather than by matching path-ish text, which would
+     * miss cases and mangle legitimate messages.
+     */
+    const isSystemError = typeof err?.code === 'string' && typeof err?.syscall === 'string';
+    const message =
+      status >= 500 || isSystemError
+        ? status >= 500
+          ? 'Internal server error'
+          : 'Not found'
+        : (err.message ?? 'Unknown error');
+
+    logger.error(`Request error: ${err.message}`, { status, stack: err.stack });
+
+    res.status(status).json({
+      error: message,
+      ...(process.env.NODE_ENV === 'development' ? { stack: err.stack } : {}),
+    });
+  };
+}

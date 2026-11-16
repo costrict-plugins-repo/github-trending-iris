@@ -1,0 +1,119 @@
+import { useState, useMemo, useEffect, useCallback } from 'react';
+import { useEvals } from '../../api/hooks';
+import { EvalFilters } from './EvalFilters';
+import { EvalTable } from './EvalTable';
+import { EvalDetailCard } from './EvalDetailCard';
+import { Pagination } from '../shared/Pagination';
+import { LoadingSpinner } from '../shared/LoadingSpinner';
+import { useFocusTrap } from '../shared/useFocusTrap';
+import { ExportMenu } from '../shared/ExportMenu';
+import type { EvalResult } from '../../api/types';
+
+export function EvalListPage() {
+  const [filters, setFilters] = useState({ eval_type: '', passed: '', since: '', until: '' });
+  const [offset, setOffset] = useState(0);
+  const [selectedEval, setSelectedEval] = useState<EvalResult | null>(null);
+  const limit = 50;
+
+  // What the list is filtered by: sent with each page, and what the export carries (#4).
+  const filterParams = useMemo(() => {
+    const p: Record<string, string> = {};
+    if (filters.eval_type) p.eval_type = filters.eval_type;
+    if (filters.passed) p.passed = filters.passed;
+    if (filters.since) p.since = new Date(filters.since).toISOString();
+    if (filters.until) p.until = new Date(filters.until).toISOString();
+    return p;
+  }, [filters]);
+  const params = useMemo(() => ({ limit: String(limit), offset: String(offset), ...filterParams }), [filterParams, offset]);
+
+  const { data, loading } = useEvals(params);
+
+  const closeModal = useCallback(() => setSelectedEval(null), []);
+  const trapRef = useFocusTrap<HTMLDivElement>(selectedEval !== null);
+
+  useEffect(() => {
+    if (!selectedEval) return;
+    const handleEscape = (e: KeyboardEvent) => { if (e.key === 'Escape') closeModal(); };
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [selectedEval, closeModal]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+      <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap', alignItems: 'center' }}>
+        <EvalFilters values={filters} onChange={(v) => { setFilters(v); setOffset(0); }} />
+        <div style={{ marginLeft: 'auto' }}>
+          <ExportMenu kind="evaluations" filters={filterParams} total={data?.total} />
+        </div>
+      </div>
+
+      <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)', borderRadius: 'var(--border-radius-lg)', overflow: 'hidden' }}>
+        {loading && !data ? (
+          <LoadingSpinner />
+        ) : (
+          <>
+            <EvalTable
+              evals={data?.results ?? []}
+              onSelect={setSelectedEval}
+            />
+            {data && data.total > limit && (
+              <div style={{ padding: '0 var(--space-4)' }}>
+                <Pagination total={data.total} limit={limit} offset={offset} onPageChange={setOffset} />
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Modal overlay for eval detail */}
+      {selectedEval && (
+        <div
+          onClick={closeModal}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.6)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 100,
+          }}
+        >
+          <div
+            ref={trapRef}
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Evaluation detail"
+            style={{ width: '500px', maxHeight: '80vh', overflow: 'auto', position: 'relative' }}
+          >
+            <button
+              onClick={closeModal}
+              aria-label="Close evaluation detail"
+              style={{
+                position: 'absolute',
+                top: 8,
+                right: 8,
+                background: 'var(--bg-tertiary)',
+                border: '1px solid var(--border-color)',
+                borderRadius: 'var(--border-radius-sm)',
+                color: 'var(--text-primary)',
+                width: 28,
+                height: 28,
+                cursor: 'pointer',
+                fontSize: '14px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                zIndex: 1,
+              }}
+            >
+              X
+            </button>
+            <EvalDetailCard evalResult={selectedEval} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

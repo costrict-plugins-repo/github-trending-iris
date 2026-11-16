@@ -1,0 +1,211 @@
+{
+  "schemaVersion": 1,
+  "rule": "topic_consistency",
+  "category": "relevance",
+  "family": "topic",
+  "positiveClass": "fail",
+  "definition": "topic_consistency — continuity with the input: the share of the output's content-bearing sentences that connect to the input's topic must be at least a third (config key topic_consistency, default 0.33). A sentence connects when it shares a content term with the input or with an earlier connected sentence; list items are read under the sentence that introduces them; outputs with fewer than six words of four or more letters are skipped rather than judged. Definition version: docs/api-reference.md §Relevance Rules and the rule description as merged in #416 (9d9fd50) on 2026-09-04, which replaced the share-of-output-words-found-in-the-input measure. Positive = fewer than a third of the content sentences connect (the rule should FAIL).",
+  "source": "LLM-authored on 2026-09-04. Held out on 2026-09-23: the 10 case(s) copied from, varied from or modelled on the 24 real transcripts in tests/fixtures/real-transcripts (topic-001, topic-002, topic-003, topic-004, topic-005, topic-006, topic-007, topic-008, topic-009, topic-010) were removed, so no number this family publishes is estimated on a transcript, and the transcript line in proof/TRANSCRIPTS.md and proof/COMPOSITE.md is measured on cases none of these rates were estimated from. 3 replacement case(s), authored the same day and marked in their notes, bring the family back to the 24-case floor the runner enforces. The replacements sit far from the threshold (0% or 100% under any reasonable reading), so their labels do not depend on this file's particular stopword or sentence lists.",
+  "labelling": "LLM-authored on 2026-09-04 and labelled against the documented definition. First labelled that morning semantically against the definition then documented (5% of output words found in the input, purpose \"stays on topic\"); re-labelled the same day, after #416 replaced the mechanism with sentence continuity, by applying the new documented definition independently by script — its sentence splitting, content-term lists and inflection folding are this file's own reading, not the rule's — with each note stating the connected/total count that decided the label. Consequences a reader should know: an off-target real answer that reuses the question's vocabulary connects (the real transcripts t-17 and t-18 do), and an on-topic answer in fresh words does not (three such cases are positive; the documentation states this lexical limit). 0 case(s) landed between 20% and 45% under this reading and were dropped as undecidable from the documentation alone: none. Four cases whose point was that a shared word is not topical relevance (history of the same product, business retention for a database question) were removed because the documented definition explicitly reads a shared term as connection, so they cannot be labelled positive under it.",
+  "labelBasis": "definition",
+  "authored": "2026-09-04",
+  "counts": {
+    "n": 24,
+    "positive": 12,
+    "negative": 12
+  },
+  "cases": [
+    {
+      "id": "topic-011",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "Our Kubernetes ingress returns 502 for one service after the cert rotation. Which annotations control backend TLS verification?",
+      "output": "For a good sourdough, mix flour, water, salt and starter, rest for an hour, then fold every thirty minutes. Bake covered at 240 degrees and uncover for the last twenty minutes to darken the crust.",
+      "notes": "Entirely different subject: no sentence connects (0/2 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-012",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "Our Kubernetes ingress returns 502 for one service after the cert rotation. Which annotations control backend TLS verification?",
+      "output": "Roses are red, the sky is blue; the tests are green and so are you. Verses about deployment do not fix anything, but at least they rhyme.",
+      "notes": "A poem that shares no content term with the question (0/2 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-013",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "Our Kubernetes ingress returns 502 for one service after the cert rotation. Which annotations control backend TLS verification?",
+      "output": "Great question! There are many factors to consider when approaching a problem like this, and the right choice depends on your specific context, requirements and constraints. Let me know if you would like more detail.",
+      "notes": "Generic filler that could follow any question: no sentence connects (0/3 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-014",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "Explain how a Wilson score interval differs from the normal approximation.",
+      "output": "Preheat the oven, season the chicken, roast for forty minutes and rest before carving. Serve with the pan juices.",
+      "notes": "Different subject (0/2 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-015",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "Write a SQL query that returns the ten most expensive traces from the last day.",
+      "output": "Dear customer, thank you for reaching out. We have received your message and a member of the team will be in touch shortly. Kind regards, Support.",
+      "notes": "Template reply unrelated to the request (0/3 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-016",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "Which annotations control backend TLS verification on the ingress?",
+      "output": "The weather in Lisbon this week is mild with some afternoon showers, warmer toward the weekend, and the sea temperature is pleasant for swimming.",
+      "notes": "Different subject (0/1 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-017",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "Summarise the security section of the README.",
+      "output": "The dashboard theme can be switched between light and dark from the command palette, and the sidebar remembers its collapsed state between sessions.",
+      "notes": "Answers about UI theming instead of security (0/1 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-018",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "How do I rotate the dashboard API key?",
+      "output": "Bread dough should rest overnight in the fridge; the slow ferment builds flavour and an open crumb.",
+      "notes": "Different subject (0/1 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-019",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "What does the --purge flag do?",
+      "output": "Our office is closed on public holidays; for urgent matters call the emergency line listed on the intranet.",
+      "notes": "Different subject (0/1 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-020",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "Summarise the security section of the README.",
+      "output": "Everything stays on your disk in SQLite; outbound HTTP happens only where you opt in (a judge key, citation fetching, an OTel exporter); the dashboard binds localhost and can require an API key.",
+      "notes": "On topic to a reader, but it shares no content term with the ask, so by the documented definition no sentence connects — the documentation states this lexical limit (0/1 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-021",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "What does the --self-test flag check?",
+      "output": "It creates the configured home and proves it can write there, then runs the isolated checks — storage, rules, the MCP handshake — and prints PASS or the first failure with its errno.",
+      "notes": "On topic to a reader; shares no content term with the ask, so by the documented definition it does not connect — the stated lexical limit (0/1 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-022",
+      "rule": "topic_consistency",
+      "label": "positive",
+      "input": "Does Iris phone home?",
+      "output": "No. There is no telemetry and no account; the only outbound calls are the ones you configure.",
+      "notes": "On topic to a reader; shares no content term with the ask, so by the documented definition it does not connect — the stated lexical limit (0/1 content sentences connect = 0% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-023",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "Our Kubernetes ingress returns 502 for one service after the cert rotation. Which annotations control backend TLS verification?",
+      "output": "Set nginx.ingress.kubernetes.io/backend-protocol to HTTPS and nginx.ingress.kubernetes.io/proxy-ssl-verify to on, and point proxy-ssl-secret at the rotated CA; the 502 comes from the controller rejecting the new backend certificate.",
+      "notes": "Direct answer using the input's terms (1/1 content sentences connect = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-024",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "Our Kubernetes ingress returns 502 for one service after the cert rotation. Which annotations control backend TLS verification?",
+      "output": "The 502 after rotating the certificate is the controller refusing the backend: turn on proxy-ssl-verify, set the backend protocol to HTTPS and reference the secret holding the new CA bundle.",
+      "notes": "Direct answer, partly paraphrased; connects (1/1 content sentences connect = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-025",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "Our Kubernetes ingress returns 502 for one service after the cert rotation. Which annotations control backend TLS verification?",
+      "output": "The controller distrusts the backend since the swap. Enable upstream verification, point it at the fresh CA bundle, and mark the upstream as HTTPS. That clears the bad gateway.",
+      "notes": "On-topic answer in fresh words: the first sentence connects on backend, the second on verification, the third through the chain (2/3 content sentences connect = 67% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-026",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "Our Kubernetes ingress returns 502 for one service after the cert rotation. Which annotations control backend TLS verification?",
+      "output": "Enable proxy-ssl-verify, HTTPS backend.",
+      "notes": "Brief on-topic answer (fewer than six words of four or more letters: the documented rule skips rather than judges, so nothing can fail)"
+    },
+    {
+      "id": "topic-027",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "Explain how a Wilson score interval differs from the normal approximation.",
+      "output": "The Wilson score interval keeps the bounds inside zero and one and stays sensible when the proportion is near an edge or the sample is small, where the normal approximation can spill outside the unit interval or collapse to zero width.",
+      "notes": "Direct on-topic answer (1/1 content sentences connect = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-028",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "Write a SQL query that returns the ten most expensive traces from the last day.",
+      "output": "SELECT id, cost_usd FROM traces WHERE created_at >= datetime('now', '-1 day') ORDER BY cost_usd DESC LIMIT 10;",
+      "notes": "A query answering the request; SQL keywords rather than prose, but traces and day connect it (1/1 content sentences connect = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-029",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "How does the retention sweep decide which rows to delete?",
+      "output": "It compares each row's created_at with now minus retention.days; anything older goes, traces and evaluations alike, and the write-ahead log is truncated afterwards.",
+      "notes": "On-topic answer; rows and retention connect (1/1 content sentences connect = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-030",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "Which port?",
+      "output": "Port 4748 by default; change it with the --port flag or the IRIS_PORT environment variable when you start the dashboard.",
+      "notes": "On-topic answer to a two-word question: port connects (1/1 content sentences connect = 100% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-031",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "Where does Iris store its data?",
+      "output": "Iris stores everything under IRIS_HOME, by default ~/.iris: the SQLite database, custom rules and the audit log. Set IRIS_HOME to move it. Nothing is stored anywhere else.",
+      "notes": "Three sentences; the first two connect on iris/store/data, the third through the chain (2/3 content sentences connect = 67% by this file's reading of the definition)"
+    },
+    {
+      "id": "topic-032",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "How does the retry policy handle a timeout from the payment provider?",
+      "output": "A timeout from the payment provider counts as a retryable failure. The retry policy waits two seconds, then doubles the wait on each attempt. After five attempts the payment is marked failed and the provider timeout is logged.",
+      "notes": "Sentence one shares timeout/payment/provider, two shares retry/policy, three shares payment/provider/timeout (3/3 content sentences connect = 100% by this file's reading of the definition). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "topic-033",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "What changed in the billing export between version 2 and version 3?",
+      "output": "Version 3 of the billing export adds a currency column. The export also switches its dates from local time to UTC. Rows in version 2 files keep the old layout, so readers must check the version header.",
+      "notes": "Sentence one shares version/billing/export, two shares export, three shares version (3/3 content sentences connect = 100% by this file's reading of the definition). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "topic-034",
+      "rule": "topic_consistency",
+      "label": "negative",
+      "input": "Why is the nightly backup job slower this week?",
+      "output": "The nightly backup job now copies the audit tables, which grew by forty percent this week. That larger audit copy accounts for most of the slower run. Compressing the backup before upload would recover about half of that time.",
+      "notes": "Sentence one shares nightly/backup/job/week, two shares slower (and audit with sentence one), three shares backup (3/3 content sentences connect = 100% by this file's reading of the definition). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    }
+  ]
+}

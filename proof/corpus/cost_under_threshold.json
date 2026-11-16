@@ -1,0 +1,277 @@
+{
+  "schemaVersion": 1,
+  "rule": "cost_under_threshold",
+  "category": "cost",
+  "family": "cost",
+  "positiveClass": "fail",
+  "definition": "cost_under_threshold — the evaluation's cost in USD must not exceed the threshold: pass when cost_usd ≤ cost_threshold, default $0.10 (config key cost_threshold); skipped when no cost is provided. docs/api-reference.md §Cost Rules. Positive = cost strictly over the threshold (the rule should FAIL).",
+  "source": "LLM-authored on 2026-09-04. Held out on 2026-09-23: the 8 case(s) copied from, varied from or modelled on the 24 real transcripts in tests/fixtures/real-transcripts (cost-001, cost-002, cost-003, cost-004, cost-005, cost-006, cost-007, cost-008) were removed, so no number this family publishes is estimated on a transcript, and the transcript line in proof/TRANSCRIPTS.md and proof/COMPOSITE.md is measured on cases none of these rates were estimated from. 6 replacement case(s), authored the same day and marked in their notes, bring the family back to the 24-case floor the runner enforces.",
+  "labelling": "LLM-authored and LLM-labelled against the documented definition on 2026-09-04; each note states the cost and the threshold that decided the label.",
+  "labelBasis": "definition",
+  "authored": "2026-09-04",
+  "counts": {
+    "n": 24,
+    "positive": 10,
+    "negative": 14
+  },
+  "cases": [
+    {
+      "id": "cost-009",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Run completed. cost_usd=0.1000.",
+      "context": {
+        "costUsd": 0.1
+      },
+      "notes": "Exactly the default threshold: the documented condition is cost ≤ threshold, so at the limit passes (cost $0.1 vs $0.10 default)"
+    },
+    {
+      "id": "cost-010",
+      "rule": "cost_under_threshold",
+      "label": "positive",
+      "output": "Run completed. cost_usd=0.1001.",
+      "context": {
+        "costUsd": 0.1001
+      },
+      "notes": "A ten-thousandth over the default threshold (cost $0.1001 vs $0.10 default)"
+    },
+    {
+      "id": "cost-011",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Run completed. cost_usd=0.0999.",
+      "context": {
+        "costUsd": 0.0999
+      },
+      "notes": "A ten-thousandth under the default threshold (cost $0.0999 vs $0.10 default)"
+    },
+    {
+      "id": "cost-012",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Run completed. cost_usd=0.0000.",
+      "context": {
+        "costUsd": 0
+      },
+      "notes": "Zero cost (cost $0 vs $0.10 default)"
+    },
+    {
+      "id": "cost-013",
+      "rule": "cost_under_threshold",
+      "label": "positive",
+      "output": "Run completed. cost_usd=0.1100.",
+      "context": {
+        "costUsd": 0.11
+      },
+      "notes": "Just over (cost $0.11 vs $0.10 default)"
+    },
+    {
+      "id": "cost-014",
+      "rule": "cost_under_threshold",
+      "label": "positive",
+      "output": "Run completed. cost_usd=10.0000.",
+      "context": {
+        "costUsd": 10
+      },
+      "notes": "A hundred times the default (cost $10 vs $0.10 default)"
+    },
+    {
+      "id": "cost-015",
+      "rule": "cost_under_threshold",
+      "label": "positive",
+      "output": "Run completed. cost_usd=0.2500.",
+      "context": {
+        "costUsd": 0.25
+      },
+      "notes": "A single expensive judge call (cost $0.25 vs $0.10 default)"
+    },
+    {
+      "id": "cost-016",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Run completed. cost_usd=0.5000, cost_threshold=1.",
+      "context": {
+        "costUsd": 0.5,
+        "customConfig": {
+          "cost_threshold": 1
+        }
+      },
+      "notes": "Under a raised threshold (cost $0.5 vs $1 configured)"
+    },
+    {
+      "id": "cost-017",
+      "rule": "cost_under_threshold",
+      "label": "positive",
+      "output": "Run completed. cost_usd=0.0200, cost_threshold=0.01.",
+      "context": {
+        "costUsd": 0.02,
+        "customConfig": {
+          "cost_threshold": 0.01
+        }
+      },
+      "notes": "Over a lowered threshold (cost $0.02 vs $0.01 configured)"
+    },
+    {
+      "id": "cost-018",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Run completed. cost_usd=0.0500, cost_threshold=0.05.",
+      "context": {
+        "costUsd": 0.05,
+        "customConfig": {
+          "cost_threshold": 0.05
+        }
+      },
+      "notes": "Exactly a configured threshold: at the limit passes (cost $0.05 vs $0.05 configured)"
+    },
+    {
+      "id": "cost-019",
+      "rule": "cost_under_threshold",
+      "label": "positive",
+      "output": "Run completed. cost_usd=1.5000, cost_threshold=1.",
+      "context": {
+        "costUsd": 1.5,
+        "customConfig": {
+          "cost_threshold": 1
+        }
+      },
+      "notes": "Over a raised threshold (cost $1.5 vs $1 configured)"
+    },
+    {
+      "id": "cost-020",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Run completed. cost_usd=0.0090, cost_threshold=0.01.",
+      "context": {
+        "costUsd": 0.009,
+        "customConfig": {
+          "cost_threshold": 0.01
+        }
+      },
+      "notes": "Under a lowered threshold (cost $0.009 vs $0.01 configured)"
+    },
+    {
+      "id": "cost-021",
+      "rule": "cost_under_threshold",
+      "label": "positive",
+      "output": "Run completed. cost_usd=0.0501, cost_threshold=0.05.",
+      "context": {
+        "costUsd": 0.0501,
+        "customConfig": {
+          "cost_threshold": 0.05
+        }
+      },
+      "notes": "Just over a configured threshold (cost $0.0501 vs $0.05 configured)"
+    },
+    {
+      "id": "cost-022",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Run completed. cost_usd=-0.0100.",
+      "context": {
+        "costUsd": -0.01
+      },
+      "notes": "A negative cost (a credit) is under any threshold (cost $-0.01 vs $0.10 default)"
+    },
+    {
+      "id": "cost-023",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Run completed. cost_usd=absent.",
+      "context": {},
+      "notes": "No cost data: nothing can be over the threshold; the documented rule skips rather than judges (cost absent vs $0.10 default)"
+    },
+    {
+      "id": "cost-024",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Run completed. cost_usd=absent, cost_threshold=0.01.",
+      "context": {
+        "customConfig": {
+          "cost_threshold": 0.01
+        }
+      },
+      "notes": "No cost data with a configured threshold: the rule skips (cost absent vs $0.01 configured)"
+    },
+    {
+      "id": "cost-025",
+      "rule": "cost_under_threshold",
+      "label": "positive",
+      "output": "Run completed. cost_usd=0.3000.",
+      "context": {
+        "costUsd": 0.3
+      },
+      "notes": "Three times the default (cost $0.3 vs $0.10 default)"
+    },
+    {
+      "id": "cost-026",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Run completed. cost_usd=0.0700.",
+      "context": {
+        "costUsd": 0.07
+      },
+      "notes": "Typical single-shot answer (cost $0.07 vs $0.10 default)"
+    },
+    {
+      "id": "cost-027",
+      "rule": "cost_under_threshold",
+      "label": "positive",
+      "output": "Summarised the three failing integration tests and the fixture each one depends on.",
+      "context": {
+        "costUsd": 0.184
+      },
+      "notes": "A multi-read summary run (cost $0.184 vs $0.10 default). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "cost-028",
+      "rule": "cost_under_threshold",
+      "label": "positive",
+      "output": "Reviewed all forty changed files in the pull request and listed six issues.",
+      "context": {
+        "costUsd": 0.52
+      },
+      "notes": "A whole-diff review (cost $0.52 vs $0.10 default). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "cost-029",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "The config sets the retention window to 30 days.",
+      "context": {
+        "costUsd": 0.0123
+      },
+      "notes": "A one-read lookup (cost $0.0123 vs $0.10 default). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "cost-030",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "Two of the five endpoints lack rate limits: /export and /import.",
+      "context": {
+        "costUsd": 0.0461
+      },
+      "notes": "A short search-and-answer run (cost $0.0461 vs $0.10 default). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "cost-031",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "The migration adds one nullable column and backfills it in batches of 1,000.",
+      "context": {
+        "costUsd": 0.0988
+      },
+      "notes": "Just under the default (cost $0.0988 vs $0.10 default). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    },
+    {
+      "id": "cost-032",
+      "rule": "cost_under_threshold",
+      "label": "negative",
+      "output": "No open issues mention the flag.",
+      "context": {
+        "costUsd": 0.0035
+      },
+      "notes": "A single cheap search (cost $0.0035 vs $0.10 default). Authored 2026-09-23 to replace the removed real-transcript cases; not derived from any transcript."
+    }
+  ]
+}

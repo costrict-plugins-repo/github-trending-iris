@@ -1,0 +1,332 @@
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import type { IrisConfig } from '../types/index.js';
+import { assertWebhookConfig } from '../notify/config.js';
+import { defaultConfig } from './defaults.js';
+import { assertValidCriticality } from '../eval/criticality.js';
+import { irisHome } from '../utils/iris-home.js';
+import { validateConfigFile, SEARCH_BUDGET_RANGE_MS, INPUT_ELEMENTS_RULE } from './schema.js';
+import { setPricingSettings } from '../cost/model-lookup.js';
+
+/*
+ * Owner-only (0700) for the iris home directory, matching the 0600 the data
+ * FILES inside it already get (write-atomic.ts, sqlite-adapter.ts). iris.db
+ * holds agent inputs and outputs verbatim — a PII detector necessarily
+ * stores the PII it found — and a 0755 directory beside 0600 files still
+ * lets every local account list what is there and read anything a library
+ * happens to create with the default umask (#372). The mode applies only
+ * when THIS process creates the directory; a pre-existing IRIS_HOME keeps
+ * whatever permissions its owner chose. No-op on Windows (ACLs govern).
+ */
+export const IRIS_HOME_DIR_MODE = 0o700;
+
+/**
+ * Create a directory Iris needs, or fail with ONE line that names the path
+ * and the permission problem (#371). Before this, an unwritable IRIS_HOME
+ * surfaced as a raw EPERM stack trace from deep inside mkdirSync — the
+ * first thing a new user saw, with nothing telling them which variable to
+ * change. Exported so --self-test probes the configured home through the
+ * exact same call the server will make.
+ */
+export function ensureIrisDirectory(path: string, what: string): void {
+  if (existsSync(path)) return;
+  try {
+    mkdirSync(path, { recursive: true, mode: IRIS_HOME_DIR_MODE });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
+    throw new Error(
+      `Cannot create ${what} "${path}" (${code}). Iris keeps its database, config and rule files there. ` +
+        'Point IRIS_HOME at a directory this user can write, or fix the permissions on that path.',
+    );
+  }
+}
+
+function deepMerge(target: any, source: any): any {
+  const result = { ...target };
+  for (const key of Object.keys(source)) {
+    const sourceVal = source[key];
+    if (
+      sourceVal !== undefined &&
+      typeof sourceVal === 'object' &&
+      sourceVal !== null &&
+      !Array.isArray(sourceVal) &&
+      typeof result[key] === 'object' &&
+      result[key] !== null
+    ) {
+      result[key] = deepMerge(result[key], sourceVal);
+    } else if (sourceVal !== undefined) {
+      result[key] = sourceVal;
+    }
+  }
+  return result;
+}
+
+function loadConfigFile(path: string): Partial<IrisConfig> {
+  let content: string;
+  try {
+    content = readFileSync(path, 'utf-8');
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return {};
+    }
+    throw new Error(`Cannot read config file ${path}: ${(err as Error).message}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (err: unknown) {
+    throw new Error(`Invalid JSON in config file ${path}: ${(err as Error).message}`);
+  }
+  // Strict: a key Iris does not read, or a value of the wrong
+  // type, refuses startup naming it — see schema.ts for why.
+  const file = validateConfigFile(parsed, path);
+  // security.maxToolInputElements is security.maxInputElements's name before 0.21.0 (the schema refuses both at once).
+  const security = file.security as (Partial<IrisConfig['security']> & { maxToolInputElements?: number }) | undefined;
+  if (security?.maxToolInputElements !== undefined) {
+    const { maxToolInputElements, ...rest } = security;
+    file.security = { ...rest, maxInputElements: maxToolInputElements } as IrisConfig['security'];
+  }
+  return file;
+}
+
+function parsePortEnv(value: string, name: string): number {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n) || n < 1 || n > 65535) {
+    throw new Error(`${name}=${JSON.stringify(value)} is not a valid port (must be an integer 1-65535)`);
+  }
+  return n;
+}
+
+/** IRIS_SEARCH_BUDGET_MS: whole milliseconds within the range config.json's storage.searchBudgetMs accepts; anything else refuses startup. */
+function parseSearchBudgetEnv(value: string): number {
+  const n = Number(value.trim());
+  const [min, max] = SEARCH_BUDGET_RANGE_MS;
+  if (!Number.isInteger(n) || n < min || n > max) {
+    throw new Error(`IRIS_SEARCH_BUDGET_MS=${JSON.stringify(value)} is not a valid search budget (must be a whole number of milliseconds, ${min}-${max})`);
+  }
+  return n;
+}
+
+/** IRIS_MAX_INPUT_ELEMENTS, or its name before 0.21.0: what config.json's security.maxInputElements accepts; anything else refuses startup. */
+function parseInputElementsEnv(value: string, name: string): number {
+  const n = /^\s*\d+\s*$/.test(value) ? Number(value) : NaN;
+  if (!Number.isSafeInteger(n) || n < 1) {
+    throw new Error(`${name}=${JSON.stringify(value)} is not valid (must be ${INPUT_ELEMENTS_RULE})`);
+  }
+  return n;
+}
+
+/** IRIS_SEARCH_INDEX: `on` or `off`, as config.json's storage.searchIndex; anything else refuses startup. */
+function parseSearchIndexEnv(value: string): 'on' | 'off' {
+  const v = value.trim().toLowerCase();
+  if (v === 'on' || v === 'off') return v;
+  throw new Error(`IRIS_SEARCH_INDEX=${JSON.stringify(value)} is not valid (use on or off)`);
+}
+
+/*
+ * IRIS_DASHBOARD used to be `value === 'true'`, which silently read every
+ * other spelling — 1, yes, on, TRUE — as an explicit DISABLE that then
+ * overrode config.json's dashboard.enabled in the layer merge. The user who
+ * exported IRIS_DASHBOARD=1 got no dashboard plus a pointer log telling
+ * them to set the very variable they believed they had set. Unrecognized
+ * values now throw, same contract as parsePortEnv: loud beats silently
+ * wrong for a startup switch.
+ */
+function parseBooleanEnv(value: string, name: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+  throw new Error(
+    `${name}=${JSON.stringify(value)} is not a valid boolean (use true/1/yes/on or false/0/no/off)`,
+  );
+}
+
+function loadEnvVars(): Partial<IrisConfig> {
+  const config: Record<string, unknown> = {};
+
+  if (process.env.IRIS_TRANSPORT) {
+    config.transport = { type: process.env.IRIS_TRANSPORT };
+  }
+  if (process.env.IRIS_PORT) {
+    config.transport = { ...(config.transport as object), port: parsePortEnv(process.env.IRIS_PORT, 'IRIS_PORT') };
+  }
+  if (process.env.IRIS_HOST) {
+    config.transport = { ...(config.transport as object), host: process.env.IRIS_HOST };
+  }
+  if (process.env.IRIS_DB_PATH) {
+    config.storage = { type: 'sqlite', path: process.env.IRIS_DB_PATH };
+  }
+  if (process.env.IRIS_SEARCH_BUDGET_MS) {
+    config.storage = { ...(config.storage as object), searchBudgetMs: parseSearchBudgetEnv(process.env.IRIS_SEARCH_BUDGET_MS) };
+  }
+  if (process.env.IRIS_SEARCH_INDEX) {
+    config.storage = { ...(config.storage as object), searchIndex: parseSearchIndexEnv(process.env.IRIS_SEARCH_INDEX) };
+  }
+  if (process.env.IRIS_LOG_LEVEL) {
+    config.logging = { level: process.env.IRIS_LOG_LEVEL };
+  }
+  if (process.env.IRIS_DASHBOARD) {
+    config.dashboard = { enabled: parseBooleanEnv(process.env.IRIS_DASHBOARD, 'IRIS_DASHBOARD') };
+  }
+  if (process.env.IRIS_DASHBOARD_PORT) {
+    config.dashboard = {
+      ...(config.dashboard as object),
+      port: parsePortEnv(process.env.IRIS_DASHBOARD_PORT, 'IRIS_DASHBOARD_PORT'),
+    };
+  }
+  if (process.env.IRIS_DASHBOARD_HOST) {
+    config.dashboard = {
+      ...(config.dashboard as object),
+      host: process.env.IRIS_DASHBOARD_HOST,
+    };
+  }
+  if (process.env.IRIS_WEBHOOK_URL || process.env.IRIS_WEBHOOK_SECRET) {
+    // The webhook from the environment: merged over the file's, so a URL and a secret can live apart.
+    config.notify = {
+      webhook: {
+        ...(process.env.IRIS_WEBHOOK_URL ? { url: process.env.IRIS_WEBHOOK_URL } : {}),
+        ...(process.env.IRIS_WEBHOOK_SECRET ? { secret: process.env.IRIS_WEBHOOK_SECRET } : {}),
+      },
+    };
+  }
+  if (process.env.IRIS_API_KEY) {
+    config.security = { ...(config.security as object), apiKey: process.env.IRIS_API_KEY };
+  }
+  // The secret-file pattern: the key ring reads the file at
+  // boot and refuses an unreadable or empty one with a sentence.
+  if (process.env.IRIS_API_KEY_FILE) {
+    config.security = { ...(config.security as object), apiKeyFile: process.env.IRIS_API_KEY_FILE };
+  }
+  if (process.env.IRIS_ALLOW_UNAUTHENTICATED) {
+    config.security = {
+      ...(config.security as object),
+      allowUnauthenticated: ['1', 'true', 'yes', 'on'].includes(process.env.IRIS_ALLOW_UNAUTHENTICATED.trim().toLowerCase()),
+    };
+  }
+  if (process.env.IRIS_ALLOWED_ORIGINS) {
+    config.security = {
+      ...(config.security as object),
+      allowedOrigins: process.env.IRIS_ALLOWED_ORIGINS.split(',').map((s) => s.trim()),
+    };
+  }
+  // IRIS_MAX_TOOL_INPUT_ELEMENTS is its name before 0.21.0, when it bounded tool calls only: read when the new name is unset.
+  const inputElements = process.env.IRIS_MAX_INPUT_ELEMENTS
+    ? { name: 'IRIS_MAX_INPUT_ELEMENTS', value: process.env.IRIS_MAX_INPUT_ELEMENTS }
+    : process.env.IRIS_MAX_TOOL_INPUT_ELEMENTS
+      ? { name: 'IRIS_MAX_TOOL_INPUT_ELEMENTS', value: process.env.IRIS_MAX_TOOL_INPUT_ELEMENTS }
+      : undefined;
+  if (inputElements) {
+    config.security = {
+      ...(config.security as object),
+      maxInputElements: parseInputElementsEnv(inputElements.value, inputElements.name),
+    };
+  }
+
+  return config as Partial<IrisConfig>;
+}
+
+export interface CliArgs {
+  transport?: string;
+  port?: number;
+  config?: string;
+  dbPath?: string;
+  dashboard?: boolean;
+  dashboardPort?: number;
+  dashboardHost?: string;
+  apiKey?: string;
+}
+
+function cliArgsToConfig(args: CliArgs): Partial<IrisConfig> {
+  const config: Record<string, unknown> = {};
+
+  if (args.transport) {
+    config.transport = { type: args.transport };
+  }
+  if (args.port) {
+    config.transport = { ...(config.transport as object), port: args.port };
+  }
+  if (args.dbPath) {
+    config.storage = { type: 'sqlite', path: args.dbPath };
+  }
+  if (args.dashboard !== undefined) {
+    config.dashboard = { enabled: args.dashboard };
+  }
+  if (args.dashboardPort) {
+    config.dashboard = { ...(config.dashboard as object), port: args.dashboardPort };
+  }
+  if (args.dashboardHost) {
+    config.dashboard = { ...(config.dashboard as object), host: args.dashboardHost };
+  }
+  if (args.apiKey) {
+    config.security = { ...(config.security as object), apiKey: args.apiKey };
+  }
+
+  return config as Partial<IrisConfig>;
+}
+
+/** The config file loadConfig reads: `--config`, else `config.json` in the Iris home. */
+export function configFilePath(cliArgs?: CliArgs): string {
+  return cliArgs?.config ?? join(irisHome(), 'config.json');
+}
+
+/**
+ * The `security` block exactly as loadConfig would build it now: defaults,
+ * then the config file, then the environment, then the CLI, with the same
+ * validation (a malformed or unknown key throws). It creates nothing on
+ * disk, so the live key ring (security/live-key-ring.ts) can call it on a
+ * running server whenever the config file or a key file changes.
+ */
+export function loadSecurityConfig(cliArgs?: CliArgs): IrisConfig['security'] {
+  const layers = [loadConfigFile(configFilePath(cliArgs)), loadEnvVars(), cliArgs ? cliArgsToConfig(cliArgs) : {}];
+  return layers.reduce<IrisConfig>((config, layer) => deepMerge(config, layer), defaultConfig).security;
+}
+
+/**
+ * The key from the environment or the command line (IRIS_API_KEY,
+ * --api-key): the one key no file governs, so a key-ring reload that fails
+ * keeps only this one.
+ */
+export function fixedApiKey(cliArgs?: CliArgs): string | undefined {
+  return cliArgs?.apiKey || process.env.IRIS_API_KEY || undefined;
+}
+
+export function loadConfig(cliArgs?: CliArgs): IrisConfig {
+  const home = irisHome();
+  ensureIrisDirectory(home, 'IRIS_HOME');
+
+  const configPath = configFilePath(cliArgs);
+  const fileConfig = loadConfigFile(configPath);
+  const envConfig = loadEnvVars();
+  const argsConfig = cliArgs ? cliArgsToConfig(cliArgs) : {};
+
+  let config = deepMerge(defaultConfig, fileConfig);
+  config = deepMerge(config, envConfig);
+  config = deepMerge(config, argsConfig);
+  // Which thresholds the deployment SET, recorded before the merge erases
+  // the difference between "set to the shipped number" and "left alone".
+  // Environment and CLI carry no rule thresholds, so the file is the source.
+  config.eval.configuredThresholdKeys = Object.keys((fileConfig as Partial<IrisConfig>).eval?.ruleThresholds ?? {});
+  // Likewise the prior: the shipped 0.5 and a deployment's own 0.5 are the
+  // same number and different facts, and the verdict's provenance says which.
+  config.eval.priorConfigured = (fileConfig as Partial<IrisConfig>).eval?.prior !== undefined;
+
+  ensureIrisDirectory(dirname(config.storage.path), 'the database directory (IRIS_DB_PATH / --db-path)');
+
+  /*
+   * Fail at STARTUP on a bad rule name, before a single evaluation runs.
+   * A typo in eval.criticalRules that quietly did nothing would leave an
+   * operator believing their deploy gate exists when it does not — the same
+   * "detection that reports an all-clear" failure the veto exists to stop.
+   */
+  assertValidCriticality(config.eval);
+  // Likewise the webhook: a URL the schema never saw (the environment's), or an unsigned iris-format hook, refuses startup here.
+  assertWebhookConfig(config.notify.webhook);
+  /*
+   * The prices a trace's cost is estimated at. Set here, the one place both
+   * the server and `iris-eval ingest` pass through, so a hook-fed trace and
+   * a served one are priced by the same table (src/cost/model-lookup.ts).
+   */
+  setPricingSettings(config.pricing);
+
+  return config;
+}

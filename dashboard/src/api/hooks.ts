@@ -1,0 +1,357 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { api } from './client';
+import { asApiError, type ApiError } from './errors';
+import { usePolling } from '../hooks/usePolling';
+import type {
+  DriftComparison,
+  TraceQueryResult,
+  TraceDetail,
+  DashboardSummary,
+  FilterOptions,
+  EvalQueryResult,
+  EvalStats,
+  EvalTrendPoint,
+  RuleBreakdown,
+  EvalFailure,
+  MomentQueryResult,
+  DecisionMomentDetail,
+  FailureQueryResult,
+  DeployedCustomRule,
+  AuditQueryResult,
+  BuiltInRuleMeta,
+  HealthResponse,
+  CapabilitiesSummary,
+  RunsResponse,
+  RunDetailResponse,
+  CaseResponse,
+  IssuesResponse,
+  LabelStats,
+  VerdictLabel,
+} from './types';
+
+/**
+ * Polling cadence presets — picks the default interval based on how
+ * time-sensitive the data is. Per-view cadence is achieved by the hook
+ * author picking the right preset, not by runtime route detection (which
+ * would break the hook's co-location with its consumer).
+ *
+ * Cadence rationale (audit item #12):
+ *   FAST   3s  — live-tail data: Stream view's trace feed
+ *   NORMAL 10s — most dashboard reads: summary, rule breakdown, trend
+ *   SLOW   30s — low-churn aggregations: filter options, audit log,
+ *                deployed rules list
+ *   NEVER  undefined — one-shot fetches: detail pages
+ *
+ * Previously most hooks polled at 5s which translated to 12 req/min per
+ * data type on top of browser visibility gating. On a Pro tier with 100
+ * req/min rate limit, a user with 3 open views would be rate-limited
+ * before they did anything. The cadence here gives headroom.
+ */
+export const CADENCE = {
+  FAST: 3000,
+  NORMAL: 10000,
+  SLOW: 30000,
+} as const;
+
+/**
+ * Hook state augmented with rate-limit awareness (audit item #12).
+ *
+ * When a fetch returns 429, `useApiData` pauses polling until the
+ * server's reset time, and surfaces `rateLimitedUntil` so the UI can
+ * show a specific banner instead of a generic "Unknown error" message.
+ */
+export interface UseApiDataResult<T> {
+  data: T | null;
+  loading: boolean;
+  /** The last fetch's failure, classified, or null if it succeeded. Render it with <QueryError>. */
+  error: ApiError | null;
+  /**
+   * Epoch-ms timestamp when the rate limit is expected to reset, or null.
+   * While set, polling is paused. The value resets to null on the next
+   * successful fetch or manual refetch.
+   */
+  rateLimitedUntil: number | null;
+  refetch: () => Promise<void>;
+}
+
+// Exported only for tests — every production caller goes through a
+// purpose-named wrapper (useTraces / useSummary / etc.) that pre-applies
+// the right cadence + fetcher. The bare hook is exposed so the
+// stale-data race regression test can drive it directly without
+// mocking the entire api client surface.
+/**
+ * One query, one state: a widget branches on `status` and never has
+ * to reason about `loading && !data && !error` by hand.
+ */
+export type QueryState<T> = { status: 'loading' } | { status: 'ready'; data: T } | { status: 'error'; error: ApiError };
+
+export function queryStateOf<T>(r: Pick<UseApiDataResult<T>, 'data' | 'loading' | 'error'>): QueryState<T> {
+  if (r.error) return { status: 'error', error: r.error };
+  if (r.data !== null) return { status: 'ready', data: r.data };
+  return { status: 'loading' };
+}
+
+export function useApiData<T>(fetcher: () => Promise<T>, pollInterval?: number): UseApiDataResult<T> {
+  const [data, setData] = useState<T | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<ApiError | null>(null);
+  const [rateLimitedUntil, setRateLimitedUntil] = useState<number | null>(null);
+  const resumeTimer = useRef<number | null>(null);
+  // Monotonic request id. Each fetchData() call captures its own id; if a
+  // newer call has started by the time the response resolves, the older
+  // call discards its result. Closes the stale-data race where a slow
+  // earlier fetch could overwrite the newer fetch's data after a rapid
+  // filter/route change.
+  const requestIdRef = useRef(0);
+  /*
+   * Whether the LATEST request is still in flight. A poll tick that fires
+   * while one is pending is skipped rather than started: starting it would
+   * take the request id and the pending response would be discarded as
+   * stale — on a server where a window of 200 moments takes longer than the
+   * cadence, that discarded every response in turn and the widget stayed
+   * on its loading (or empty) state for ever. Found by the demo
+   * (0.16.0): the Drift and Health prior windows never rendered. A manual
+   * refetch or a parameter change still supersedes, on purpose.
+   */
+  const inFlightRef = useRef(false);
+
+  const fetchData = useCallback(async () => {
+    const myId = ++requestIdRef.current;
+    inFlightRef.current = true;
+    try {
+      const result = await fetcher();
+      if (myId !== requestIdRef.current) return; // stale — newer call superseded us
+      setData(result);
+      setError(null);
+      setRateLimitedUntil(null);
+    } catch (err) {
+      if (myId !== requestIdRef.current) return; // stale — drop the error too
+      // Classified, never a bare string: the widget renders the kind.
+      const apiErr = asApiError(err);
+      setError(apiErr);
+      if (apiErr.kind === 'rate-limited' && apiErr.retryAfterMs) {
+        const until = Date.now() + apiErr.retryAfterMs;
+        setRateLimitedUntil(until);
+        // Schedule auto-resume right after the window expires so the next
+        // successful fetch clears the banner without user action.
+        if (resumeTimer.current !== null) {
+          window.clearTimeout(resumeTimer.current);
+        }
+        resumeTimer.current = window.setTimeout(() => {
+          resumeTimer.current = null;
+          setRateLimitedUntil(null);
+        }, apiErr.retryAfterMs + 100);
+      }
+    } finally {
+      // Only the latest call clears the loading flag — prevents a stale
+      // resolution from flipping loading to false while a newer request
+      // is still in flight.
+      if (myId === requestIdRef.current) {
+        setLoading(false);
+        inFlightRef.current = false;
+      }
+    }
+  }, [fetcher]);
+
+  const pollTick = useCallback(() => {
+    if (inFlightRef.current) return;
+    void fetchData();
+  }, [fetchData]);
+
+  useEffect(() => {
+    fetchData();
+    return () => {
+      if (resumeTimer.current !== null) {
+        window.clearTimeout(resumeTimer.current);
+        resumeTimer.current = null;
+      }
+    };
+  }, [fetchData]);
+
+  // While rate-limited, suppress polling entirely — the server already
+  // told us how long to wait. Browser visibility gating inside usePolling
+  // still applies.
+  const activePollInterval = rateLimitedUntil ? undefined : pollInterval;
+  usePolling(pollTick, activePollInterval);
+
+  return { data, loading, error, rateLimitedUntil, refetch: fetchData };
+}
+
+export function useTraces(params?: Record<string, string>) {
+  // Key by JSON-stringified params (semantic value) so callers can pass fresh
+  // object literals without unnecessary refetches. params is captured in the
+  // closure; paramsKey controls when the closure is recreated.
+  const paramsKey = JSON.stringify(params);
+  const fetcher = useCallback(
+    () => api.getTraces(params),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- paramsKey is the semantic key
+    [paramsKey],
+  );
+  return useApiData<TraceQueryResult>(fetcher, CADENCE.NORMAL);
+}
+
+export function useTraceDetail(traceId: string) {
+  const fetcher = useCallback(() => api.getTraceDetail(traceId), [traceId]);
+  return useApiData<TraceDetail>(fetcher);
+}
+
+export function useSummary(hours?: number) {
+  const fetcher = useCallback(() => api.getSummary(hours), [hours]);
+  return useApiData<DashboardSummary>(fetcher, CADENCE.NORMAL);
+}
+
+/**
+ * The shell's health poll: one query behind the header's pill, judge
+ * chip and DEMO chip. SLOW on purpose: the connection store turns the pill
+ * red on the first request that fails anywhere, so this poll only refines
+ * `degraded`, the judge state and the mode — none of which changes by the
+ * second — and every request the shell adds counts against the server's
+ * per-minute budget (the CI e2e run tripped it at 10 s).
+ */
+export function useHealth() {
+  const fetcher = useCallback(() => api.getHealth(), []);
+  return useApiData<HealthResponse>(fetcher, CADENCE.SLOW);
+}
+
+/** Read once: the server's own enable steps for the judge and its retention window. */
+export function useCapabilities() {
+  const fetcher = useCallback(() => api.getCapabilities(), []);
+  return useApiData<CapabilitiesSummary>(fetcher);
+}
+
+/* ---- runs and cases ---- */
+export function useRuns(limit = 50) {
+  const fetcher = useCallback(() => api.getRuns(limit), [limit]);
+  return useApiData<RunsResponse>(fetcher, CADENCE.SLOW);
+}
+
+export function useRun(runId: string) {
+  const fetcher = useCallback(() => api.getRun(runId), [runId]);
+  return useApiData<RunDetailResponse>(fetcher, CADENCE.SLOW);
+}
+
+export function useCase(caseKey: string, run?: string) {
+  const fetcher = useCallback(() => api.getCase(caseKey, run), [caseKey, run]);
+  return useApiData<CaseResponse>(fetcher, CADENCE.SLOW);
+}
+
+export function useFilters() {
+  const fetcher = useCallback(() => api.getFilters(), []);
+  return useApiData<FilterOptions>(fetcher, CADENCE.SLOW);
+}
+
+export function useEvals(params?: Record<string, string>) {
+  const paramsKey = JSON.stringify(params);
+  const fetcher = useCallback(
+    () => api.getEvaluations(params),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- paramsKey is the semantic key
+    [paramsKey],
+  );
+  return useApiData<EvalQueryResult>(fetcher, CADENCE.NORMAL);
+}
+
+export function useEvalStats(period?: string) {
+  const fetcher = useCallback(() => api.getEvalStats(period), [period]);
+  return useApiData<EvalStats>(fetcher, CADENCE.NORMAL);
+}
+
+export function useEvalTrend(period?: string, cohort?: 'run') {
+  const fetcher = useCallback(() => api.getEvalTrend(period, cohort), [period, cohort]);
+  // Trend over 7d/30d/90d windows changes slowly — poll at SLOW cadence.
+  return useApiData<EvalTrendPoint[]>(fetcher, CADENCE.SLOW);
+}
+
+export function useEvalRules() {
+  const fetcher = useCallback(() => api.getEvalRules(), []);
+  return useApiData<RuleBreakdown[]>(fetcher, CADENCE.NORMAL);
+}
+
+export function useEvalFailures(limit?: number) {
+  const fetcher = useCallback(() => api.getEvalFailures(limit), [limit]);
+  return useApiData<EvalFailure[]>(fetcher, CADENCE.NORMAL);
+}
+
+export function useDrift(params?: Record<string, string>) {
+  const paramsKey = JSON.stringify(params);
+  const fetcher = useCallback(
+    () => api.getDrift(params),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- paramsKey is the semantic key
+    [paramsKey],
+  );
+  return useApiData<DriftComparison>(fetcher, CADENCE.NORMAL);
+}
+
+export function useMoments(params?: Record<string, string>, cadence: number = CADENCE.FAST) {
+  const paramsKey = JSON.stringify(params);
+  // Moments are the Stream view's live tail — FAST by default. A view that
+  // reads a whole window (Drift, Health, the agent list) passes NORMAL: two
+  // hundred moments are not a tail, and a fetch slower than the cadence
+  // must never be raced by its own poll.
+  const fetcher = useCallback(
+    () => api.getMoments(params),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- paramsKey is the semantic key
+    [paramsKey],
+  );
+  return useApiData<MomentQueryResult>(fetcher, cadence);
+}
+
+export function useMomentDetail(id: string) {
+  const fetcher = useCallback(() => api.getMomentDetail(id), [id]);
+  return useApiData<DecisionMomentDetail>(fetcher);
+}
+
+export function useFailures(params?: Record<string, string>) {
+  const paramsKey = JSON.stringify(params);
+  // The landing view's data — a ranked read, not a live tail. NORMAL keeps
+  // it fresh without competing with Stream's FAST cadence.
+  const fetcher = useCallback(
+    () => api.getFailures(params),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- paramsKey is the semantic key
+    [paramsKey],
+  );
+  return useApiData<FailureQueryResult>(fetcher, CADENCE.NORMAL);
+}
+
+export function useCustomRules() {
+  const fetcher = useCallback(() => api.getCustomRules().then((r) => r.rules), []);
+  return useApiData<DeployedCustomRule[]>(fetcher, CADENCE.SLOW);
+}
+
+/** The engine's built-in rule roster — fixed for the process lifetime, so a one-shot fetch. */
+export function useBuiltInRules() {
+  const fetcher = useCallback(() => api.getBuiltInRules().then((r) => r.rules), []);
+  return useApiData<BuiltInRuleMeta[]>(fetcher);
+}
+
+export function useAuditLog(params?: Record<string, string>) {
+  const paramsKey = JSON.stringify(params);
+  const fetcher = useCallback(
+    () => api.getAuditLog(params),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- paramsKey is the semantic key
+    [paramsKey],
+  );
+  return useApiData<AuditQueryResult>(fetcher, CADENCE.SLOW);
+}
+
+/* Labels on your own traffic. */
+
+export function useLabelStats() {
+  const fetcher = useCallback(() => api.getLabelStats(), []);
+  return useApiData<LabelStats>(fetcher, CADENCE.SLOW);
+}
+
+export function useIssues(params?: Record<string, string>) {
+  const paramsKey = JSON.stringify(params);
+  const fetcher = useCallback(
+    () => api.getIssues(params),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- paramsKey is the semantic key
+    [paramsKey],
+  );
+  return useApiData<IssuesResponse>(fetcher, CADENCE.SLOW);
+}
+
+/** The labels on one evaluation, read once; the page updates its own copy after a write. */
+export function useEvalLabels(evalId: string) {
+  const fetcher = useCallback(() => api.getLabels(evalId).then((r) => r.labels), [evalId]);
+  return useApiData<VerdictLabel[]>(fetcher);
+}

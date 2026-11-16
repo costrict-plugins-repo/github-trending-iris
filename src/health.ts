@@ -1,0 +1,210 @@
+/*
+ * One health contract for both ports.
+ *
+ * Until 0.15.0 the dashboard's `/api/v1/health` reported status, version,
+ * uptime, a trace count and a storage word, while the MCP transport's
+ * `/health` answered `{ status, server, timestamp }` — and the API reference
+ * said they were "the same contract". They were not. This module is the
+ * one place the answer is built; both routes call it, so the two ports
+ * cannot drift again, and a container `HEALTHCHECK`, a load balancer and a
+ * human read one shape.
+ *
+ * What the checks mean:
+ *   storage      the database answers a COUNT of traces
+ *   rules_store  the deployed custom-rules file reads and parses
+ *   migrations   every migration this build knows is applied; the numbers
+ *                are how many, so an operator can see a schema is behind
+ *                before a query fails on a missing column
+ *   driver       which SQLite driver opened the file (0.15.0 added the
+ *                Node built-in as a fallback; the word is the seam)
+ *   search       the trace search index: `ready`, `building` (a search
+ *                reads the traces until it is done; `progress` says how
+ *                far along the build is) or `unavailable` (a SQLite without
+ *                FTS5). Not a check: a search answers in every state, so it
+ *                never makes the status degraded.
+ *   search_worker where searches run: their own thread, or the server's
+ *                when the worker could not start (and why); informational
+ *
+ * `status` is `ok` only when every check that could run is `ok`; anything
+ * else is `degraded` with HTTP 503, so a probe that only reads the status
+ * code gets the right answer. The older fields (`storage`, `judge`, `mode`)
+ * stay: the dashboard header and the UAT read them.
+ *
+ * `judge.relevance` says whether a relevance judge is installed and callable
+ * and whether its daily budget has stopped it today — a probe can alert on
+ * `budget_exhausted` before a user wonders why verdicts went lexical. What
+ * was spent is on the authenticated surfaces (iris://capabilities, the
+ * self-test), not here, for the reason below.
+ *
+ * The endpoint answers without a key, so it reports whether the store can
+ * be counted, never the count; the index build's progress is a share of
+ * the traces for the same reason. Until this change it carried `trace_count`,
+ * which told any unauthenticated caller how much data the server held. The
+ * count is on the authenticated surface: `total` on GET /api/v1/traces.
+ */
+import type { IStorageAdapter, SearchWorkerStatus } from './types/query.js';
+import type { SearchIndexStatus } from './storage/search-index.js';
+import type { CustomRuleStore } from './custom-rule-store.js';
+import { LOCAL_TENANT } from './types/tenant.js';
+import { judgeState } from './judge-enablement.js';
+import type { RelevanceJudge } from './eval/llm-judge/relevance-judge.js';
+
+const startTime = Date.now();
+
+export type CheckState = 'ok' | 'fail' | 'absent';
+
+export interface HealthReport {
+  status: 'ok' | 'degraded';
+  version: string;
+  uptime_seconds: number;
+  /** The SQLite driver behind `storage`, or null when no storage is attached. */
+  driver: string | null;
+  /** Where searches run (#703), or null when no storage is attached or it does not say. Informational: an unavailable worker leaves searches working, so it never degrades `status`. */
+  search_worker: SearchWorkerStatus | null;
+  checks: {
+    storage: CheckState;
+    rules_store: CheckState;
+    migrations: { status: CheckState; applied: number; known: number };
+  };
+  /**
+   * The trace search index: its state, what a search reads now, and while
+   * it is being built the share of stored traces it holds, 0 to 0.99
+   * (1 when ready, null without FTS5). Null when there is no storage or it
+   * reports nothing.
+   */
+  search: { state: SearchIndexStatus['state']; index: SearchIndexStatus['index']; progress: number | null } | null;
+  /**
+   * The indexes the dashboard and the failure log read: `building` after an
+   * upgrade, while they are built in the background (those reads answer
+   * meanwhile, more slowly), then `ready`. Informational: never degrades
+   * `status`. Null when there is no storage or it reports nothing.
+   */
+  indexes: 'ready' | 'building' | null;
+  /**
+   * While the store is being upgraded after the start (the copy, then the
+   * migrations; storage/ready.ts), or after that failed: what it is doing
+   * and since when. Null when it serves. Requests wait for it meanwhile,
+   * and are refused once it has failed.
+   */
+  upgrade: { state: 'opening' | 'copying' | 'migrating' | 'failed'; since: string; reason?: string } | null;
+  /** The word the pre-0.15.0 contract used; kept for readers of it. */
+  storage?: 'connected' | 'disconnected';
+  judge: {
+    enabled: boolean;
+    provider: string | null;
+    /** The relevance judge answers_the_ask gates on; absent when no engine was handed to the health check. */
+    relevance?: { configured: boolean; ready: boolean; budget_exhausted: boolean; budget_resets_at: string | null };
+  };
+  mode: 'real' | 'demo';
+}
+
+export interface HealthDeps {
+  storage?: IStorageAdapter;
+  customRuleStore?: CustomRuleStore;
+  version?: string;
+  /** `demo` when serving the disposable demo database. */
+  mode?: 'real' | 'demo';
+  /** The relevance judge in force, read per request (`evalEngine.relevanceJudgeInForce`), for `judge.relevance`. */
+  relevanceJudge?: () => RelevanceJudge | null;
+}
+
+/** The share of stored traces the index holds: 1 when ready; while building, rounded down and never 1, so it reads as done only when it is. */
+function searchProgress(s: SearchIndexStatus): number | null {
+  if (s.state === 'unavailable' || s.state === 'off') return null;
+  if (s.state === 'ready') return 1;
+  if (!s.total) return 0.99;
+  return Math.min(0.99, Math.floor(((s.indexed ?? 0) / s.total) * 100) / 100);
+}
+
+/** The report and the HTTP status it should travel with (200 ok, 503 degraded). */
+export async function buildHealth(deps: HealthDeps): Promise<{ status: number; body: HealthReport }> {
+  const uptime_seconds = Math.floor((Date.now() - startTime) / 1000);
+  /*
+   * The judge state, provider name only — never the key. Read per request
+   * rather than at boot so a test (or an operator) that sets the variable
+   * in this process sees it here.
+   */
+  const judge = judgeState();
+  const body: HealthReport = {
+    status: 'ok',
+    version: deps.version ?? 'unknown',
+    uptime_seconds,
+    driver: deps.storage?.driver ?? null,
+    search_worker: deps.storage?.searchWorkerStatus?.() ?? null,
+    checks: {
+      storage: 'absent',
+      rules_store: 'absent',
+      migrations: { status: 'absent', applied: 0, known: 0 },
+    },
+    search: null,
+    indexes: deps.storage?.readIndexesState?.() ?? null,
+    upgrade: null,
+    judge: { enabled: judge.enabled, provider: judge.provider },
+    mode: deps.mode ?? 'real',
+  };
+  if (deps.relevanceJudge) {
+    const relevance = deps.relevanceJudge();
+    // Server-level facts, so LOCAL_TENANT like the storage probe below.
+    const today = relevance?.budget.today(LOCAL_TENANT) ?? null;
+    body.judge.relevance = {
+      configured: relevance !== null,
+      ready: relevance !== null && relevance.problem === null,
+      budget_exhausted: today?.exhausted ?? false,
+      budget_resets_at: today?.exhausted ? today.resetsAt : null,
+    };
+  }
+
+  if (deps.storage) {
+    /*
+     * Health probes use LOCAL_TENANT directly — the endpoint is pre-tenant-
+     * resolution (it answers unauthenticated callers) and reports server-
+     * level facts. This is the ONE place storage is called with an explicit
+     * LOCAL_TENANT rather than a resolved tenantId; deliberate, documented
+     * here so it stays the only exception.
+     *
+     * The count proves the store answers; the number itself is not
+     * reported (see the header). limit 1 keeps the row fetch negligible.
+     */
+    const readiness = deps.storage.readiness?.();
+    if (readiness && readiness.state !== 'ready') {
+      // Being upgraded: the store answers nothing until it is done, and health answers now rather than wait for it.
+      body.upgrade = { state: readiness.state, since: new Date(readiness.since).toISOString(), ...(readiness.detail !== undefined ? { reason: readiness.detail } : {}) };
+    }
+    try {
+      if (body.upgrade) throw new Error('upgrading');
+      await deps.storage.queryTraces(LOCAL_TENANT, { limit: 1, offset: 0 });
+      body.storage = 'connected';
+      body.checks.storage = 'ok';
+    } catch {
+      body.storage = 'disconnected';
+      body.checks.storage = 'fail';
+    }
+    try {
+      const m = await deps.storage.migrations();
+      body.checks.migrations = { status: m.pending.length === 0 ? 'ok' : 'fail', applied: m.applied, known: m.known };
+    } catch {
+      body.checks.migrations = { status: 'fail', applied: 0, known: 0 };
+    }
+    try {
+      // Before the store serves, the index has not been reconciled: `search` stays null rather than read as unavailable.
+      const s = body.upgrade ? undefined : await deps.storage.searchStatus?.();
+      if (s) body.search = { state: s.state, index: s.index, progress: searchProgress(s) };
+    } catch {
+      // A store that cannot say where its index is still answers searches; the storage check reports the store.
+    }
+  }
+
+  if (deps.customRuleStore) {
+    try {
+      deps.customRuleStore.list(LOCAL_TENANT);
+      body.checks.rules_store = 'ok';
+    } catch {
+      body.checks.rules_store = 'fail';
+    }
+  }
+
+  const failed =
+    body.checks.storage === 'fail' || body.checks.rules_store === 'fail' || body.checks.migrations.status === 'fail';
+  body.status = failed ? 'degraded' : 'ok';
+  return { status: failed ? 503 : 200, body };
+}

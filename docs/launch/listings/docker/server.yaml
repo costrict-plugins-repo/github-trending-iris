@@ -1,0 +1,48 @@
+# Docker MCP Catalog entry for Iris, as submitted to docker/mcp-registry as
+# servers/iris-eval/server.yaml. The image is the one this repository
+# publishes (ghcr.io/iris-eval/mcp-server). It starts in HTTP mode with the
+# dashboard on, so the entry sets IRIS_TRANSPORT=stdio and IRIS_DASHBOARD=false:
+# the MCP Toolkit talks to the container over stdio. source.commit is the
+# release commit (git rev-list -n 1 v<version>); Docker's pin bot skips images
+# outside its own namespace, so a small PR moves it after each release.
+name: iris-eval
+image: ghcr.io/iris-eval/mcp-server
+type: server
+meta:
+  category: monitoring
+  tags:
+    - agent-evaluation
+    - ai-agent
+    - claude
+    - eval
+    - evaluation
+    - llm
+    - model-context-protocol
+    - observability
+    - security
+    - tracing
+about:
+  title: Iris
+  description: >-
+    Stop shipping agents on vibes. Iris scores every agent output for quality,
+    safety, and cost. It detects PII, credentials and prompt injection, checks
+    grounding and tool use, and compares runs with confidence intervals. The
+    measured accuracy of its rules is published. An LLM judge is optional.
+    Traces and verdicts stay local in SQLite, and the same image serves a
+    dashboard. MIT licensed.
+  icon: https://iris-eval.com/iris-logo-white-bg.png
+source:
+  project: https://github.com/iris-eval/mcp-server
+  commit: c24e80aaece3a5032280a83c06a86c43065e6f24
+run:
+  volumes:
+    - iris-eval-data:/data
+config:
+  description: Runs over stdio with no required settings. Traces and verdicts persist in the iris-eval-data volume.
+  env:
+    - name: IRIS_TRANSPORT
+      example: "stdio"
+      value: "stdio"
+    - name: IRIS_DASHBOARD
+      example: "false"
+      value: "false"

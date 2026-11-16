@@ -1,0 +1,145 @@
+/*
+ * The truthbase capture refuses a report whose counts would lie.
+ *
+ * A test file that fails to load is not a failed test: vitest's JSON report
+ * lists the file with status "failed" and no assertions, counts none of its
+ * tests, and leaves numFailedTests at 0. A capture that read only the counts
+ * once recorded 3,533/3,533 with nothing failed for a branch whose
+ * otlp.test.ts no longer parsed, eleven tests short. The capture now fails,
+ * naming the file and the reason.
+ *
+ * The fixture tests/fixtures/capture/vitest-report-load-errors.json is a real
+ * vitest 5 JSON report (paths replaced by <root>) of three files: one that
+ * does not parse, one that throws at import, one that passes.
+ */
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+// @ts-ignore — plain .mjs module
+import { CaptureRefused, checkReport, failedTests, fileLevelFailures } from '../../../scripts/claims/capture-report.mjs';
+
+const ROOT = resolve(__dirname, '..', '..', '..');
+const fixturePath = join(ROOT, 'tests', 'fixtures', 'capture', 'vitest-report-load-errors.json');
+const loadErrors = JSON.parse(readFileSync(fixturePath, 'utf8')) as Record<string, unknown>;
+
+const clean = (tests: number) => ({
+  numTotalTests: tests,
+  numPassedTests: tests,
+  numFailedTests: 0,
+  success: true,
+  testResults: [{ name: '<root>/tests/a.test.ts', status: 'passed', message: '', assertionResults: Array.from({ length: tests }, () => ({ status: 'passed' })) }],
+});
+
+describe('what a report may not become', () => {
+  it('a file that does not parse and a file that throws at import are named, with their reasons, and the capture is refused', () => {
+    expect(fileLevelFailures(loadErrors, '<root>')).toEqual([
+      { file: 'tests/zz/broken.test.ts', reason: 'Transform failed with 1 error:' },
+      { file: 'tests/zz/throws.test.ts', reason: 'boom at import' },
+    ]);
+    // The counts alone look green: 1 of 1, nothing failed.
+    expect([loadErrors.numTotalTests, loadErrors.numFailedTests]).toEqual([1, 0]);
+    expect(() => checkReport(loadErrors, { scope: 'root', root: '<root>' })).toThrow(CaptureRefused);
+    expect(() => checkReport(loadErrors, { scope: 'root', root: '<root>' })).toThrow(/2 test file\(s\) in scope "root" failed to load[\s\S]*tests\/zz\/broken\.test\.ts: Transform failed[\s\S]*tests\/zz\/throws\.test\.ts: boom at import/);
+  });
+
+  /*
+   * On main at 969719e one test failed during the CI capture (3,729 of
+   * 3,730). The capture recorded it, and the next step said only that
+   * claims.json "drifted", with no test named. A failing test is now a
+   * refusal that names it.
+   */
+  it('a failed assertion is not a load error, and it refuses the capture, naming the file, the test and the reason', () => {
+    const report = {
+      numTotalTests: 2,
+      numPassedTests: 1,
+      numFailedTests: 1,
+      success: false,
+      testResults: [
+        {
+          name: '<root>/tests/unit/storage/search-worker.test.ts',
+          status: 'failed',
+          message: '',
+          assertionResults: [
+            { status: 'passed', fullName: 'search on a worker thread > answers' },
+            {
+              status: 'failed',
+              fullName: 'search on a worker thread > a delete during a search does not wait for it',
+              failureMessages: ['\u001b[31mAssertionError: delete took 68 ms, the search 132 ms\u001b[39m\n    at file.ts:1:1'],
+            },
+          ],
+        },
+      ],
+    };
+    expect(fileLevelFailures(report)).toEqual([]);
+    expect(failedTests(report, '<root>')).toEqual([
+      {
+        file: 'tests/unit/storage/search-worker.test.ts',
+        test: 'search on a worker thread > a delete during a search does not wait for it',
+        reason: 'AssertionError: delete took 68 ms, the search 132 ms',
+      },
+    ]);
+    expect(() => checkReport(report, { scope: 'root', root: '<root>' })).toThrow(CaptureRefused);
+    expect(() => checkReport(report, { scope: 'root', root: '<root>' })).toThrow(
+      /1 test\(s\) failed in scope "root"[\s\S]*tests\/unit\/storage\/search-worker\.test\.ts > search on a worker thread > a delete during a search does not wait for it\n\s+AssertionError: delete took 68 ms/,
+    );
+  });
+
+  it('a failure count with no failed assertion listed is refused too', () => {
+    expect(() => checkReport({ ...clean(3), numPassedTests: 2, numFailedTests: 1 })).toThrow(/1 test\(s\) failed in scope "root"/);
+  });
+
+  it('a run that failed with no failing test and no failing file (an unhandled error) is refused', () => {
+    expect(() => checkReport({ ...clean(3), success: false })).toThrow(/failed \(success: false\) with no failing test and no failing file/);
+  });
+
+  /*
+   * What vitest really writes for an unhandled error: `success: true`, every
+   * test passed, and the process exits 1. The rule above never fires on it
+   * (a store-ready branch's capture recorded 4,016 of 4,016 while CI failed
+   * on `Error: the disk said no`); the exit code is what says so.
+   */
+  it('a run that exits non-zero with every test passing is refused, and says where to see the error', () => {
+    expect(() => checkReport(clean(3), { exitCode: 1 })).toThrow(CaptureRefused);
+    expect(() => checkReport(clean(3), { exitCode: 1 })).toThrow(
+      /vitest exited 1 with every counted test passing[\s\S]*run `npx vitest run` in the scope to see it/,
+    );
+  });
+
+  it('a run that wrote no report is not refused by its exit code: its counts stay unknown, and the committed ones are kept', () => {
+    expect(checkReport(null, { scope: 'dashboard', exitCode: 1 })).toEqual({ total: null, passed: null, failed: null });
+  });
+
+  it('a clean exit, or a report read from a file (no exit code), is its counts', () => {
+    expect(checkReport(clean(3), { exitCode: 0 })).toEqual({ total: 3, passed: 3, failed: 0 });
+    expect(checkReport(clean(3), {})).toEqual({ total: 3, passed: 3, failed: 0 });
+  });
+
+  it('a skipped test is refused, as before', () => {
+    expect(() => checkReport({ ...clean(3), numPassedTests: 2 })).toThrow(/1 test\(s\) skipped/);
+  });
+
+  it('a clean report is its counts', () => {
+    expect(checkReport(clean(3))).toEqual({ total: 3, passed: 3, failed: 0 });
+  });
+});
+
+describe('claims:capture-tests', () => {
+  it('exits non-zero on a report with a file that failed to load, names it, and writes nothing', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'iris-capture-'));
+    const report = join(dir, 'root.json');
+    // As vitest writes it on this machine: absolute paths under the repository root.
+    writeFileSync(report, JSON.stringify(loadErrors).split('<root>').join(ROOT.split('\\').join('/')));
+    const cache = join(ROOT, '.claims-cache', 'tests.json');
+    const before = existsSync(cache) ? statSync(cache).mtimeMs : null;
+
+    const run = spawnSync(process.execPath, [join(ROOT, 'scripts', 'claims', 'capture-tests.mjs'), '--report', `root=${report}`, '--report', `dashboard=${report}`], { cwd: ROOT, encoding: 'utf8' });
+
+    expect(run.status).toBe(1);
+    expect(run.stderr).toMatch(/failed to load or errored outside any test/);
+    expect(run.stderr).toContain('tests/zz/broken.test.ts: Transform failed with 1 error:');
+    expect(run.stderr).toContain('tests/zz/throws.test.ts: boom at import');
+    expect(existsSync(cache) ? statSync(cache).mtimeMs : null).toBe(before);
+  });
+});
